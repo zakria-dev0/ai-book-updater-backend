@@ -22,7 +22,7 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     await connect_to_mongo()
-    print(f"✅ {settings.PROJECT_NAME} started successfully")
+    print(f"{settings.PROJECT_NAME} started successfully")
 
 # Shutdown event
 @app.on_event("shutdown")

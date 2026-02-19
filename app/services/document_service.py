@@ -9,6 +9,7 @@ import base64
 from io import BytesIO
 from PIL import Image
 import re
+import fitz  # PyMuPDF
 
 class DOCXParser:
     """Parser for DOCX documents"""
@@ -173,6 +174,81 @@ class DOCXParser:
         return DocumentMetadata(
             total_pages=len(self.doc.sections),  # Approximation
             total_paragraphs=len(self.doc.paragraphs),
+            total_equations=len(self.equations),
+            total_figures=len(self.figures),
+            total_tables=len(self.tables)
+        )
+
+
+class PDFParser:
+    """Parser for PDF documents using PyMuPDF"""
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.doc = fitz.open(file_path)
+        self.equations: List[Equation] = []
+        self.figures: List[Figure] = []
+        self.tables: List[Table] = []
+        self.text_content = ""
+
+    def parse(self) -> Tuple[str, List[Equation], List[Figure], List[Table], DocumentMetadata]:
+        """Parse PDF document and extract all content"""
+        self.text_content = self._extract_text()
+        self.equations = self._extract_equations()
+        self.figures = self._extract_figures()
+        metadata = self._generate_metadata()
+        return self.text_content, self.equations, self.figures, self.tables, metadata
+
+    def _extract_text(self) -> str:
+        """Extract all text from PDF"""
+        full_text = []
+        for page in self.doc:
+            full_text.append(page.get_text())
+        return "\n".join(full_text)
+
+    def _extract_equations(self) -> List[Equation]:
+        """Basic equation detection in PDF text"""
+        equations = []
+        equation_pattern = r'\(([\d+-]+)\)'
+        for page_num, page in enumerate(self.doc):
+            text = page.get_text()
+            for line in text.split("\n"):
+                if any(char in line for char in ['=', '∫', '∑', '√', 'μ', 'π']):
+                    eq_number_match = re.search(equation_pattern, line)
+                    eq_number = eq_number_match.group(0) if eq_number_match else None
+                    equations.append(Equation(
+                        equation_id=f"eq_p{page_num}_{len(equations)}",
+                        latex=line.strip(),
+                        position=Position(page=page_num),
+                        number=eq_number
+                    ))
+        return equations
+
+    def _extract_figures(self) -> List[Figure]:
+        """Extract images from PDF pages"""
+        figures = []
+        for page_num, page in enumerate(self.doc):
+            for img_idx, img in enumerate(page.get_images(full=True)):
+                try:
+                    xref = img[0]
+                    base_image = self.doc.extract_image(xref)
+                    image_bytes = base_image["image"]
+                    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+                    figures.append(Figure(
+                        figure_id=f"fig_p{page_num}_{img_idx}",
+                        image_base64=image_base64,
+                        position=Position(page=page_num)
+                    ))
+                except Exception as e:
+                    print(f"Error extracting PDF figure on page {page_num}: {e}")
+                    continue
+        return figures
+
+    def _generate_metadata(self) -> DocumentMetadata:
+        """Generate PDF document metadata"""
+        return DocumentMetadata(
+            total_pages=len(self.doc),
+            total_paragraphs=0,
             total_equations=len(self.equations),
             total_figures=len(self.figures),
             total_tables=len(self.tables)
