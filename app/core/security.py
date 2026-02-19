@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta
 from typing import Optional
+import hmac
+import hashlib
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
@@ -9,13 +11,21 @@ from app.core.config import settings
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
+def _prehash_password(password: str) -> str:
+    """Pre-hash password with SHA-256 to avoid bcrypt's 72-byte limit"""
+    return hmac.new(
+        settings.SECRET_KEY.encode(),
+        password.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against a hash"""
-    return pwd_context.verify(plain_password, hashed_password)
+    return pwd_context.verify(_prehash_password(plain_password), hashed_password)
 
 def get_password_hash(password: str) -> str:
     """Hash a password"""
-    return pwd_context.hash(password)
+    return pwd_context.hash(_prehash_password(password))
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     """Create JWT access token"""

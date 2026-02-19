@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from app.core.security import get_current_user
 from app.database.connection import get_database
 from app.models.document import DocumentStatus
-from app.services.document_service import DOCXParser, PDFParser
+from app.services.document_service import DOCXParser
 from bson import ObjectId
 from datetime import datetime
 
@@ -31,6 +31,13 @@ async def process_document(
     if document["user_id"] != current_user["email"]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
     
+    # Only allow DOCX files
+    if document["file_type"] != "docx":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only DOCX files are supported"
+        )
+    
     # Update status to processing
     await db.documents.update_one(
         {"_id": ObjectId(document_id)},
@@ -44,12 +51,8 @@ async def process_document(
         }
     )
     
-    # Process document based on type
     try:
-        if document["file_type"] == "docx":
-            parser = DOCXParser(document["file_path"])
-        else:  # pdf
-            parser = PDFParser(document["file_path"])
+        parser = DOCXParser(document["file_path"])
         
         # Extract content
         text, equations, figures, tables, metadata = parser.parse()
@@ -95,19 +98,13 @@ async def process_document(
             detail=f"Processing failed: {str(e)}"
         )
 
+
 @router.get("/{document_id}/status")
 async def get_document_status(
     document_id: str,
     current_user: dict = Depends(get_current_user),
     db = Depends(get_database)
 ):
-    """
-    Get processing status of a document
-    
-    - **document_id**: ID of the document
-    - Returns: Current status and progress
-    """
-    
     document = await db.documents.find_one({"_id": ObjectId(document_id)})
     
     if not document:
@@ -122,28 +119,23 @@ async def get_document_status(
         "progress": document.get("progress", 0),
         "current_stage": document.get("current_stage", ""),
         "message": document.get("error_message", "Processing..."),
-        "changes_count": 0  # Will be populated in Milestone 2
+        "changes_count": 0
     }
+
 
 @router.get("/")
 async def list_documents(
     current_user: dict = Depends(get_current_user),
     db = Depends(get_database)
 ):
-    """
-    Get list of all documents for current user
-    
-    - Returns: List of documents
-    """
-    
     cursor = db.documents.find({"user_id": current_user["email"]})
     documents = await cursor.to_list(length=100)
     
-    # Convert ObjectId to string
     for doc in documents:
         doc["id"] = str(doc.pop("_id"))
     
     return {"documents": documents}
+
 
 @router.get("/{document_id}")
 async def get_document(
@@ -151,13 +143,6 @@ async def get_document(
     current_user: dict = Depends(get_current_user),
     db = Depends(get_database)
 ):
-    """
-    Get details of a specific document
-    
-    - **document_id**: ID of the document
-    - Returns: Document details
-    """
-    
     document = await db.documents.find_one({"_id": ObjectId(document_id)})
     
     if not document:
