@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from app.core.config import settings
 from app.database.connection import connect_to_mongo, close_mongo_connection
-from app.api import auth, upload, processing
+from app.api import auth, upload, processing, analysis
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -43,6 +43,7 @@ async def shutdown_event():
 app.include_router(auth.router, prefix=settings.API_V1_PREFIX)
 app.include_router(upload.router, prefix=settings.API_V1_PREFIX)
 app.include_router(processing.router, prefix=settings.API_V1_PREFIX)
+app.include_router(analysis.router, prefix=settings.API_V1_PREFIX)
 
 # ── Utility endpoints ─────────────────────────────────────────────────────────
 @app.get("/health", tags=["Health"])

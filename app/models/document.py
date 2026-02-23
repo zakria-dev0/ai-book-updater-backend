@@ -7,6 +7,7 @@ class DocumentStatus(str, Enum):
     UPLOADED = "uploaded"
     PROCESSING = "processing"
     COMPLETED = "completed"
+    ANALYZING = "analyzing"
     EXPORT_READY = "export_ready"
     ERROR = "error"
 

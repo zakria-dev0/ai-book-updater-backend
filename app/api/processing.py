@@ -452,3 +452,135 @@ async def get_equations(
         "total_equations": len(equations),
         "equations": equations,
     }
+
+
+# ------------------------------------------------------------------ #
+# Equation batch processing                                            #
+# ------------------------------------------------------------------ #
+
+@router.post(
+    "/{document_id}/equations/batch-process",
+    summary="Re-process all equations via Mathpix",
+    responses={
+        200: {"description": "Batch processing completed"},
+        400: {"description": "Document not processed or no figures"},
+        403: {"description": "Not authorized"},
+        404: {"description": "Document not found"},
+    },
+)
+async def batch_process_equations(
+    document_id: str,
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """
+    Re-process all figures through Mathpix to detect equations.
+    Replaces existing Mathpix-detected equations with fresh results.
+    Requires MATHPIX_APP_ID and MATHPIX_APP_KEY in .env.
+    """
+    repo = DocumentRepository(db)
+    document = await _get_owned_document(document_id, current_user, repo)
+
+    if document["status"] not in (DocumentStatus.COMPLETED, DocumentStatus.ERROR):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Document must be processed first",
+        )
+
+    if not settings.MATHPIX_APP_ID or not settings.MATHPIX_APP_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Mathpix API keys not configured",
+        )
+
+    from app.models.document import Figure, Equation
+
+    # Rebuild Figure objects from stored data
+    figures_raw = document.get("figures", [])
+    all_equations = document.get("equations", [])
+
+    # Also include figures that were previously classified as equations (re-scan them)
+    figures = [Figure(**f) if isinstance(f, dict) else f for f in figures_raw]
+
+    if not figures:
+        return {
+            "document_id": document_id,
+            "message": "No figures to process",
+            "equations_found": 0,
+        }
+
+    mathpix = MathpixService()
+    new_eqs, remaining_figs = await mathpix.extract_equations_from_figures(figures)
+
+    # Keep non-Mathpix equations (OMML-extracted), replace Mathpix ones
+    omml_equations = [eq for eq in all_equations if not eq.get("equation_id", "").startswith("eq_mathpix_")]
+    combined_equations = omml_equations + [eq.model_dump() for eq in new_eqs]
+
+    await repo.update_fields(document_id, {
+        "equations": combined_equations,
+        "figures": [fig.model_dump() for fig in remaining_figs],
+    })
+
+    logger.info(
+        "Batch equation processing for %s: %d new equations from %d figures",
+        document_id, len(new_eqs), len(figures),
+    )
+
+    return {
+        "document_id": document_id,
+        "message": "Batch equation processing completed",
+        "equations_found": len(new_eqs),
+        "total_equations": len(combined_equations),
+        "remaining_figures": len(remaining_figs),
+    }
+
+
+# ------------------------------------------------------------------ #
+# Equation preview                                                     #
+# ------------------------------------------------------------------ #
+
+@router.get(
+    "/{document_id}/equations/{equation_id}/preview",
+    summary="Get equation LaTeX preview",
+    responses={
+        200: {"description": "Equation preview data"},
+        404: {"description": "Equation or document not found"},
+        403: {"description": "Not authorized"},
+    },
+)
+async def get_equation_preview(
+    document_id: str,
+    equation_id: str,
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """
+    Return equation data for rendering preview.
+    Includes LaTeX string, base64 image (if available), and position info.
+    The frontend can render the LaTeX using KaTeX or MathJax.
+    """
+    repo = DocumentRepository(db)
+    document = await _get_owned_document(document_id, current_user, repo)
+
+    equations = document.get("equations", [])
+    equation = None
+    for eq in equations:
+        eq_id = eq.get("equation_id", "") if isinstance(eq, dict) else eq.equation_id
+        if eq_id == equation_id:
+            equation = eq
+            break
+
+    if not equation:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Equation not found")
+
+    eq_data = equation if isinstance(equation, dict) else equation.model_dump()
+
+    return {
+        "document_id": document_id,
+        "equation_id": equation_id,
+        "latex": eq_data.get("latex", ""),
+        "image_base64": eq_data.get("image_base64"),
+        "position": eq_data.get("position"),
+        "number": eq_data.get("number"),
+        "render_hint": "Use KaTeX or MathJax to render the LaTeX string on the frontend",
+    }

@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     MATHPIX_APP_KEY: str = ""
     OPENAI_API_KEY: str = ""
     TAVILY_API_KEY: str = ""
+
+    # AI Analysis Settings
+    GPT_MODEL: str = "gpt-4o"
+    CONTENT_STALENESS_YEARS: int = 3
+    MAX_RESEARCH_RESULTS: int = 5
     
     class Config:
         env_file = ".env"

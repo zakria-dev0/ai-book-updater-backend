@@ -141,7 +141,8 @@ class DOCXParser:
 
         equations = []
         MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
-        equation_number_pattern = r'\([\d][\d+\-]*\)'  # e.g. (6-4), (1), (3+1)
+        # Matches: (1), (6-4), (3.1), (A-2), (2.3.1), (iv), etc.
+        equation_number_pattern = r'\((\d+(?:[.\-]\d+)*|[A-Z](?:[.\-]\d+)+|[ivxlc]+)\)'
 
         for para_idx, para in enumerate(self.doc.paragraphs):
             # Find every <m:oMath> block inside this paragraph

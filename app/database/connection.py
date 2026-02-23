@@ -28,6 +28,15 @@ async def connect_to_mongo():
         "expires_at", expireAfterSeconds=0
     )
 
+    # changes: fast lookup by document and status
+    await database.changes.create_index("document_id")
+    await database.changes.create_index([("document_id", 1), ("status", 1)])
+    await database.changes.create_index([("created_at", -1)])
+
+    # changelogs: one per document analysis run
+    await database.changelogs.create_index("document_id")
+    await database.changelogs.create_index([("created_at", -1)])
+
     print(f"Connected to MongoDB – indexes ensured")
 
 
