@@ -22,6 +22,7 @@ class Position(BaseModel):
 class Equation(BaseModel):
     equation_id: str
     latex: str
+    raw_omml: Optional[str] = None  # Raw OMML XML for Mathpix/omml2latex conversion later
     image_base64: Optional[str] = None
     position: Position
     number: Optional[str] = None  # e.g., "(6-4)"
@@ -39,6 +40,13 @@ class Table(BaseModel):
     content: List[List[str]]  # 2D array of table cells
     position: Position
     number: Optional[str] = None  # e.g., "Table 6-1"
+
+class ProcessingHistoryEntry(BaseModel):
+    stage: str
+    progress: int
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    message: Optional[str] = None
+
 
 class DocumentMetadata(BaseModel):
     title: Optional[str] = None
@@ -74,6 +82,7 @@ class Document(BaseModel):
     # Progress tracking
     progress: int = 0  # 0-100
     current_stage: Optional[str] = None
+    processing_history: List[ProcessingHistoryEntry] = []
     
     class Config:
         populate_by_name = True

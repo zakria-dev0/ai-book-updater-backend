@@ -29,8 +29,8 @@ async def save_upload_file(file: UploadFile, user_id: str) -> tuple[str, str]:
     # Generate unique filename
     file_ext = os.path.splitext(file.filename)[1].lower()
     unique_filename = f"{uuid4()}{file_ext}"
-    file_path = os.path.join(settings.UPLOAD_DIR, unique_filename)
-    
+    file_path = os.path.abspath(os.path.join(settings.UPLOAD_DIR, unique_filename))
+
     # Save file
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)

@@ -18,7 +18,10 @@ class Settings(BaseSettings):
     
     # File Upload Configuration
     MAX_UPLOAD_SIZE: int = 52428800  # 50MB
-    ALLOWED_EXTENSIONS: List[str] = [".docx", ".pdf"]
+    ALLOWED_EXTENSIONS: List[str] = [".docx"]  # PDF skipped per client confirmation
+
+    # CORS
+    CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8000"]
     
     # Storage Paths
     UPLOAD_DIR: str = "./storage/uploads"

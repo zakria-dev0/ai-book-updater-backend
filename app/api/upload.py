@@ -1,71 +1,85 @@
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status
-from app.core.security import get_current_user
+from app.core.security import get_current_user_dep
 from app.database.connection import get_database
+from app.database.repositories.document_repo import DocumentRepository
 from app.models.document import Document, DocumentType
 from app.utils.file_handler import validate_file, save_upload_file
 from app.core.config import settings
+from app.core.logger import get_logger
 import os
 
-router = APIRouter(prefix="/upload", tags=["upload"])
+logger = get_logger(__name__)
 
-@router.post("/")
+router = APIRouter(prefix="/upload", tags=["Upload"])
+
+
+@router.post(
+    "/",
+    summary="Upload a DOCX document",
+    responses={
+        200: {"description": "Document uploaded successfully"},
+        400: {"description": "Invalid file type or size"},
+        401: {"description": "Not authenticated"},
+        500: {"description": "File save error"},
+    },
+)
 async def upload_document(
-    file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user),
-    db = Depends(get_database)
+    file: UploadFile = File(..., description="DOCX file to upload"),
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
 ):
     """
-    Upload a DOCX or PDF document for processing
-    
-    - **file**: DOCX or PDF file to upload
-    - Returns: Document metadata including document_id
+    Upload a DOCX document for processing.
+
+    - Only `.docx` files are accepted (PDF is out of scope for Milestone 1)
+    - Maximum file size: 50 MB
+    - Returns a `document_id` to track processing status
     """
-    
-    # Validate file
+    # Validate extension
     is_valid, message = validate_file(file)
     if not is_valid:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
-    
-    # Check file size
-    file.file.seek(0, 2)  # Seek to end
+
+    # Validate size
+    file.file.seek(0, 2)
     file_size = file.file.tell()
-    file.file.seek(0)  # Reset to beginning
-    
+    file.file.seek(0)
     if file_size > settings.MAX_UPLOAD_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File too large. Maximum size is {settings.MAX_UPLOAD_SIZE / 1024 / 1024}MB"
+            detail=f"File too large. Maximum size is {settings.MAX_UPLOAD_SIZE // (1024 * 1024)} MB",
         )
-    
-    # Save file
+
+    # Save to disk
     try:
         filename, file_path = await save_upload_file(file, current_user["email"])
     except Exception as e:
+        logger.error("Failed to save file for user %s: %s", current_user["email"], str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save file: {str(e)}"
+            detail=f"Failed to save file: {str(e)}",
         )
-    
-    # Determine file type
+
+    # Determine type (only docx accepted; guard already done above)
     file_ext = os.path.splitext(file.filename)[1].lower()
     file_type = DocumentType.DOCX if file_ext == ".docx" else DocumentType.PDF
-    
-    # Create document record
+
+    # Create DB record
     document = Document(
         filename=filename,
         original_filename=file.filename,
         file_type=file_type,
         file_path=file_path,
-        user_id=current_user["email"]
+        user_id=current_user["email"],
     )
-    
-    # Save to database
-    result = await db.documents.insert_one(document.model_dump(by_alias=True, exclude={"id"}))
-    document.id = str(result.inserted_id)
-    
+    repo = DocumentRepository(db)
+    doc_id = await repo.create(document.model_dump(by_alias=True, exclude={"id"}))
+
+    logger.info("Document uploaded: %s by %s", file.filename, current_user["email"])
     return {
-        "document_id": document.id,
-        "filename": document.original_filename,
-        "status": document.status,
-        "uploaded_at": document.uploaded_at.isoformat()
+        "document_id": doc_id,
+        "filename": file.filename,
+        "file_size_bytes": file_size,
+        "status": "uploaded",
+        "uploaded_at": document.uploaded_at.isoformat(),
     }
