@@ -12,33 +12,62 @@ import re
 import fitz  # PyMuPDF
 
 class DOCXParser:
-    """Parser for DOCX documents"""
-    
     def __init__(self, file_path: str):
         self.file_path = file_path
-        self.doc = DocxDocument(file_path)
-        self.equations: List[Equation] = []
-        self.figures: List[Figure] = []
-        self.tables: List[Table] = []
-        self.text_content = ""
+        try:
+            self.doc = DocxDocument(file_path)
+        except Exception as e:
+            raise ValueError(f"Invalid or corrupted DOCX file: {str(e)}")
     
     def parse(self) -> Tuple[str, List[Equation], List[Figure], List[Table], DocumentMetadata]:
         """Parse DOCX document and extract all content"""
         
-        # Extract text content
-        self.text_content = self._extract_text()
+        # Initialize empty lists first
+        self.equations = []
+        self.figures = []
+        self.tables = []
+        self.text_content = ""
         
-        # Extract equations
-        self.equations = self._extract_equations()
+        # Extract text content
+        try:
+            self.text_content = self._extract_text()
+        except Exception as e:
+            print(f"Error extracting text: {e}")
+            self.text_content = ""
+        
+        # Extract equations (placeholder for now - will implement with Mathpix later)
+        try:
+            self.equations = self._extract_equations()
+        except Exception as e:
+            print(f"Error extracting equations: {e}")
+            self.equations = []
         
         # Extract figures (images)
-        self.figures = self._extract_figures()
+        try:
+            self.figures = self._extract_figures()
+        except Exception as e:
+            print(f"Error extracting figures: {e}")
+            self.figures = []
         
         # Extract tables
-        self.tables = self._extract_tables()
+        try:
+            self.tables = self._extract_tables()
+        except Exception as e:
+            print(f"Error extracting tables: {e}")
+            self.tables = []
         
         # Generate metadata
-        metadata = self._generate_metadata()
+        try:
+            metadata = self._generate_metadata()
+        except Exception as e:
+            print(f"Error generating metadata: {e}")
+            metadata = DocumentMetadata(
+                total_pages=0,
+                total_paragraphs=0,
+                total_equations=0,
+                total_figures=0,
+                total_tables=0
+            )
         
         return self.text_content, self.equations, self.figures, self.tables, metadata
     
@@ -77,58 +106,96 @@ class DOCXParser:
         return equations
     
     def _extract_figures(self) -> List[Figure]:
-        """Extract images/figures from DOCX"""
+        """Extract images/figures from DOCX with position tracking"""
         figures = []
         
-        # Get all image relationships
-        for idx, rel in enumerate(self.doc.part.rels.values()):
+        # Map images to their positions in document
+        image_rels = {}
+        for rel in self.doc.part.rels.values():
             if "image" in rel.target_ref:
-                try:
-                    # Get image data
-                    image_data = rel.target_part.blob
-                    
-                    # Convert to base64
-                    image_base64 = base64.b64encode(image_data).decode('utf-8')
-                    
-                    # Try to find caption (look for nearby text mentioning "Figure")
-                    caption = self._find_figure_caption(idx)
-                    
-                    figure = Figure(
-                        figure_id=f"fig_{idx}",
-                        caption=caption,
-                        image_base64=image_base64,
-                        position=Position(),  # Will be refined
-                        number=self._extract_figure_number(caption) if caption else None
-                    )
-                    figures.append(figure)
-                except Exception as e:
-                    print(f"Error extracting figure {idx}: {e}")
-                    continue
+                image_rels[rel.rId] = rel
+        
+        # Find images in paragraphs and track position
+        for para_idx, para in enumerate(self.doc.paragraphs):
+            # Check for images in this paragraph
+            for run in para.runs:
+                if 'graphic' in run._element.xml:
+                    # Extract image from this run
+                    for rel_id, rel in image_rels.items():
+                        try:
+                            image_data = rel.target_part.blob
+                            image_base64 = base64.b64encode(image_data).decode('utf-8')
+                            
+                            # Find caption nearby
+                            caption = self._find_figure_caption_near_paragraph(para_idx)
+                            
+                            figure = Figure(
+                                figure_id=f"fig_{len(figures)}",
+                                caption=caption,
+                                image_base64=image_base64,
+                                position=Position(paragraph=para_idx),  # ✅ Now tracked
+                                number=self._extract_figure_number(caption) if caption else None
+                            )
+                            figures.append(figure)
+                            break
+                        except:
+                            continue
         
         return figures
     
+    def _find_figure_caption_near_paragraph(self, para_idx: int) -> Optional[str]:
+        """Find figure caption within +/- 2 paragraphs"""
+        start = max(0, para_idx - 2)
+        end = min(len(self.doc.paragraphs), para_idx + 3)
+        
+        for i in range(start, end):
+            para_text = self.doc.paragraphs[i].text
+            if re.search(r'Figure\s+\d+-\d+', para_text, re.IGNORECASE):
+                return para_text.strip()
+        
+        return None
+    
     def _extract_tables(self) -> List[Table]:
-        """Extract tables from DOCX"""
+        """Extract tables from DOCX with position tracking"""
         tables = []
         
-        for idx, table in enumerate(self.doc.tables):
-            # Extract table data as 2D array
-            table_data = []
-            for row in table.rows:
-                row_data = [cell.text for cell in row.cells]
-                table_data.append(row_data)
+        from docx.oxml.table import CT_Tbl
+        from docx.oxml.text.paragraph import CT_P
+        
+        try:
+            body_elements = list(self.doc.element.body)
+            paragraph_counter = 0
             
-            # Try to find caption
-            caption = self._find_table_caption(idx)
-            
-            table_obj = Table(
-                table_id=f"tbl_{idx}",
-                caption=caption,
-                content=table_data,
-                position=Position(),  # Will be refined
-                number=self._extract_table_number(caption) if caption else None
-            )
-            tables.append(table_obj)
+            for idx, element in enumerate(body_elements):
+                if isinstance(element, CT_P):  # Paragraph
+                    paragraph_counter += 1
+                
+                elif isinstance(element, CT_Tbl):  # Table
+                    try:
+                        table = self.doc.tables[len(tables)]  # Get actual table object
+                        
+                        # Extract table data as 2D array
+                        table_data = []
+                        for row in table.rows:
+                            row_data = [cell.text.strip() for cell in row.cells]
+                            table_data.append(row_data)
+                        
+                        # Find caption
+                        caption = self._find_table_caption_near_element(idx, body_elements)
+                        
+                        table_obj = Table(
+                            table_id=f"tbl_{len(tables)}",
+                            caption=caption,
+                            content=table_data,
+                            position=Position(paragraph=paragraph_counter),
+                            number=self._extract_table_number(caption) if caption else None
+                        )
+                        tables.append(table_obj)
+                    except Exception as e:
+                        print(f"Error extracting table {len(tables)}: {e}")
+                        continue
+        except Exception as e:
+            print(f"Error in table extraction: {e}")
         
         return tables
     
@@ -178,6 +245,37 @@ class DOCXParser:
             total_figures=len(self.figures),
             total_tables=len(self.tables)
         )
+    
+    def _find_table_caption_near_element(self, element_idx: int, body_elements) -> Optional[str]:
+        """
+        Find table caption near a table element
+        
+        Args:
+            element_idx: Index of table in body elements
+            body_elements: All body elements (paragraphs and tables)
+            
+        Returns:
+            Caption text if found, None otherwise
+        """
+        from docx.oxml.text.paragraph import CT_P
+        
+        # Check 2 paragraphs before and after the table
+        start_idx = max(0, element_idx - 2)
+        end_idx = min(len(body_elements), element_idx + 3)
+        
+        for i in range(start_idx, end_idx):
+            element = body_elements[i]
+            if isinstance(element, CT_P):
+                # Get paragraph text
+                para_text = ""
+                for text_element in element.itertext():
+                    para_text += text_element
+                
+                # Check if it contains "Table"
+                if re.search(r'Table\s+\d+-\d+', para_text, re.IGNORECASE):
+                    return para_text.strip()
+        
+        return None
 
 
 class PDFParser:

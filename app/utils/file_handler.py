@@ -1,6 +1,8 @@
 import os
+import uuid
 import shutil
 from uuid import uuid4
+import aiofiles
 from pathlib import Path
 from fastapi import UploadFile, HTTPException
 from app.core.config import settings
@@ -41,3 +43,20 @@ def delete_file(file_path: str):
     """Delete a file from storage"""
     if os.path.exists(file_path):
         os.remove(file_path)
+
+async def save_upload_file_from_bytes(
+    file_content: bytes,
+    original_filename: str,
+    user_id: str
+) -> tuple[str, str]:
+    """Save file from bytes instead of stream - avoids multipart boundary issues"""
+    file_ext = os.path.splitext(original_filename)[1].lower()
+    filename = f"{uuid.uuid4()}{file_ext}"
+    file_path = os.path.join("./storage/uploads", filename)
+    
+    os.makedirs("./storage/uploads", exist_ok=True)
+    
+    async with aiofiles.open(file_path, 'wb') as f:
+        await f.write(file_content)
+    
+    return filename, file_path

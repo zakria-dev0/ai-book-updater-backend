@@ -39,22 +39,36 @@ async def process_document(
                 "status": DocumentStatus.PROCESSING,
                 "processing_started_at": datetime.utcnow(),
                 "progress": 10,
-                "current_stage": "document_extraction"
+                "current_stage": "initializing"
             }
         }
     )
     
-    # Process document based on type
     try:
         if document["file_type"] == "docx":
             parser = DOCXParser(document["file_path"])
-        else:  # pdf
-            parser = PDFParser(document["file_path"])
+        await db.documents.update_one(
+            {"_id": ObjectId(document_id)},
+            {"$set": {"progress": 20, "current_stage": "extracting_text"}}
+        )
         
-        # Extract content
         text, equations, figures, tables, metadata = parser.parse()
         
-        # Update document with extracted content
+        await db.documents.update_one(
+            {"_id": ObjectId(document_id)},
+            {"$set": {"progress": 40, "current_stage": "extracting_figures"}}
+        )
+        
+        await db.documents.update_one(
+            {"_id": ObjectId(document_id)},
+            {"$set": {"progress": 60, "current_stage": "extracting_tables"}}
+        )
+        
+        await db.documents.update_one(
+            {"_id": ObjectId(document_id)},
+            {"$set": {"progress": 80, "current_stage": "generating_metadata"}}
+        )
+        
         await db.documents.update_one(
             {"_id": ObjectId(document_id)},
             {
