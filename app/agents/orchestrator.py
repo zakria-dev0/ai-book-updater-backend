@@ -55,7 +55,7 @@ update_agent = UpdateAgent()
 async def _update_analysis_progress(state: AnalysisState, stage: str, progress: int, message: str = ""):
     """Write analysis progress to the document record in DB."""
     db = state.get("db")
-    if not db:
+    if db is None:
         return
     try:
         doc_repo = DocumentRepository(db)
