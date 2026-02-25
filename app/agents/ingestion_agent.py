@@ -1,22 +1,32 @@
 """
 Content Analysis Agent — uses GPT-4o to scan document text and identify
 factual claims that may be outdated (dates, statistics, company info,
-missions, technologies, policies, citations).
+missions, technologies, policies, citations, constellations).
+
+Supports:
+- Focus area filtering (only detect claims matching selected categories)
+- Writing style analysis (determine document's grade level, tone, complexity)
+- Enhanced constellation/mega-constellation detection patterns
 """
 import json
 import uuid
 import asyncio
-from typing import List
-from openai import AsyncOpenAI, RateLimitError, APITimeoutError
+from typing import List, Optional
+from openai import AsyncOpenAI, RateLimitError, APITimeoutError, APIError, APIConnectionError
 from app.core.config import settings
 from app.core.logger import get_logger
-from app.models.change import FactualClaim
+from app.models.change import (
+    FactualClaim,
+    FocusArea,
+    CLAIM_TYPE_TO_FOCUS_AREA,
+    StyleProfile,
+)
 
 logger = get_logger(__name__)
 
 # Retry settings
-MAX_RETRIES = 3
-RETRY_BASE_DELAY = 2  # seconds
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 3  # seconds
 
 SYSTEM_PROMPT = """\
 You are an expert fact-checker for academic and technical books.
@@ -33,14 +43,29 @@ Look for ANY of these types of claims:
 - Named entities with associated factual information (people, organizations, places)
 - Descriptions of current state of any field, industry, or technology
 - Any sentence with a verifiable fact that could change over time
+- Satellite constellations: constellation sizes, numbers of satellites, constellation purposes,
+  mega-constellation references, orbital network descriptions. Pay special attention to statements
+  about constellation sizes in "dozens" or "hundreds" — modern mega-constellations have thousands.
 
 For EACH claim you find, return a JSON object with these fields:
 - "text": the exact sentence or phrase containing the claim
-- "claim_type": one of "statistic", "date", "company_info", "mission", "technology", "policy", "citation", "regulation"
+- "claim_type": one of "statistic", "date", "company_info", "mission", "technology", "policy", "citation", "regulation", "constellation", "historical", "business_philosophy"
 - "paragraph_idx": the paragraph index (provided with the text)
 - "entities": list of named entities (people, orgs, places) mentioned
 - "temporal_refs": list of dates or years mentioned (e.g. "2019", "March 2020")
 - "is_outdated": whether the claim's TRUTH VALUE has likely changed (see rules below)
+
+CLAIM TYPE GUIDANCE:
+- "constellation": ANY mention of satellite constellations, constellation sizes, GPS/GLONASS/Galileo
+  constellations, Starlink, OneWeb, Kuiper, mega-constellations, orbital networks, satellite counts
+- "mission": Space missions, launches, mission names, rocket flights, exploration programs
+- "technology": Hardware, software, systems, tech versions, spacecraft capabilities
+- "statistic": Numerical data, percentages, rankings, metrics, budgets
+- "company_info": Company details, leadership, ownership, mergers, acquisitions
+- "business_philosophy": Industry trends, commercial space evolution, market dynamics
+- "historical": Historical dates, events, milestones, founding dates
+- "date": Time-sensitive references using "currently", "now", "as of", "recently"
+- "policy"/"regulation": Laws, standards, guidelines, treaties, regulatory frameworks
 
 CRITICAL RULES for determining "is_outdated":
 
@@ -63,6 +88,10 @@ Set is_outdated = TRUE ONLY when:
   demonstrably different (not just slightly evolved but fundamentally changed).
 - The claim uses "currently", "now", "the latest", "the newest" and the underlying
   fact has been specifically superseded by a known successor or replacement.
+- For constellations: statements about constellation sizes that are dramatically outdated
+  (e.g. "constellations typically consist of 24-48 satellites" — now mega-constellations
+  have thousands). Statements about constellation purposes limited to navigation only,
+  when modern constellations serve broadband, IoT, imaging, etc.
 
 When in doubt, set is_outdated = FALSE. Only flag claims where you are confident the
 statement would actively mislead a reader today.
@@ -88,6 +117,8 @@ Rules:
   has a date prefix like "As of [year]". The "As of" prefix does NOT protect present-tense
   assertions — focus on whether the core verb uses "is/are" with a superlative.
 - Only flag claims where a specific fact has been clearly superseded (new CEO, new version, etc.).
+- For constellation claims: statements about small constellation sizes (24-48 satellites as "typical")
+  ARE outdated given modern mega-constellations (thousands of satellites).
 
 For each claim, return:
 - "claim_id": the original claim_id
@@ -96,6 +127,31 @@ For each claim, return:
 
 Return a JSON object: {{"verified_claims": [...]}}
 Only return valid JSON — no markdown fences, no extra text.
+"""
+
+STYLE_ANALYSIS_PROMPT = """\
+You are an expert linguistic analyst. Analyze the writing style of the following document excerpt
+and produce a style profile.
+
+Determine each of the following:
+- "grade_level": one of "college_freshman", "college_junior", "college_senior", "graduate"
+- "technical_depth": one of "introductory", "intermediate", "advanced"
+- "tone": one of "conversational", "formal_academic", "authoritative"
+- "sentence_complexity": one of "simple", "moderate", "complex"
+- "terminology_level": one of "basic", "technical", "highly_technical"
+- "avg_sentence_length": estimated average number of words per sentence (integer)
+- "passive_voice_usage": one of "rare", "moderate", "frequent"
+
+Consider:
+- Vocabulary sophistication and domain-specific terminology
+- Sentence structure (simple vs. compound-complex)
+- Use of passive voice vs. active voice
+- Formality level (contractions, colloquialisms vs. academic register)
+- Technical jargon density
+- Reference style (inline citations, footnotes, etc.)
+
+Return ONLY a JSON object with these fields. No extra text, no markdown fences.
+Example: {{"grade_level": "college_senior", "technical_depth": "advanced", "tone": "formal_academic", "sentence_complexity": "complex", "terminology_level": "highly_technical", "avg_sentence_length": 28, "passive_voice_usage": "moderate"}}
 """
 
 CHUNK_SIZE = 8  # paragraphs per GPT call
@@ -108,15 +164,73 @@ class ContentAnalysisAgent:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
 
+    # ------------------------------------------------------------------ #
+    # Writing Style Analysis                                               #
+    # ------------------------------------------------------------------ #
+
+    async def analyze_style(self, text_content: str) -> StyleProfile:
+        """
+        Analyze the first 3000 characters of a document to determine
+        its writing style profile. Run once per document.
+        """
+        if not settings.OPENAI_API_KEY:
+            logger.warning("OpenAI API key not configured — returning default style profile")
+            return StyleProfile()
+
+        excerpt = text_content[:3000]
+
+        try:
+            response = await self._call_with_retry(STYLE_ANALYSIS_PROMPT, excerpt)
+            if response is None:
+                logger.warning("Style analysis call failed — returning default profile")
+                return StyleProfile()
+
+            if response.usage:
+                self.total_prompt_tokens += response.usage.prompt_tokens
+                self.total_completion_tokens += response.usage.completion_tokens
+
+            raw = response.choices[0].message.content
+            logger.info("Style analysis raw response: %s", raw[:500])
+            data = json.loads(raw)
+
+            profile = StyleProfile(
+                grade_level=data.get("grade_level", "college_senior"),
+                technical_depth=data.get("technical_depth", "intermediate"),
+                tone=data.get("tone", "formal_academic"),
+                sentence_complexity=data.get("sentence_complexity", "moderate"),
+                terminology_level=data.get("terminology_level", "technical"),
+                avg_sentence_length=data.get("avg_sentence_length", 25),
+                passive_voice_usage=data.get("passive_voice_usage", "moderate"),
+            )
+            logger.info(
+                "Style profile: grade=%s, depth=%s, tone=%s, complexity=%s, terminology=%s",
+                profile.grade_level, profile.technical_depth, profile.tone,
+                profile.sentence_complexity, profile.terminology_level,
+            )
+            return profile
+
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse style analysis response: %s", e)
+            return StyleProfile()
+        except Exception as e:
+            logger.error("Style analysis failed: %s", e)
+            return StyleProfile()
+
+    # ------------------------------------------------------------------ #
+    # Claim Analysis with Focus Area Support                               #
+    # ------------------------------------------------------------------ #
+
     async def analyze_document(
         self,
         document_id: str,
         text_content: str,
         paragraphs: List[str] | None = None,
+        focus_areas: Optional[List[str]] = None,
     ) -> List[FactualClaim]:
         """
         Analyze document text and return a list of FactualClaim objects.
-        If paragraphs list is not provided, splits text_content by newlines.
+        If focus_areas is provided (not ["all"]), claims are filtered to only
+        those matching the specified categories.
         """
         if not settings.OPENAI_API_KEY:
             logger.warning("OpenAI API key not configured — skipping content analysis")
@@ -124,6 +238,12 @@ class ContentAnalysisAgent:
 
         if paragraphs is None:
             paragraphs = [p for p in text_content.split("\n") if p.strip()]
+
+        # Resolve focus areas
+        active_focus = None
+        if focus_areas and "all" not in focus_areas:
+            active_focus = set(focus_areas)
+            logger.info("Focus area filtering active: %s", active_focus)
 
         all_claims: List[FactualClaim] = []
 
@@ -138,6 +258,20 @@ class ContentAnalysisAgent:
                 chunk_start,
                 chunk_start + len(chunk) - 1,
                 len(chunk_claims),
+            )
+
+        # Assign focus_area to each claim based on claim_type
+        for claim in all_claims:
+            mapped = CLAIM_TYPE_TO_FOCUS_AREA.get(claim.claim_type)
+            claim.focus_area = mapped.value if mapped else "technology"
+
+        # Filter by focus areas if specified
+        if active_focus:
+            before_count = len(all_claims)
+            all_claims = [c for c in all_claims if c.focus_area in active_focus]
+            logger.info(
+                "Focus area filter: %d → %d claims (kept areas: %s)",
+                before_count, len(all_claims), active_focus,
             )
 
         # Verification pass: double-check outdated flags
@@ -315,7 +449,7 @@ class ContentAnalysisAgent:
             return []
 
     async def _call_with_retry(self, system: str, user_content: str):
-        """Call OpenAI with exponential backoff retry on rate limits."""
+        """Call OpenAI with exponential backoff retry on transient errors."""
         for attempt in range(MAX_RETRIES):
             try:
                 return await self.client.chat.completions.create(
@@ -326,15 +460,21 @@ class ContentAnalysisAgent:
                     ],
                     temperature=0.1,
                     response_format={"type": "json_object"},
+                    timeout=120.0,
                 )
-            except (RateLimitError, APITimeoutError) as e:
+            except (RateLimitError, APITimeoutError, APIConnectionError, APIError) as e:
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
+                error_type = type(e).__name__
+                status_code = getattr(e, "status_code", "N/A")
                 logger.warning(
-                    "OpenAI rate limit/timeout (attempt %d/%d), retrying in %ds: %s",
-                    attempt + 1, MAX_RETRIES, delay, e,
+                    "OpenAI %s (status=%s, attempt %d/%d), retrying in %ds: %s",
+                    error_type, status_code, attempt + 1, MAX_RETRIES, delay, str(e)[:200],
                 )
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(delay)
                 else:
-                    logger.error("OpenAI call failed after %d retries", MAX_RETRIES)
+                    logger.error(
+                        "OpenAI call failed after %d retries. Last error: %s (status=%s)",
+                        MAX_RETRIES, error_type, status_code,
+                    )
                     return None

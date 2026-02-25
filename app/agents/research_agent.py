@@ -2,6 +2,11 @@
 Research Agent — takes flagged outdated claims and researches them
 using Tavily web search to find updated information.
 Supports parallel processing with concurrency limits.
+
+Enhanced with:
+- Better query building for constellation/mega-constellation topics
+- Claim-type-aware search strategies
+- More search results for comprehensive synthesis
 """
 import asyncio
 from typing import Dict, List
@@ -25,7 +30,7 @@ class ResearchAgent:
     ) -> Dict[str, List[ResearchResult]]:
         """
         Research each outdated claim via Tavily using parallel async calls.
-        Returns a dict mapping claim_id → list of ResearchResult.
+        Returns a dict mapping claim_id -> list of ResearchResult.
         """
         if not self.tavily.is_configured:
             logger.warning("Tavily not configured — skipping research")
@@ -61,50 +66,74 @@ class ResearchAgent:
     ) -> List[ResearchResult]:
         """Research a single claim with semaphore-based concurrency control."""
         async with self._semaphore:
-            logger.info("Researching claim %d/%d: %s", idx + 1, total, claim.text[:80])
+            logger.info("Researching claim %d/%d [%s]: %s", idx + 1, total, claim.claim_type, claim.text[:80])
             query = self._build_query(claim)
+            logger.info("  Search query: %s", query)
             search_results = await self.tavily.search_authoritative(query)
 
             if search_results:
                 logger.info(
-                    "  → %d results found (top source: %s)",
+                    "  -> %d results found (top source: %s, score=%.2f)",
                     len(search_results),
                     search_results[0].source_type,
+                    search_results[0].relevance_score,
                 )
             else:
-                logger.info("  → no results found")
+                logger.info("  -> no results found")
 
             return search_results
 
     @staticmethod
     def _build_query(claim: FactualClaim) -> str:
-        """Build an effective search query from claim text and entities."""
+        """Build an effective search query from claim text, entities, and type.
+        Enhanced with specialized query patterns for constellations and missions."""
         parts = []
 
         # Use entities if available for a focused query
         if claim.entities:
             parts.append(" ".join(claim.entities[:3]))
 
-        # Add claim type context
+        # Claim-type-specific query strategies
         type_context = {
-            "statistic": "latest statistics",
-            "date": "current status",
-            "company_info": "latest news",
-            "mission": "current status update",
-            "technology": "latest development",
-            "policy": "current policy",
-            "regulation": "current regulation",
-            "citation": "latest research",
+            "statistic": "latest statistics data",
+            "date": "current status update",
+            "company_info": "latest company news update",
+            "mission": "space mission current status update",
+            "technology": "latest technology development update",
+            "policy": "current policy regulation",
+            "regulation": "current regulation update",
+            "citation": "latest research findings",
+            "constellation": "satellite constellation current size status update",
+            "historical": "current status update",
+            "business_philosophy": "industry trends commercial space update",
         }
         context = type_context.get(claim.claim_type, "latest update")
         parts.append(context)
+
+        # Special handling for constellation claims — add specific sub-queries
+        claim_lower = claim.text.lower()
+        if claim.claim_type == "constellation" or any(kw in claim_lower for kw in [
+            "constellation", "starlink", "oneweb", "kuiper", "mega-constellation",
+            "satellite network", "orbital network"
+        ]):
+            # Add constellation-specific context
+            if "starlink" in claim_lower or "spacex" in claim_lower:
+                parts.append("Starlink constellation total satellites deployed")
+            elif "oneweb" in claim_lower:
+                parts.append("OneWeb constellation deployment status")
+            elif "kuiper" in claim_lower or "amazon" in claim_lower:
+                parts.append("Amazon Kuiper constellation progress")
+            elif "gps" in claim_lower:
+                parts.append("GPS constellation current satellite count")
+            else:
+                parts.append("mega-constellation satellite count Starlink OneWeb")
 
         # Add temporal context if available
         if claim.temporal_refs:
             parts.append(f"after {claim.temporal_refs[0]}")
 
         # Fallback: use first 100 chars of claim text
-        if not parts:
+        if len(parts) <= 1:
             parts.append(claim.text[:100])
 
         query = " ".join(parts)

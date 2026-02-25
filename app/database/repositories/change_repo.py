@@ -78,15 +78,22 @@ class ChangeRepository:
         )
 
     async def update_status(
-        self, change_id: str, status: str, reviewer_note: str = ""
+        self, change_id: str, status: str, reviewer_note: str = "",
+        approval_action: str = "", user_edited_content: str = "",
     ) -> bool:
+        update_fields = {
+            "status": status,
+            "reviewed_at": datetime.utcnow(),
+            "reviewer_note": reviewer_note,
+        }
+        if approval_action:
+            update_fields["approval_action"] = approval_action
+        if user_edited_content:
+            update_fields["user_edited_content"] = user_edited_content
+
         result = await self.changes.update_one(
             {"_id": ObjectId(change_id)},
-            {"$set": {
-                "status": status,
-                "reviewed_at": datetime.utcnow(),
-                "reviewer_note": reviewer_note,
-            }},
+            {"$set": update_fields},
         )
         return result.modified_count > 0
 

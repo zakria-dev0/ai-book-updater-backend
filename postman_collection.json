@@ -368,18 +368,83 @@
       "name": "AI Analysis",
       "item": [
         {
-          "name": "Trigger Analysis",
+          "name": "Trigger Analysis (All Focus Areas)",
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
             ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"focus_areas\": [\"all\"]\n}"
+            },
             "url": {
               "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/analyze",
               "host": ["{{base_url}}{{api_prefix}}"],
               "path": ["documents", "{{document_id}}", "analyze"]
             },
-            "description": "Run the full AI analysis pipeline on a processed document:\n1. **Content Analysis** — GPT-4o scans text for factual claims\n2. **Research** — Tavily searches for updated information\n3. **Proposals** — GPT-4o generates change suggestions\n4. **Validation** — cross-reference quality checks\n\nRequires document status = completed."
+            "description": "Run the full AI analysis pipeline on a processed document:\n1. **Writing Style Analysis** — determines grade level, tone, complexity\n2. **Content Analysis** — GPT-4o scans text for factual claims (filtered by focus_areas)\n3. **Research** — Tavily searches for updated information (authoritative sources only)\n4. **Proposals** — GPT-4o generates style-matched change suggestions\n5. **Validation** — cross-reference quality checks\n\n**focus_areas** options: missions, constellations, technology, statistics, companies, business_philosophy, historical_facts, all (default)\n\nRequires document status = completed."
+          }
+        },
+        {
+          "name": "Trigger Analysis (Filtered: Missions + Constellations)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"focus_areas\": [\"missions\", \"constellations\"]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/analyze",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "analyze"]
+            },
+            "description": "Run analysis filtered to only missions and constellations. The system will SKIP technology updates, company changes, etc.\n\nUseful for history chapters or mission-focused content."
+          }
+        },
+        {
+          "name": "Trigger Analysis (Filtered: Historical + Companies)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"focus_areas\": [\"historical_facts\", \"companies\", \"business_philosophy\"]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/analyze",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "analyze"]
+            },
+            "description": "Run analysis filtered to historical facts, companies, and business philosophy. Useful for industry/policy chapters."
+          }
+        },
+        {
+          "name": "Trigger Analysis (Filtered: Technology + Statistics)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"focus_areas\": [\"technology\", \"statistics\"]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/analyze",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "analyze"]
+            },
+            "description": "Run analysis filtered to technology and statistics. Useful for technical chapters with equations and system specs."
           }
         },
         {
@@ -394,11 +459,11 @@
               "host": ["{{base_url}}{{api_prefix}}"],
               "path": ["documents", "{{document_id}}", "analysis", "status"]
             },
-            "description": "Check whether a document has been analyzed and get summary stats (total claims, outdated, changes)."
+            "description": "Check analysis status. Returns:\n- **status**: current document status\n- **is_analyzed**: boolean\n- **style_profile**: document writing style (grade_level, tone, complexity, etc.)\n- **analysis_summary**: total claims, outdated, changes, focus_areas used"
           }
         },
         {
-          "name": "Get Claims",
+          "name": "Get Claims (All)",
           "request": {
             "method": "GET",
             "header": [
@@ -409,10 +474,47 @@
               "host": ["{{base_url}}{{api_prefix}}"],
               "path": ["documents", "{{document_id}}", "claims"],
               "query": [
-                { "key": "outdated_only", "value": "false", "description": "Set to true to only see outdated claims" }
+                { "key": "outdated_only", "value": "false", "description": "Set to true to only see outdated claims" },
+                { "key": "focus_area", "value": "", "description": "Filter by focus area: missions, constellations, technology, statistics, companies, business_philosophy, historical_facts", "disabled": true }
               ]
             },
-            "description": "Return all factual claims identified during analysis. Each claim includes:\n- **claim_id**: Unique identifier\n- **text**: Original text containing the claim\n- **claim_type**: statistic, date, company_info, mission, technology, etc.\n- **entities**: Named entities mentioned\n- **temporal_refs**: Dates/years found\n- **is_outdated**: Whether the claim is flagged as potentially outdated"
+            "description": "Return all factual claims identified during analysis. Each claim includes:\n- **claim_id**: Unique identifier\n- **text**: Original text containing the claim\n- **claim_type**: statistic, date, company_info, mission, technology, constellation, etc.\n- **focus_area**: Resolved focus category (missions, constellations, technology, etc.)\n- **entities**: Named entities mentioned\n- **temporal_refs**: Dates/years found\n- **is_outdated**: Whether the claim is flagged as potentially outdated"
+          }
+        },
+        {
+          "name": "Get Claims (Outdated Only)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/claims?outdated_only=true",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "claims"],
+              "query": [
+                { "key": "outdated_only", "value": "true" }
+              ]
+            },
+            "description": "Return only claims flagged as outdated."
+          }
+        },
+        {
+          "name": "Get Claims (By Focus Area)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/claims?focus_area=constellations",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "claims"],
+              "query": [
+                { "key": "focus_area", "value": "constellations", "description": "Filter: missions, constellations, technology, statistics, companies, business_philosophy, historical_facts" }
+              ]
+            },
+            "description": "Return claims filtered by a specific focus area."
           }
         },
         {
@@ -429,10 +531,29 @@
               "query": [
                 { "key": "page", "value": "1" },
                 { "key": "page_size", "value": "20" },
-                { "key": "status_filter", "value": "", "description": "Filter by: pending, approved, rejected, applied", "disabled": true }
+                { "key": "status_filter", "value": "", "description": "Filter by: pending, approved, rejected, applied", "disabled": true },
+                { "key": "change_type", "value": "", "description": "Filter by type: data_update, tech_update, mission_update, company_update, constellation_update, statistics_update, system_update, regulation_update, business_model_update, historical_correction", "disabled": true }
               ]
             },
-            "description": "Paginated list of AI-generated change proposals. Each proposal includes:\n- **old_content**: Original text\n- **new_content**: Suggested replacement\n- **change_type**: data_update, tech_update, mission_update, etc.\n- **confidence**: high, medium, low\n- **sources**: Research sources with URLs\n- **status**: pending, approved, rejected"
+            "description": "Paginated list of AI-generated change proposals. Each proposal includes:\n- **old_content**: Original text\n- **new_content**: Style-matched suggested replacement (technical depth matched to document)\n- **change_type**: data_update, tech_update, mission_update, constellation_update, statistics_update, system_update, regulation_update, business_model_update, historical_correction, etc.\n- **confidence**: high, medium, low\n- **sources**: Authoritative research sources (NASA, ESA, IEEE, etc.) with URLs\n- **status**: pending, approved, rejected\n- **user_edited_content**: User's modified version (if edited)\n- **approval_action**: approve_as_is, approve_with_edit, reject"
+          }
+        },
+        {
+          "name": "List Changes (By Type: constellation_update)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/changes?change_type=constellation_update",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "changes"],
+              "query": [
+                { "key": "change_type", "value": "constellation_update" }
+              ]
+            },
+            "description": "Filter change proposals by type. Example: only constellation-related updates."
           }
         },
         {
@@ -447,45 +568,67 @@
               "host": ["{{base_url}}{{api_prefix}}"],
               "path": ["documents", "{{document_id}}", "changes", "{{change_id}}"]
             },
-            "description": "Get full details of a single change proposal including all research sources."
+            "description": "Get full details of a single change proposal including all research sources, confidence, and style-matched content."
           }
         },
         {
-          "name": "Approve Change",
+          "name": "Review: Approve As-Is",
           "request": {
             "method": "PUT",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
             ],
-            "url": {
-              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/changes/{{change_id}}?action=approve&note=Looks good",
-              "host": ["{{base_url}}{{api_prefix}}"],
-              "path": ["documents", "{{document_id}}", "changes", "{{change_id}}"],
-              "query": [
-                { "key": "action", "value": "approve", "description": "approve or reject" },
-                { "key": "note", "value": "Looks good", "description": "Optional reviewer note" }
-              ]
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"approve_as_is\",\n  \"note\": \"Looks good, using AI suggestion directly\"\n}"
             },
-            "description": "Approve a change proposal. The status changes from 'pending' to 'approved'."
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/changes/{{change_id}}",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "changes", "{{change_id}}"]
+            },
+            "description": "Approve a change proposal as-is. Uses the AI-generated new_content directly.\n\n**action** options:\n- `approve_as_is` — accept AI suggestion\n- `approve_with_edit` — accept with user modifications (requires edited_content)\n- `reject` — reject this change"
           }
         },
         {
-          "name": "Reject Change",
+          "name": "Review: Approve With Edit",
           "request": {
             "method": "PUT",
             "header": [
-              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
             ],
-            "url": {
-              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/changes/{{change_id}}?action=reject&note=Not applicable",
-              "host": ["{{base_url}}{{api_prefix}}"],
-              "path": ["documents", "{{document_id}}", "changes", "{{change_id}}"],
-              "query": [
-                { "key": "action", "value": "reject", "description": "approve or reject" },
-                { "key": "note", "value": "Not applicable", "description": "Optional reviewer note" }
-              ]
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"approve_with_edit\",\n  \"note\": \"Modified the AI suggestion to better fit the chapter context\",\n  \"edited_content\": \"Your custom edited text goes here. This will be used instead of the AI-generated new_content when applying changes.\"\n}"
             },
-            "description": "Reject a change proposal. The status changes from 'pending' to 'rejected'."
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/changes/{{change_id}}",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "changes", "{{change_id}}"]
+            },
+            "description": "Approve a change with user edits. The user-modified text is saved in `user_edited_content` and will be used instead of the AI's `new_content` when applying changes in Milestone 4.\n\n**edited_content** is REQUIRED when action = 'approve_with_edit'."
+          }
+        },
+        {
+          "name": "Review: Reject Change",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"reject\",\n  \"note\": \"Not applicable to this chapter\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/changes/{{change_id}}",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "changes", "{{change_id}}"]
+            },
+            "description": "Reject a change proposal. Status changes to 'rejected'."
           }
         },
         {
@@ -500,7 +643,7 @@
               "host": ["{{base_url}}{{api_prefix}}"],
               "path": ["documents", "{{document_id}}", "changelog"]
             },
-            "description": "Full change log for the most recent analysis run. Includes all claims, proposals, and summary stats."
+            "description": "Full change log for the most recent analysis run. Includes all claims, proposals, style_profile, focus_areas, and summary stats."
           }
         },
         {
@@ -515,7 +658,7 @@
               "host": ["{{base_url}}{{api_prefix}}"],
               "path": ["documents", "{{document_id}}", "changelog", "export"]
             },
-            "description": "Export the full changelog as JSON including document metadata, all claims, proposals, and research sources."
+            "description": "Export the full changelog as JSON (v2.0). Includes document metadata with style_profile, all claims with focus_area, proposals with user_edited_content, and research sources."
           }
         }
       ]

@@ -1,6 +1,11 @@
 """
 LangGraph Orchestrator — coordinates the full AI analysis pipeline:
-  analyze → research → propose → validate → complete
+  style_analyze → analyze → research → propose → validate → complete
+
+Enhanced with:
+- Focus area filtering (only analyze/research selected categories)
+- Writing style analysis (run once, pass to proposal generation)
+- Style-matched update generation
 """
 import uuid
 import asyncio
@@ -14,6 +19,7 @@ from app.models.change import (
     ChangeProposal,
     ChangeLog,
     ConfidenceLevel,
+    StyleProfile,
 )
 from app.agents.ingestion_agent import ContentAnalysisAgent
 from app.agents.research_agent import ResearchAgent
@@ -33,6 +39,8 @@ class AnalysisState(TypedDict):
     document_id: str
     text_content: str
     paragraphs: List[str]
+    focus_areas: List[str]
+    style_profile: Optional[dict]  # StyleProfile as dict for serialization
     claims: List[FactualClaim]
     research: Dict[str, List[ResearchResult]]
     proposals: List[ChangeProposal]
@@ -74,15 +82,56 @@ async def _update_analysis_progress(state: AnalysisState, stage: str, progress: 
         logger.warning("Failed to update analysis progress: %s", e)
 
 
+async def style_analyze_node(state: AnalysisState) -> dict:
+    """Stage 0: Analyze writing style of the document (run once)."""
+    logger.info("Orchestrator [style]: analyzing writing style for document %s", state["document_id"])
+    await _update_analysis_progress(
+        state, "Analyzing writing style", 5,
+        "Determining document grade level, tone, and complexity",
+    )
+    try:
+        profile = await content_agent.analyze_style(state["text_content"])
+        profile_dict = profile.model_dump()
+
+        # Store style profile in document metadata
+        db = state.get("db")
+        if db:
+            doc_repo = DocumentRepository(db)
+            await doc_repo.update_fields(state["document_id"], {
+                "style_profile": profile_dict,
+            })
+
+        logger.info(
+            "Style analysis complete: grade=%s, depth=%s, tone=%s",
+            profile.grade_level, profile.technical_depth, profile.tone,
+        )
+        return {
+            "style_profile": profile_dict,
+            "stage": "Style analysis complete",
+            "progress": 8,
+        }
+    except Exception as e:
+        logger.error("Style analysis node failed: %s", e)
+        return {"style_profile": None, "stage": "Style analysis failed", "progress": 5}
+
+
 async def analyze_node(state: AnalysisState) -> dict:
-    """Stage 1: Analyze document text for factual claims."""
-    logger.info("Orchestrator [analyze]: starting for document %s", state["document_id"])
-    await _update_analysis_progress(state, "Analyzing content", 10, "Scanning text for factual claims via GPT-4o")
+    """Stage 1: Analyze document text for factual claims (with focus area filtering)."""
+    focus_areas = state.get("focus_areas", ["all"])
+    logger.info(
+        "Orchestrator [analyze]: starting for document %s (focus: %s)",
+        state["document_id"], focus_areas,
+    )
+    await _update_analysis_progress(
+        state, "Analyzing content", 10,
+        f"Scanning text for factual claims via GPT-4o (focus: {', '.join(focus_areas)})",
+    )
     try:
         claims = await content_agent.analyze_document(
             document_id=state["document_id"],
             text_content=state["text_content"],
             paragraphs=state["paragraphs"],
+            focus_areas=focus_areas,
         )
         outdated_count = sum(1 for c in claims if c.is_outdated)
         await _update_analysis_progress(
@@ -124,17 +173,23 @@ async def research_node(state: AnalysisState) -> dict:
 
 
 async def propose_node(state: AnalysisState) -> dict:
-    """Stage 3: Generate change proposals from research."""
+    """Stage 3: Generate style-matched change proposals from research."""
     logger.info("Orchestrator [propose]: generating proposals")
     await _update_analysis_progress(
         state, "Generating proposals", 60,
-        f"Generating change proposals for {len(state['research'])} researched claims",
+        f"Generating style-matched change proposals for {len(state['research'])} researched claims",
     )
     try:
+        # Reconstruct StyleProfile from dict
+        style_profile = None
+        if state.get("style_profile"):
+            style_profile = StyleProfile(**state["style_profile"])
+
         proposals = await update_agent.generate_proposals(
             claims=state["claims"],
             research=state["research"],
             document_id=state["document_id"],
+            style_profile=style_profile,
         )
         await _update_analysis_progress(
             state, "Proposals generated", 75,
@@ -168,11 +223,18 @@ async def validate_node(state: AnalysisState) -> dict:
         # Cross-reference: upgrade confidence if multiple authoritative sources agree
         gov_sources = sum(1 for s in proposal.sources if s.source_type == "government")
         academic_sources = sum(1 for s in proposal.sources if s.source_type == "academic")
+        industry_sources = sum(1 for s in proposal.sources if s.source_type == "industry")
+        technical_sources = sum(1 for s in proposal.sources if s.source_type == "technical")
 
-        if gov_sources >= 1 and academic_sources >= 1:
+        authoritative_count = gov_sources + academic_sources + industry_sources
+
+        if gov_sources >= 1 and (academic_sources >= 1 or industry_sources >= 1):
             proposal.confidence = ConfidenceLevel.HIGH
-        elif gov_sources >= 1 or academic_sources >= 2:
+        elif authoritative_count >= 2:
             proposal.confidence = ConfidenceLevel.HIGH
+        elif authoritative_count >= 1 or technical_sources >= 2:
+            if proposal.confidence == ConfidenceLevel.LOW:
+                proposal.confidence = ConfidenceLevel.MEDIUM
         elif len(proposal.sources) >= 3:
             if proposal.confidence == ConfidenceLevel.LOW:
                 proposal.confidence = ConfidenceLevel.MEDIUM
@@ -223,12 +285,14 @@ def should_propose(state: AnalysisState) -> str:
 def build_graph() -> StateGraph:
     graph = StateGraph(AnalysisState)
 
+    graph.add_node("style_analyze", style_analyze_node)
     graph.add_node("analyze", analyze_node)
     graph.add_node("research", research_node)
     graph.add_node("propose", propose_node)
     graph.add_node("validate", validate_node)
 
-    graph.set_entry_point("analyze")
+    graph.set_entry_point("style_analyze")
+    graph.add_edge("style_analyze", "analyze")
 
     graph.add_conditional_edges("analyze", should_research, {
         "research": "research",
@@ -248,10 +312,22 @@ def build_graph() -> StateGraph:
 # Public API                                                           #
 # ------------------------------------------------------------------ #
 
-async def run_analysis(document_id: str, db) -> ChangeLog:
+async def run_analysis(
+    document_id: str,
+    db,
+    focus_areas: Optional[List[str]] = None,
+) -> ChangeLog:
     """
     Run the full analysis pipeline for a document.
     Saves results to the changes and changelogs collections.
+
+    Args:
+        document_id: ID of the document to analyze
+        db: Database connection
+        focus_areas: Optional list of focus areas to filter claims.
+                     Options: missions, constellations, technology, statistics,
+                     companies, business_philosophy, historical_facts, all
+                     Default: ["all"]
     """
     doc_repo = DocumentRepository(db)
     change_repo = ChangeRepository(db)
@@ -267,6 +343,10 @@ async def run_analysis(document_id: str, db) -> ChangeLog:
 
     paragraphs = [p for p in text_content.split("\n") if p.strip()]
 
+    # Default focus areas
+    if not focus_areas:
+        focus_areas = ["all"]
+
     # Update document status
     await doc_repo.update_fields(document_id, {"status": DocumentStatus.ANALYZING})
 
@@ -277,6 +357,8 @@ async def run_analysis(document_id: str, db) -> ChangeLog:
         "document_id": document_id,
         "text_content": text_content,
         "paragraphs": paragraphs,
+        "focus_areas": focus_areas,
+        "style_profile": None,
         "claims": [],
         "research": {},
         "proposals": [],
@@ -292,6 +374,7 @@ async def run_analysis(document_id: str, db) -> ChangeLog:
 
         claims = result.get("claims", [])
         proposals = result.get("validated_proposals", []) or result.get("proposals", [])
+        style_profile = result.get("style_profile")
 
         # Delete previous analysis results for this document
         await change_repo.delete_by_document(document_id)
@@ -309,6 +392,8 @@ async def run_analysis(document_id: str, db) -> ChangeLog:
             total_changes=len(proposals),
             claims=claims,
             changes=proposals,
+            focus_areas=focus_areas,
+            style_profile=style_profile,
             created_at=datetime.utcnow(),
         )
         await change_repo.save_changelog(changelog.model_dump())
@@ -323,15 +408,16 @@ async def run_analysis(document_id: str, db) -> ChangeLog:
             "stage": "Analysis complete",
             "progress": 100,
             "timestamp": datetime.utcnow(),
-            "message": f"Analysis complete: {len(claims)} claims, {len(proposals)} proposals",
+            "message": f"Analysis complete: {len(claims)} claims, {len(proposals)} proposals (focus: {', '.join(focus_areas)})",
         }
         await doc_repo.push_history_entry(document_id, entry)
 
         logger.info(
-            "Analysis pipeline complete for %s: %d claims, %d outdated, %d proposals",
+            "Analysis pipeline complete for %s: %d claims, %d outdated, %d proposals (focus: %s)",
             document_id, len(claims),
             sum(1 for c in claims if c.is_outdated),
             len(proposals),
+            focus_areas,
         )
         return changelog
 
