@@ -343,6 +343,9 @@ async def run_analysis(
 
     paragraphs = [p for p in text_content.split("\n") if p.strip()]
 
+    # Load paragraph→page map built during document processing
+    para_to_page = document.get("para_to_page", {})
+
     # Default focus areas
     if not focus_areas:
         focus_areas = ["all"]
@@ -375,6 +378,15 @@ async def run_analysis(
         claims = result.get("claims", [])
         proposals = result.get("validated_proposals", []) or result.get("proposals", [])
         style_profile = result.get("style_profile")
+
+        # Resolve page numbers from the paragraph→page map
+        if para_to_page:
+            for claim in claims:
+                if claim.page is None and claim.paragraph_idx is not None:
+                    claim.page = para_to_page.get(str(claim.paragraph_idx))
+            for proposal in proposals:
+                if proposal.page is None and proposal.paragraph_idx is not None:
+                    proposal.page = para_to_page.get(str(proposal.paragraph_idx))
 
         # Delete previous analysis results for this document
         await change_repo.delete_by_document(document_id)

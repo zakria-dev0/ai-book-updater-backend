@@ -144,12 +144,16 @@ async def process_document(
         metadata = parser._generate_metadata()
 
         # ── Stage 7: Persist & complete ───────────────────────────────
+        # Save paragraph→page map so the analysis pipeline can resolve page numbers
+        para_to_page = {str(k): v for k, v in parser._para_to_page.items()}
+
         await repo.update_fields(document_id, {
             "text_content": text,
             "equations": [eq.model_dump() for eq in equations],
             "figures": [fig.model_dump() for fig in figures],
             "tables": [tbl.model_dump() for tbl in tables],
             "metadata": metadata.model_dump(),
+            "para_to_page": para_to_page,
             "status": DocumentStatus.COMPLETED,
             "processing_completed_at": datetime.utcnow(),
         })
