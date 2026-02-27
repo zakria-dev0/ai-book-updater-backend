@@ -227,6 +227,18 @@ async def get_claims(
         )
 
     claims = changelog.get("claims", [])
+
+    # Diagnostic: report if stored claims count differs from changelog metadata
+    stored_total = changelog.get("total_claims", 0)
+    actual_stored = len(claims)
+    if stored_total != actual_stored and actual_stored > 0:
+        logger.warning(
+            "Claims count mismatch for document %s: changelog.total_claims=%d but "
+            "actual stored claims=%d (claims_stored_separately=%s)",
+            document_id, stored_total, actual_stored,
+            changelog.get("claims_stored_separately", False),
+        )
+
     if outdated_only:
         claims = [c for c in claims if c.get("is_outdated")]
     if focus_area:
@@ -236,6 +248,8 @@ async def get_claims(
         "document_id": document_id,
         "total_claims": len(claims),
         "claims": claims,
+        "analysis_total_claims": stored_total,
+        "analysis_total_outdated": changelog.get("total_outdated", 0),
     }
 
 

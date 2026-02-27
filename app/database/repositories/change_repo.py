@@ -110,9 +110,52 @@ class ChangeRepository:
         logger.info("Changelog saved: %s", result.inserted_id)
         return str(result.inserted_id)
 
+    async def delete_changelogs_by_document(self, document_id: str) -> int:
+        """Delete all previous changelogs for a document so stale data is not returned."""
+        result = await self.changelogs.delete_many({"document_id": document_id})
+        if result.deleted_count > 0:
+            logger.info("Deleted %d old changelogs for document %s", result.deleted_count, document_id)
+        return result.deleted_count
+
     async def find_changelog_by_document(self, document_id: str) -> Optional[dict]:
         doc = await self.changelogs.find_one(
             {"document_id": document_id},
             sort=[("created_at", -1)],
         )
-        return self._serialize(doc) if doc else None
+        if not doc:
+            return None
+
+        doc = self._serialize(doc)
+
+        # If claims were stored separately (large changelog), load them back
+        if doc.get("claims_stored_separately"):
+            claims = await self.find_claims_by_document(doc.get("document_id", ""))
+            doc["claims"] = claims
+            logger.info(
+                "Loaded %d claims from separate storage for document %s",
+                len(claims), doc.get("document_id"),
+            )
+
+        return doc
+
+    # ------------------------------------------------------------------ #
+    # Claims (separate storage for large documents)                        #
+    # ------------------------------------------------------------------ #
+    async def save_claims_batch(self, document_id: str, claims: List[dict]) -> int:
+        """Save claims to a separate collection when changelog exceeds size limits."""
+        if not claims:
+            return 0
+        # Delete any previously stored claims for this document
+        await self.changes.database.claims.delete_many({"document_id": document_id})
+        # Tag each claim with the document_id
+        for claim in claims:
+            claim["document_id"] = document_id
+        result = await self.changes.database.claims.insert_many(claims)
+        logger.info("Saved %d claims separately for document %s", len(result.inserted_ids), document_id)
+        return len(result.inserted_ids)
+
+    async def find_claims_by_document(self, document_id: str) -> List[dict]:
+        """Load claims from separate collection."""
+        cursor = self.changes.database.claims.find({"document_id": document_id})
+        docs = await cursor.to_list(length=5000)
+        return [self._serialize(d) for d in docs]

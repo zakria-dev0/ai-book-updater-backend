@@ -187,9 +187,40 @@ UPDATE GENERATION RULES
    - Do NOT plagiarize source snippets — write in the textbook's own voice
    - Do NOT bury the correction in paragraph 2 after context-setting
    - Do NOT open any sentence with "As of [year]," — rephrase to put the subject first
-   - Do NOT end updates with "This highlights...", "This underscores...",
-     "This marks a significant...", "This demonstrates..." — end on a specific fact
    - Split any sentence over 35 words into two sentences at a natural conjunction or em-dash
+
+═══════════════════════════════════════════════════
+FORBIDDEN ENDING PATTERNS (CRITICAL — YOUR OUTPUT WILL BE REJECTED IF VIOLATED)
+═══════════════════════════════════════════════════
+
+NEVER end your new_content with ANY of these editorial commentary patterns:
+   - "This highlights..."
+   - "This underscores..."
+   - "This demonstrates..."
+   - "This marks a significant..."
+   - "This shift underscores..."
+   - "...highlighting the challenges..."
+   - "...highlighting the complexities..."
+   - "...underscoring the importance..."
+
+These are editorial opinions, NOT factual textbook writing. The textbook NEVER editorializes.
+
+INSTEAD, end on a SPECIFIC FACT — a date, a number, a technical detail, or a concrete outcome.
+
+FORBIDDEN ENDING EXAMPLE:
+  "This highlights the challenges faced by private ventures in executing complex
+   interplanetary missions."
+
+CORRECT ENDING EXAMPLE:
+  "The company's assets were liquidated in early 2019 after a Swiss court ruling."
+
+FORBIDDEN ENDING EXAMPLE:
+  "This shift underscores the challenges of private missions requiring substantial
+   governmental resources."
+
+CORRECT ENDING EXAMPLE:
+  "Tito subsequently booked two seats on SpaceX's planned Starship lunar flyby mission,
+   announced in October 2022."
 
 ═══════════════════════════════════════════════════
 OUTPUT FORMAT
@@ -200,7 +231,7 @@ Return a JSON object with a "proposals" array. Each proposal must include:
   "proposals": [
     {{
       "old_content": "exact original text being replaced",
-      "new_content": "updated replacement text matching book style",
+      "new_content": "updated replacement text matching book style — MUST end on a specific fact, NOT editorial commentary",
       "change_type": one of: "tech_update" | "mission_update" | "constellation_update" |
                     "statistics_update" | "company_update" | "historical_correction" |
                     "system_update" | "regulation_update" | "business_model_update",
@@ -296,6 +327,51 @@ def _get_style_example(claim_type: str) -> str:
         f"BAD (do NOT write like this):\n\"{example['bad']}\"\n\n"
         f"GOOD (write like this):\n\"{example['good']}\""
     )
+
+
+# ------------------------------------------------------------------ #
+# Post-processing: forbidden ending pattern removal                    #
+# ------------------------------------------------------------------ #
+
+# Patterns that GPT frequently uses despite instructions not to.
+# Each regex matches a final sentence that starts with one of these editorial phrases.
+import re as _re
+
+_FORBIDDEN_ENDING_PATTERNS = [
+    _re.compile(
+        r'\.\s+'
+        r'(?:This|These|Such|The shift|The change|The move|The transition)'
+        r'\s+'
+        r'(?:highlight|underscore|demonstrate|mark|illustrate|showcase|emphasize|signal|reflect|reveal)'
+        r's?\s+'
+        r'.{10,}$',
+        _re.IGNORECASE,
+    ),
+    _re.compile(
+        r'\.\s+'
+        r'.{0,30}'
+        r'(?:highlighting|underscoring|demonstrating|marking|illustrating|showcasing|emphasizing|signaling)'
+        r'\s+(?:the\s+)?'
+        r'(?:challenges|complexities|difficulties|importance|significance|immense|growing)'
+        r'.{5,}$',
+        _re.IGNORECASE,
+    ),
+]
+
+
+def _fix_forbidden_endings(text: str) -> str:
+    """
+    Remove editorial commentary sentences from the end of generated text.
+    These sentences add no factual value and violate the textbook style.
+    """
+    for pattern in _FORBIDDEN_ENDING_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            # Remove the forbidden sentence, keep everything before it
+            cleaned = text[:match.start() + 1].strip()  # +1 to keep the period
+            if len(cleaned) > 20:  # Safety: don't reduce to near-empty
+                return cleaned
+    return text
 
 
 # ------------------------------------------------------------------ #
@@ -458,6 +534,14 @@ class UpdateAgent:
                 if not p.get("old_content") or not p.get("new_content"):
                     continue
 
+                # ── Post-processing: fix forbidden ending patterns ────
+                new_content = _fix_forbidden_endings(p["new_content"])
+                if new_content != p["new_content"]:
+                    logger.info(
+                        "Fixed forbidden ending pattern in proposal for claim %s",
+                        claim.claim_id,
+                    )
+
                 # Map confidence string to enum
                 confidence_str = p.get("confidence", "medium").lower()
                 confidence = {
@@ -493,7 +577,7 @@ class UpdateAgent:
                     document_id=document_id,
                     claim_id=claim.claim_id,
                     old_content=p["old_content"],
-                    new_content=p["new_content"],
+                    new_content=new_content,
                     change_type=change_type,
                     confidence=confidence,
                     core_claim_status=core_status,

@@ -74,13 +74,14 @@ The key question is: "Would a reader be MISLED by this statement in {current_yea
 Set is_outdated = FALSE for:
 - Historical facts about past events that remain true (founding dates, release dates,
   when something happened, discontinuation dates, past milestones).
-- Historical data anchored to a specific year (e.g. "As of [year]", "In [year]").
+- Historical data anchored to a specific year AND using PAST TENSE
+  (e.g. "revenue was $X in 2019", "was founded in 1994").
 - Statements using past tense that record what occurred at a specific time.
 - Broad trends or general truths that are still largely accurate, even if the exact
   situation has evolved gradually (e.g. general market trends, widely-used technologies).
 - Statements that are still substantially correct, even if details have slightly shifted.
 
-Set is_outdated = TRUE ONLY when:
+Set is_outdated = TRUE when ANY of these apply:
 - The claim makes a specific present-tense assertion that is CLEARLY WRONG today
   (e.g. someone "is" the CEO but has since stepped down, something "is the latest version"
   but newer versions have been released, something "is the newest" but has been replaced).
@@ -88,13 +89,36 @@ Set is_outdated = TRUE ONLY when:
   demonstrably different (not just slightly evolved but fundamentally changed).
 - The claim uses "currently", "now", "the latest", "the newest" and the underlying
   fact has been specifically superseded by a known successor or replacement.
+
+- **FUTURE-TENSE CLAIMS ABOUT PAST EVENTS** (CRITICAL — DO NOT MISS THESE):
+  If a claim uses FUTURE TENSE ("will launch", "plans to", "scheduled for", "is expected to",
+  "will be available", "will start launching", "will join", "will visit", "will collect",
+  "will return", "will replace") AND the referenced date/year has ALREADY PASSED
+  (i.e. the date is before {current_year}), then is_outdated = TRUE.
+  Examples:
+    - "will launch in 2016" → 2016 has passed → is_outdated = TRUE
+    - "plans to send humans by 2025" → 2025 has passed → is_outdated = TRUE
+    - "scheduled for launch in late 2018" → 2018 has passed → is_outdated = TRUE
+    - "will start launching in 2015" → 2015 has passed → is_outdated = TRUE
+    - "will be available for launch in 2015" → 2015 has passed → is_outdated = TRUE
+    - "will visit the asteroid Bennu in 2018" → 2018 has passed → is_outdated = TRUE
+    - "will join the A-Train in 2014" → 2014 has passed → is_outdated = TRUE
+    - "NASA plans to adapt the design for Mars 2020" → if the event has occurred → is_outdated = TRUE
+  The reader would think these events haven't happened yet, when they either already
+  occurred or were cancelled — either way, the future tense is misleading.
+
+- **COMPANIES/ORGANIZATIONS THAT NO LONGER EXIST**:
+  If a claim uses present tense ("is working with", "plans to", "seeks to") about
+  a company or organization that has gone bankrupt, been acquired, or ceased operations,
+  then is_outdated = TRUE.
+
 - For constellations: statements about constellation sizes that are dramatically outdated
   (e.g. "constellations typically consist of 24-48 satellites" — now mega-constellations
   have thousands). Statements about constellation purposes limited to navigation only,
   when modern constellations serve broadband, IoT, imaging, etc.
 
-When in doubt, set is_outdated = FALSE. Only flag claims where you are confident the
-statement would actively mislead a reader today.
+When in doubt about historical/past-tense claims, set is_outdated = FALSE.
+But for FUTURE-TENSE claims with past dates, ALWAYS set is_outdated = TRUE.
 
 IMPORTANT: Return a JSON object with a "claims" key containing an array of claim objects.
 Example: {{"claims": [{{"text": "...", "claim_type": "...", ...}}]}}
@@ -108,15 +132,24 @@ You are a precise fact-checker. Review each claim below and determine if it is t
 as of {current_year}. For each claim, decide if a reader would be MISLED by the statement today.
 
 Rules:
-- A claim is outdated ONLY if its core assertion is DEMONSTRABLY FALSE today.
+- A claim is outdated if its core assertion is DEMONSTRABLY FALSE or MISLEADING today.
 - Broad generalizations that are still substantially true are NOT outdated.
 - Historical facts using PAST TENSE anchored to dates are NOT outdated
   (e.g. "revenue was $X in 2019", "was founded in 1994", "was released in 2015").
 - CRITICAL: Claims using PRESENT TENSE superlatives like "is the latest", "is the newest",
-  "is the most popular" ARE outdated if a successor or replacement exists, EVEN IF the claim
-  has a date prefix like "As of [year]". The "As of" prefix does NOT protect present-tense
-  assertions — focus on whether the core verb uses "is/are" with a superlative.
-- Only flag claims where a specific fact has been clearly superseded (new CEO, new version, etc.).
+  "is the most popular" ARE outdated if a successor or replacement exists.
+
+- **FUTURE-TENSE CLAIMS WITH PAST DATES** — ALWAYS mark as outdated:
+  If a claim says "will launch in [year]", "scheduled for [year]", "plans to [do X] by [year]",
+  "will be available in [year]", "will join in [year]", "will visit in [year]"
+  AND that year is before {current_year}, then is_outdated = TRUE.
+  The future tense misleads readers into thinking the event hasn't happened yet.
+  Examples: "will launch in 2016" → outdated. "scheduled for 2018" → outdated.
+  "NASA plans to adapt the design for Mars 2020" → the mission already launched → outdated.
+
+- **DEFUNCT COMPANIES**: Claims using present tense about companies that have gone bankrupt,
+  been acquired, or ceased operations → is_outdated = TRUE.
+
 - For constellation claims: statements about small constellation sizes (24-48 satellites as "typical")
   ARE outdated given modern mega-constellations (thousands of satellites).
 

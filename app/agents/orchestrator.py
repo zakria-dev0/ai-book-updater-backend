@@ -6,9 +6,12 @@ Enhanced with:
 - Focus area filtering (only analyze/research selected categories)
 - Writing style analysis (run once, pass to proposal generation)
 - Style-matched update generation
+- Source-claim relevance validation
+- Robust claims storage with diagnostic logging
 """
 import uuid
 import asyncio
+import sys
 from typing import TypedDict, List, Dict, Optional
 from datetime import datetime
 from langgraph.graph import StateGraph, END
@@ -93,6 +96,13 @@ async def style_analyze_node(state: AnalysisState) -> dict:
         profile = await content_agent.analyze_style(state["text_content"])
         profile_dict = profile.model_dump()
 
+        # Verify we got a real profile (not all defaults)
+        if profile.grade_level == "college_senior" and profile.tone == "formal_academic":
+            logger.warning(
+                "Style profile returned all defaults — GPT may have failed silently. "
+                "Profile: %s", profile_dict,
+            )
+
         # Store style profile in document metadata
         db = state.get("db")
         if db:
@@ -111,8 +121,14 @@ async def style_analyze_node(state: AnalysisState) -> dict:
             "progress": 8,
         }
     except Exception as e:
-        logger.error("Style analysis node failed: %s", e)
-        return {"style_profile": None, "stage": "Style analysis failed", "progress": 5}
+        logger.error("Style analysis node failed: %s", e, exc_info=True)
+        # Return a default profile instead of None so downstream nodes can still use it
+        default_profile = StyleProfile().model_dump()
+        return {
+            "style_profile": default_profile,
+            "stage": "Style analysis failed (using defaults)",
+            "progress": 5,
+        }
 
 
 async def analyze_node(state: AnalysisState) -> dict:
@@ -200,8 +216,55 @@ async def propose_node(state: AnalysisState) -> dict:
         return {"proposals": [], "error": str(e), "stage": "Error", "progress": 0}
 
 
+def _check_source_relevance(proposal: ChangeProposal) -> float:
+    """
+    Check how many sources actually mention the key entities from the claim.
+    Returns the fraction of sources that are content-relevant (0.0 to 1.0).
+    """
+    old_lower = proposal.old_content.lower()
+
+    # Extract key terms from old_content (words 4+ chars, excluding common words)
+    stop_words = {
+        "that", "this", "with", "from", "will", "have", "been", "were", "which",
+        "their", "they", "than", "also", "more", "into", "such", "about", "other",
+        "first", "would", "could", "should", "most", "some", "when", "what", "over",
+        "being", "made", "after", "before", "these", "those", "under", "while",
+        "including", "satellites", "satellite", "mission", "missions", "space",
+        "launch", "launched", "company", "plan", "plans", "planned",
+    }
+
+    words = set()
+    for w in old_lower.split():
+        cleaned = w.strip(".,;:()\"'")
+        if len(cleaned) >= 4 and cleaned not in stop_words:
+            words.add(cleaned)
+
+    # Find proper nouns / key entities (capitalized words from original)
+    key_entities = set()
+    for w in proposal.old_content.split():
+        cleaned = w.strip(".,;:()\"'")
+        if cleaned and cleaned[0].isupper() and len(cleaned) >= 3:
+            key_entities.add(cleaned.lower())
+
+    # Prioritize entity matching — if entities exist, check those
+    search_terms = key_entities if key_entities else words
+
+    if not search_terms:
+        return 1.0  # Can't check, assume relevant
+
+    relevant_count = 0
+    for source in proposal.sources:
+        source_text = f"{source.source_title} {source.snippet}".lower()
+        # A source is relevant if it mentions at least one key entity
+        if any(term in source_text for term in search_terms):
+            relevant_count += 1
+
+    return relevant_count / len(proposal.sources) if proposal.sources else 0.0
+
+
 async def validate_node(state: AnalysisState) -> dict:
-    """Stage 4: Quality validation — cross-reference sources, check confidence."""
+    """Stage 4: Quality validation — cross-reference sources, check confidence,
+    and verify source-claim relevance."""
     logger.info("Orchestrator [validate]: validating %d proposals", len(state["proposals"]))
     await _update_analysis_progress(
         state, "Validating proposals", 80,
@@ -215,7 +278,25 @@ async def validate_node(state: AnalysisState) -> dict:
             logger.info("Skipping no-change proposal: %s", proposal.change_id)
             continue
 
-        # Cross-reference: upgrade confidence if multiple authoritative sources agree
+        # ── Source-claim relevance check ──────────────────────────────
+        relevance_ratio = _check_source_relevance(proposal)
+        if relevance_ratio < 0.2:
+            # Less than 20% of sources mention claim entities → downgrade to LOW
+            logger.warning(
+                "Proposal %s: only %.0f%% sources are content-relevant — downgrading to LOW",
+                proposal.change_id, relevance_ratio * 100,
+            )
+            proposal.confidence = ConfidenceLevel.LOW
+        elif relevance_ratio < 0.5:
+            # Less than 50% relevant → cap at MEDIUM
+            logger.info(
+                "Proposal %s: %.0f%% sources content-relevant — capping at MEDIUM",
+                proposal.change_id, relevance_ratio * 100,
+            )
+            if proposal.confidence == ConfidenceLevel.HIGH:
+                proposal.confidence = ConfidenceLevel.MEDIUM
+
+        # ── Cross-reference: upgrade confidence if authoritative sources agree ──
         gov_sources = sum(1 for s in proposal.sources if s.source_type == "government")
         academic_sources = sum(1 for s in proposal.sources if s.source_type == "academic")
         industry_sources = sum(1 for s in proposal.sources if s.source_type == "industry")
@@ -223,16 +304,18 @@ async def validate_node(state: AnalysisState) -> dict:
 
         authoritative_count = gov_sources + academic_sources + industry_sources
 
-        if gov_sources >= 1 and (academic_sources >= 1 or industry_sources >= 1):
-            proposal.confidence = ConfidenceLevel.HIGH
-        elif authoritative_count >= 2:
-            proposal.confidence = ConfidenceLevel.HIGH
-        elif authoritative_count >= 1 or technical_sources >= 2:
-            if proposal.confidence == ConfidenceLevel.LOW:
-                proposal.confidence = ConfidenceLevel.MEDIUM
-        elif len(proposal.sources) >= 3:
-            if proposal.confidence == ConfidenceLevel.LOW:
-                proposal.confidence = ConfidenceLevel.MEDIUM
+        # Only upgrade confidence if sources are also content-relevant
+        if relevance_ratio >= 0.5:
+            if gov_sources >= 1 and (academic_sources >= 1 or industry_sources >= 1):
+                proposal.confidence = ConfidenceLevel.HIGH
+            elif authoritative_count >= 2:
+                proposal.confidence = ConfidenceLevel.HIGH
+            elif authoritative_count >= 1 or technical_sources >= 2:
+                if proposal.confidence == ConfidenceLevel.LOW:
+                    proposal.confidence = ConfidenceLevel.MEDIUM
+            elif len(proposal.sources) >= 3:
+                if proposal.confidence == ConfidenceLevel.LOW:
+                    proposal.confidence = ConfidenceLevel.MEDIUM
 
         # Verify sources exist (at least one must have a URL)
         valid_sources = [s for s in proposal.sources if s.source_url]
@@ -374,6 +457,22 @@ async def run_analysis(
         proposals = result.get("validated_proposals", []) or result.get("proposals", [])
         style_profile = result.get("style_profile")
 
+        # ── Diagnostic logging ────────────────────────────────────────
+        outdated_count = sum(1 for c in claims if c.is_outdated)
+        claims_size_bytes = sys.getsizeof(str([c.model_dump() for c in claims]))
+        logger.info(
+            "Pipeline results for %s: %d claims (%d outdated), %d proposals, "
+            "style_profile=%s, claims_serialized_size=%d bytes",
+            document_id, len(claims), outdated_count, len(proposals),
+            "present" if style_profile else "NULL", claims_size_bytes,
+        )
+
+        if style_profile is None:
+            logger.error(
+                "style_profile is NULL after pipeline — style_analyze_node may have failed. "
+                "Check OpenAI API key and response parsing."
+            )
+
         # Resolve page numbers from the paragraph→page map
         if para_to_page:
             for claim in claims:
@@ -386,24 +485,64 @@ async def run_analysis(
         # Delete previous analysis results for this document
         await change_repo.delete_by_document(document_id)
 
+        # Delete previous changelogs for this document so we don't return stale data
+        await change_repo.delete_changelogs_by_document(document_id)
+
         # Save proposals to DB
         if proposals:
             await change_repo.create_many([p.model_dump() for p in proposals])
 
-        # Build and save changelog
+        # Build changelog — store claims as dicts for serialization
+        claims_dicts = [c.model_dump() for c in claims]
+        proposals_dicts = [p.model_dump() for p in proposals]
+
+        changelog_data = {
+            "log_id": f"log_{uuid.uuid4().hex[:12]}",
+            "document_id": document_id,
+            "total_claims": len(claims),
+            "total_outdated": outdated_count,
+            "total_changes": len(proposals),
+            "claims": claims_dicts,
+            "changes": proposals_dicts,
+            "focus_areas": focus_areas,
+            "style_profile": style_profile,
+            "created_at": datetime.utcnow(),
+        }
+
+        # Check serialized size before saving
+        import json
+        changelog_json = json.dumps(changelog_data, default=str)
+        changelog_size_mb = len(changelog_json.encode("utf-8")) / (1024 * 1024)
+        logger.info(
+            "Changelog size for %s: %.2f MB (%d claims, %d changes)",
+            document_id, changelog_size_mb, len(claims), len(proposals),
+        )
+
+        if changelog_size_mb > 15:
+            # MongoDB 16MB limit — store claims separately if too large
+            logger.warning(
+                "Changelog too large (%.2f MB) — storing claims in separate collection",
+                changelog_size_mb,
+            )
+            await change_repo.save_claims_batch(document_id, claims_dicts)
+            changelog_data["claims"] = []  # Don't embed in changelog
+            changelog_data["claims_stored_separately"] = True
+
+        await change_repo.save_changelog(changelog_data)
+
+        # Build the ChangeLog model for return value
         changelog = ChangeLog(
-            log_id=f"log_{uuid.uuid4().hex[:12]}",
+            log_id=changelog_data["log_id"],
             document_id=document_id,
             total_claims=len(claims),
-            total_outdated=sum(1 for c in claims if c.is_outdated),
+            total_outdated=outdated_count,
             total_changes=len(proposals),
             claims=claims,
             changes=proposals,
             focus_areas=focus_areas,
             style_profile=style_profile,
-            created_at=datetime.utcnow(),
+            created_at=changelog_data["created_at"],
         )
-        await change_repo.save_changelog(changelog.model_dump())
 
         # Restore document status and final progress
         await doc_repo.update_fields(document_id, {
@@ -421,15 +560,12 @@ async def run_analysis(
 
         logger.info(
             "Analysis pipeline complete for %s: %d claims, %d outdated, %d proposals (focus: %s)",
-            document_id, len(claims),
-            sum(1 for c in claims if c.is_outdated),
-            len(proposals),
-            focus_areas,
+            document_id, len(claims), outdated_count, len(proposals), focus_areas,
         )
         return changelog
 
     except Exception as e:
-        logger.error("Analysis pipeline failed for %s: %s", document_id, e)
+        logger.error("Analysis pipeline failed for %s: %s", document_id, e, exc_info=True)
         await doc_repo.update_fields(document_id, {
             "status": DocumentStatus.ERROR,
             "error_message": f"Analysis failed: {str(e)}",

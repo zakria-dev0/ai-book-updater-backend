@@ -131,6 +131,54 @@ def _is_excluded_source(url: str) -> bool:
     return any(d in url_lower for d in EXCLUDED_DOMAINS)
 
 
+def _extract_query_key_terms(query: str) -> list[str]:
+    """
+    Extract meaningful key terms from a search query for content relevance matching.
+    Returns lowercased terms that are specific enough to check against source content.
+    """
+    stop_words = {
+        "the", "a", "an", "and", "or", "of", "in", "to", "for", "is", "are",
+        "was", "were", "be", "been", "has", "have", "had", "do", "does", "did",
+        "will", "would", "could", "should", "may", "might", "can", "shall",
+        "not", "no", "but", "if", "then", "than", "so", "as", "at", "by",
+        "on", "up", "out", "with", "from", "into", "its", "it", "this", "that",
+        "current", "status", "update", "latest", "data", "news", "result",
+        "outcome", "history", "mission", "launch", "launched", "satellites",
+        "satellite", "after", "before", "since", "about", "total", "count",
+        "deployed", "operational", "completion", "cancelled", "completed",
+        "acquisition", "bankruptcy", "version",
+    }
+
+    terms = []
+    for word in query.lower().split():
+        cleaned = word.strip(".,;:()\"'")
+        if len(cleaned) >= 3 and cleaned not in stop_words:
+            terms.append(cleaned)
+
+    return terms
+
+
+def _compute_content_relevance(
+    query_terms: list[str], title: str, content: str,
+) -> float:
+    """
+    Compute how relevant a source's content is to the query terms.
+    Returns a score from 0.0 (no match) to 1.0 (strong match).
+    """
+    if not query_terms:
+        return 0.5  # Can't assess, neutral score
+
+    combined = f"{title} {content}".lower()
+    matched = sum(1 for term in query_terms if term in combined)
+    ratio = matched / len(query_terms)
+
+    # Boost if multiple distinct key terms appear (not just one generic match)
+    if matched >= 3:
+        ratio = min(1.0, ratio * 1.2)
+
+    return round(ratio, 3)
+
+
 async def _fetch_html_meta_tags(url: str) -> dict:
     """
     Directly fetch a URL and extract author/date from HTML meta tags.
@@ -327,20 +375,39 @@ class TavilyResearchService:
             ]
             all_metadata = await asyncio.gather(*metadata_tasks)
 
+            # Extract key search terms from the query for content relevance check
+            query_terms = _extract_query_key_terms(query)
+
             results: List[ResearchResult] = []
             for item, metadata in zip(filtered_results, all_metadata):
                 url = item.get("url", "")
                 title = item.get("title", "")
                 content = item.get("content", "")
-                source_type, relevance = _score_source(url, title)
+                source_type, base_relevance = _score_source(url, title)
+
+                # ── Content relevance check ───────────────────────────
+                # Adjust relevance score based on whether the source content
+                # actually mentions the key terms from the search query
+                content_relevance = _compute_content_relevance(
+                    query_terms, title, content,
+                )
+                # Blend domain authority (60%) with content relevance (40%)
+                relevance = (base_relevance * 0.6) + (content_relevance * 0.4)
+
+                if content_relevance < 0.1:
+                    logger.debug(
+                        "Low content relevance (%.2f) for '%s' — query terms: %s",
+                        content_relevance, title[:50], query_terms,
+                    )
 
                 # Use Tavily's published_date if available, otherwise extracted
                 pub_date = item.get("published_date") or metadata.get("published_date")
                 author = metadata.get("author")
 
                 logger.info(
-                    "Source '%s' [%s, score=%.2f]: author=%s, date=%s",
-                    title[:50], source_type, relevance, author, pub_date,
+                    "Source '%s' [%s, score=%.2f (domain=%.2f, content=%.2f)]: author=%s, date=%s",
+                    title[:50], source_type, relevance, base_relevance,
+                    content_relevance, author, pub_date,
                 )
 
                 results.append(ResearchResult(
@@ -350,7 +417,7 @@ class TavilyResearchService:
                     published_date=pub_date,
                     author=author,
                     snippet=content[:500],
-                    relevance_score=relevance,
+                    relevance_score=round(relevance, 3),
                 ))
 
             # Sort by relevance (highest first)

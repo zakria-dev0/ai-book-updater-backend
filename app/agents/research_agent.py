@@ -86,55 +86,120 @@ class ResearchAgent:
     @staticmethod
     def _build_query(claim: FactualClaim) -> str:
         """Build an effective search query from claim text, entities, and type.
-        Enhanced with specialized query patterns for constellations and missions."""
+
+        Strategy: Lead with the specific subject (entities), then add a concise
+        action phrase. Avoid generic filler words that dilute the query.
+        """
+        claim_lower = claim.text.lower()
+
+        # ── Step 1: Extract the core subject ──────────────────────────
+        # Entities are the most important part — they tell Tavily WHAT to search
+        entity_str = ""
+        if claim.entities:
+            entity_str = " ".join(claim.entities[:3])
+
+        # ── Step 2: Build a claim-specific query ──────────────────────
+        # Instead of generic context phrases, build a query that captures
+        # the specific claim's subject matter
+
+        # Check for well-known subjects that need specific queries
+        specific_query = ResearchAgent._get_specific_query(claim_lower, claim.entities)
+        if specific_query:
+            return specific_query[:200]
+
+        # ── Step 3: Claim-type-aware action phrase (concise) ──────────
+        type_suffix = {
+            "statistic": "current data",
+            "date": "current status",
+            "company_info": "current status bankruptcy acquisition",
+            "mission": "mission status outcome result",
+            "technology": "latest version update",
+            "policy": "current regulation",
+            "regulation": "current regulation",
+            "citation": "latest findings",
+            "constellation": "constellation current status satellites",
+            "historical": "current status",
+            "business_philosophy": "current industry status",
+        }
+        suffix = type_suffix.get(claim.claim_type, "current status")
+
+        # ── Step 4: Assemble the query ────────────────────────────────
         parts = []
 
-        # Use entities if available for a focused query
-        if claim.entities:
-            parts.append(" ".join(claim.entities[:3]))
+        # Lead with entities (most specific)
+        if entity_str:
+            parts.append(entity_str)
 
-        # Claim-type-specific query strategies
-        type_context = {
-            "statistic": "latest statistics data",
-            "date": "current status update",
-            "company_info": "latest company news update",
-            "mission": "space mission current status update",
-            "technology": "latest technology development update",
-            "policy": "current policy regulation",
-            "regulation": "current regulation update",
-            "citation": "latest research findings",
-            "constellation": "satellite constellation current size status update",
-            "historical": "current status update",
-            "business_philosophy": "industry trends commercial space update",
-        }
-        context = type_context.get(claim.claim_type, "latest update")
-        parts.append(context)
+        # Add a condensed version of the claim text (key noun phrases)
+        # Extract first meaningful clause — up to 80 chars, cut at word boundary
+        claim_snippet = claim.text[:80].rsplit(" ", 1)[0] if len(claim.text) > 80 else claim.text
+        # Don't duplicate entity names already in the query
+        if entity_str:
+            for ent in claim.entities[:3]:
+                claim_snippet = claim_snippet.replace(ent, "").strip()
+        claim_snippet = " ".join(claim_snippet.split())  # collapse whitespace
+        if claim_snippet and len(claim_snippet) > 10:
+            parts.append(claim_snippet)
 
-        # Special handling for constellation claims — add specific sub-queries
-        claim_lower = claim.text.lower()
-        if claim.claim_type == "constellation" or any(kw in claim_lower for kw in [
-            "constellation", "starlink", "oneweb", "kuiper", "mega-constellation",
-            "satellite network", "orbital network"
-        ]):
-            # Add constellation-specific context
-            if "starlink" in claim_lower or "spacex" in claim_lower:
-                parts.append("Starlink constellation total satellites deployed")
-            elif "oneweb" in claim_lower:
-                parts.append("OneWeb constellation deployment status")
-            elif "kuiper" in claim_lower or "amazon" in claim_lower:
-                parts.append("Amazon Kuiper constellation progress")
-            elif "gps" in claim_lower:
-                parts.append("GPS constellation current satellite count")
-            else:
-                parts.append("mega-constellation satellite count Starlink OneWeb")
-
-        # Add temporal context if available
-        if claim.temporal_refs:
-            parts.append(f"after {claim.temporal_refs[0]}")
-
-        # Fallback: use first 100 chars of claim text
-        if len(parts) <= 1:
-            parts.append(claim.text[:100])
+        # Add the action suffix
+        parts.append(suffix)
 
         query = " ".join(parts)
         return query[:200]  # Tavily query length limit
+
+    @staticmethod
+    def _get_specific_query(claim_lower: str, entities: list) -> str | None:
+        """Return a highly specific query for well-known subjects."""
+        entities_lower = [e.lower() for e in entities] if entities else []
+
+        # Mars One
+        if "mars one" in claim_lower or "mars one" in " ".join(entities_lower):
+            return "Mars One organization bankruptcy 2019 current status"
+
+        # Inspiration Mars / Dennis Tito
+        if "inspiration mars" in claim_lower or "dennis tito" in " ".join(entities_lower):
+            return "Inspiration Mars Dennis Tito mission status cancelled"
+
+        # Skybox Imaging
+        if "skybox" in claim_lower or "skybox imaging" in " ".join(entities_lower):
+            return "Skybox Imaging Google acquisition Terra Bella Planet Labs history"
+
+        # DigitalGlobe
+        if "digitalglobe" in claim_lower:
+            return "DigitalGlobe Maxar acquisition current status"
+
+        # JWST
+        if "jwst" in claim_lower or "james webb" in claim_lower:
+            return "James Webb Space Telescope JWST launch date deployment status"
+
+        # Constellation-specific queries
+        if "starlink" in claim_lower or "spacex" in claim_lower:
+            return "Starlink constellation total satellites deployed current count"
+        if "oneweb" in claim_lower:
+            return "OneWeb constellation deployment status current satellites"
+        if "kuiper" in claim_lower or "amazon" in claim_lower:
+            return "Amazon Kuiper constellation launch progress"
+        if "gps iii" in claim_lower or "gps 3" in claim_lower:
+            return "GPS III satellite launch history operational status current"
+        if "iridium next" in claim_lower or ("iridium" in claim_lower and ("next" in claim_lower or "replace" in claim_lower or "new" in claim_lower)):
+            return "Iridium NEXT constellation launch completion status"
+        if "gps" in claim_lower and "constellation" in claim_lower:
+            return "GPS constellation current satellite count modernization"
+
+        # OSIRIS-REx
+        if "osiris" in claim_lower or "bennu" in claim_lower:
+            return "OSIRIS-REx mission Bennu sample return status completed"
+
+        # OCO-2
+        if "oco-2" in claim_lower or "orbiting carbon observatory" in claim_lower:
+            return "OCO-2 Orbiting Carbon Observatory launch A-Train status"
+
+        # Mars 2020 / Perseverance
+        if "mars 2020" in claim_lower or "perseverance" in claim_lower:
+            return "Mars 2020 Perseverance rover launch landing status"
+
+        # China space station
+        if "china" in claim_lower and "space station" in claim_lower:
+            return "China Tiangong space station completion status current"
+
+        return None
