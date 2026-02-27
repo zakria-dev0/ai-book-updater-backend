@@ -131,22 +131,29 @@ def _is_excluded_source(url: str) -> bool:
     return any(d in url_lower for d in EXCLUDED_DOMAINS)
 
 
+def _normalize_url(url: str) -> str:
+    """Normalize a URL for deduplication: strip trailing slash, fragments, and lowercase."""
+    url = url.split("#")[0]        # remove fragment
+    url = url.rstrip("/")          # remove trailing slash
+    return url.lower()
+
+
 def _extract_query_key_terms(query: str) -> list[str]:
     """
     Extract meaningful key terms from a search query for content relevance matching.
     Returns lowercased terms that are specific enough to check against source content.
     """
+    # Only remove truly generic English words. Keep domain-specific terms
+    # (bankruptcy, mission, satellite, launch, etc.) so content relevance
+    # can properly penalize sources that don't mention these key subjects.
     stop_words = {
         "the", "a", "an", "and", "or", "of", "in", "to", "for", "is", "are",
         "was", "were", "be", "been", "has", "have", "had", "do", "does", "did",
         "will", "would", "could", "should", "may", "might", "can", "shall",
         "not", "no", "but", "if", "then", "than", "so", "as", "at", "by",
         "on", "up", "out", "with", "from", "into", "its", "it", "this", "that",
-        "current", "status", "update", "latest", "data", "news", "result",
-        "outcome", "history", "mission", "launch", "launched", "satellites",
-        "satellite", "after", "before", "since", "about", "total", "count",
-        "deployed", "operational", "completion", "cancelled", "completed",
-        "acquisition", "bankruptcy", "version",
+        "current", "status", "update", "latest", "news",
+        "after", "before", "since", "about",
     }
 
     terms = []
@@ -365,6 +372,18 @@ class TavilyResearchService:
                     continue
                 filtered_results.append(item)
 
+            # Deduplicate by normalized URL (trailing slash, fragment, case)
+            seen_urls: set[str] = set()
+            deduped_results = []
+            for item in filtered_results:
+                norm = _normalize_url(item.get("url", ""))
+                if norm in seen_urls:
+                    logger.debug("Filtered duplicate URL: %s", item.get("url", "")[:80])
+                    continue
+                seen_urls.add(norm)
+                deduped_results.append(item)
+            filtered_results = deduped_results
+
             # Extract metadata from all results in parallel
             metadata_tasks = [
                 self._extract_metadata(
@@ -387,17 +406,22 @@ class TavilyResearchService:
 
                 # ── Content relevance check ───────────────────────────
                 # Adjust relevance score based on whether the source content
-                # actually mentions the key terms from the search query
+                # actually mentions the key terms from the search query.
+                # Content relevance is weighted MORE than domain authority
+                # to prevent generic .gov PDFs from outranking relevant articles.
                 content_relevance = _compute_content_relevance(
                     query_terms, title, content,
                 )
-                # Blend domain authority (60%) with content relevance (40%)
-                relevance = (base_relevance * 0.6) + (content_relevance * 0.4)
+                # Blend: domain authority (40%) + content relevance (60%)
+                relevance = (base_relevance * 0.4) + (content_relevance * 0.6)
 
-                if content_relevance < 0.1:
-                    logger.debug(
-                        "Low content relevance (%.2f) for '%s' — query terms: %s",
-                        content_relevance, title[:50], query_terms,
+                # Hard penalty: if snippet has near-zero content match,
+                # cap the score regardless of domain authority
+                if content_relevance < 0.15:
+                    relevance = min(relevance, 0.35)
+                    logger.info(
+                        "Hard-penalized low-relevance source (content=%.2f): '%s'",
+                        content_relevance, title[:60],
                     )
 
                 # Use Tavily's published_date if available, otherwise extracted

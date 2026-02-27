@@ -202,4 +202,36 @@ class ResearchAgent:
         if "china" in claim_lower and "space station" in claim_lower:
             return "China Tiangong space station completion status current"
 
+        # Asteroid Redirect Mission / ARM
+        if "asteroid redirect" in claim_lower or ("asteroid" in claim_lower and "redirect" in claim_lower):
+            return "NASA Asteroid Redirect Mission ARM cancelled 2017 reason"
+        if "asteroid" in claim_lower and "nasa" in " ".join(entities_lower) and ("capture" in claim_lower or "robotic" in claim_lower):
+            return "NASA Asteroid Redirect Mission ARM cancelled 2017 reason"
+
+        # SLS / Artemis
+        if "sls" in claim_lower or "space launch system" in claim_lower:
+            return "NASA SLS Space Launch System Artemis I launch 2022 Artemis II status 2025 delay"
+        if "artemis" in claim_lower:
+            return "NASA Artemis program Artemis I II current status schedule delay 2025"
+
+        # Google Lunar X Prize
+        if "lunar x" in claim_lower or "google lunar" in claim_lower or "moon 2.0" in claim_lower:
+            return "Google Lunar X Prize GLXP ended 2018 no winner unclaimed"
+
+        # Virgin Galactic
+        if "virgin galactic" in claim_lower or "spaceshiptwo" in claim_lower:
+            return "Virgin Galactic SpaceShipTwo Unity flights ended Delta class commercial 2026"
+
+        # XCOR Aerospace
+        if "xcor" in claim_lower:
+            return "XCOR Aerospace Lynx spaceplane bankruptcy 2017 ceased operations"
+
+        # Bigelow Aerospace
+        if "bigelow" in claim_lower:
+            return "Bigelow Aerospace BEAM ISS inflatable module status company layoffs"
+
+        # Commercial Crew (Boeing Starliner, SpaceX Crew Dragon)
+        if "commercial crew" in claim_lower or "starliner" in claim_lower:
+            return "NASA Commercial Crew Program SpaceX Crew Dragon Boeing Starliner status 2025"
+
         return None

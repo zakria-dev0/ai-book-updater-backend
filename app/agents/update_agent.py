@@ -223,6 +223,34 @@ CORRECT ENDING EXAMPLE:
    announced in October 2022."
 
 ═══════════════════════════════════════════════════
+MINIMUM QUALITY REQUIREMENTS (CRITICAL — ALL UPDATES MUST MEET THESE)
+═══════════════════════════════════════════════════
+
+Regardless of topic simplicity, EVERY update must be written at college-senior aerospace textbook level.
+Even for simple factual updates (company went bankrupt, mission was canceled), you MUST provide:
+
+1. MINIMUM 3 SENTENCES — Never write fewer than 3 sentences for any update.
+2. TECHNICAL CONTEXT — Include at least one technical detail (vehicle name, orbit type,
+   mission architecture, propulsion system, payload capacity, etc.)
+3. SPECIFIC NUMBERS — At least 2 specific data points (dates, dollar amounts, masses,
+   distances, satellite counts, crew sizes, etc.)
+4. FIELD IMPLICATIONS — One sentence explaining what happened next or what this means
+   for the broader aerospace ecosystem (but state it as FACT, not editorial opinion).
+
+NEVER write in news-brief style. A news brief says:
+  "XCOR filed for bankruptcy in 2017, halting the Lynx project."
+
+A TEXTBOOK says:
+  "XCOR Aerospace ceased operations in 2017 after filing for bankruptcy, ending development
+   of its Lynx suborbital spaceplane before the vehicle completed test flights. The company
+   had made notable technical progress — including successfully testing a liquid-oxygen
+   piston pump capable of supplying the Lynx main engines — but encountered financial
+   difficulties following the departure of key co-founders in 2015. The Lynx's horizontal
+   takeoff and landing design, intended to enable multiple flights per day at low operating
+   cost, represented an innovative approach that other suborbital vehicle developers continue
+   to explore."
+
+═══════════════════════════════════════════════════
 OUTPUT FORMAT
 ═══════════════════════════════════════════════════
 
@@ -372,6 +400,68 @@ def _fix_forbidden_endings(text: str) -> str:
             if len(cleaned) > 20:  # Safety: don't reduce to near-empty
                 return cleaned
     return text
+
+
+# ------------------------------------------------------------------ #
+# Post-processing: minimum quality enforcement                        #
+# ------------------------------------------------------------------ #
+
+# Sentence-ending pattern: period/question-mark/exclamation followed by
+# space+uppercase or end-of-string.  Avoids splitting on abbreviations
+# like "U.S." or "Dr." by requiring the next char to be uppercase.
+_SENTENCE_SPLIT = _re.compile(r'[.!?](?:\s+[A-Z]|$)')
+
+MIN_SENTENCES = 3
+MIN_CHAR_LENGTH = 150  # ~2–3 short sentences
+
+
+def _count_sentences(text: str) -> int:
+    """Count approximate number of sentences in text."""
+    if not text:
+        return 0
+    # Count sentence-ending punctuation followed by space+uppercase or end
+    parts = _SENTENCE_SPLIT.split(text)
+    # The number of sentences = number of splits + 1 (if text ends with punctuation)
+    count = len(_SENTENCE_SPLIT.findall(text))
+    # If text ends with sentence-ending punctuation, add 1 for the last sentence
+    if text.rstrip()[-1:] in '.!?':
+        count += 1
+    return max(count, 1)
+
+
+def _passes_quality_check(new_content: str) -> bool:
+    """
+    Programmatic quality gate: ensures the generated content meets
+    minimum textbook quality standards.
+    Returns True if the content passes, False if it needs regeneration.
+    """
+    sentence_count = _count_sentences(new_content)
+    char_count = len(new_content)
+
+    if sentence_count < MIN_SENTENCES:
+        return False
+    if char_count < MIN_CHAR_LENGTH:
+        return False
+    return True
+
+
+REGENERATION_PROMPT = """\
+Your previous output was REJECTED because it was too short (news-brief style).
+
+Your new_content had only {sentence_count} sentence(s) and {char_count} characters.
+MINIMUM REQUIREMENTS: at least 3 sentences and 150 characters.
+
+Here is your rejected output:
+\"\"\"{rejected_content}\"\"\"
+
+Rewrite this as a proper COLLEGE-LEVEL AEROSPACE TEXTBOOK paragraph:
+1. Minimum 3 sentences
+2. Include technical context (vehicle names, orbit types, mission architecture)
+3. Include at least 2 specific data points (dates, numbers, measurements)
+4. End on a specific fact, NOT editorial commentary
+
+Return the SAME JSON format as before. Only update the "new_content" field — keep all other fields identical.
+"""
 
 
 # ------------------------------------------------------------------ #
@@ -542,6 +632,25 @@ class UpdateAgent:
                         claim.claim_id,
                     )
 
+                # ── Post-processing: quality gate (min sentences/length) ──
+                if not _passes_quality_check(new_content):
+                    sc = _count_sentences(new_content)
+                    cc = len(new_content)
+                    logger.warning(
+                        "Quality check FAILED for claim %s (%d sentences, %d chars) — regenerating",
+                        claim.claim_id, sc, cc,
+                    )
+                    regenerated = await self._regenerate_short_proposal(
+                        p, new_content, user_prompt,
+                    )
+                    if regenerated:
+                        new_content = regenerated
+                    else:
+                        logger.warning(
+                            "Regeneration also failed quality check for claim %s — using best effort",
+                            claim.claim_id,
+                        )
+
                 # Map confidence string to enum
                 confidence_str = p.get("confidence", "medium").lower()
                 confidence = {
@@ -594,6 +703,57 @@ class UpdateAgent:
         except Exception as e:
             logger.error("Proposal generation failed for claim %s: %s", claim.claim_id, e)
             return []
+
+    async def _regenerate_short_proposal(
+        self, original_proposal: dict, rejected_content: str, original_user_prompt: str,
+    ) -> str | None:
+        """
+        Re-call GPT with a regeneration prompt when the initial output
+        was too short (news-brief style). Returns improved new_content
+        or None if regeneration also fails quality check.
+        """
+        regen_prompt = REGENERATION_PROMPT.format(
+            sentence_count=_count_sentences(rejected_content),
+            char_count=len(rejected_content),
+            rejected_content=rejected_content,
+        )
+        # Append regeneration instruction to the original user prompt
+        combined_prompt = original_user_prompt + "\n\n" + regen_prompt
+
+        try:
+            response = await self._call_with_retry(SYSTEM_PROMPT, combined_prompt)
+            if response is None:
+                return None
+
+            if response.usage:
+                self.total_prompt_tokens += response.usage.prompt_tokens
+                self.total_completion_tokens += response.usage.completion_tokens
+
+            raw = response.choices[0].message.content
+            data = json.loads(raw)
+            proposals = data.get("proposals", [])
+            if not proposals:
+                return None
+
+            new_content = proposals[0].get("new_content", "")
+            new_content = _fix_forbidden_endings(new_content)
+
+            if _passes_quality_check(new_content):
+                logger.info(
+                    "Regeneration succeeded: %d sentences, %d chars",
+                    _count_sentences(new_content), len(new_content),
+                )
+                return new_content
+
+            logger.warning(
+                "Regeneration still too short: %d sentences, %d chars",
+                _count_sentences(new_content), len(new_content),
+            )
+            return None
+
+        except Exception as e:
+            logger.error("Regeneration failed: %s", e)
+            return None
 
     @staticmethod
     def _build_context(paragraph_idx: int, paragraphs: List[str], window: int = 2) -> str:
