@@ -11,6 +11,8 @@ import base64
 from io import BytesIO
 from PIL import Image
 import re
+import math
+import zipfile
 import fitz  # PyMuPDF
 import tempfile
 import os
@@ -27,7 +29,29 @@ class DOCXParser:
         self.figures: List[Figure] = []
         self.tables: List[Table] = []
         self.text_content = ""
+        self._real_page_count = self._read_page_count_from_properties()
         self._para_to_page = self._build_page_map()
+
+    def _read_page_count_from_properties(self) -> Optional[int]:
+        """
+        Read real page count from DOCX extended properties (docProps/app.xml).
+        Word stores the rendered page count here when the document is saved.
+        """
+        try:
+            with zipfile.ZipFile(self.file_path, 'r') as z:
+                if 'docProps/app.xml' in z.namelist():
+                    from lxml import etree
+                    app_xml = z.read('docProps/app.xml')
+                    root = etree.fromstring(app_xml)
+                    ns = {'ep': 'http://schemas.openxmlformats.org/officeDocument/2006/extended-properties'}
+                    pages_el = root.find('ep:Pages', ns)
+                    if pages_el is not None and pages_el.text:
+                        count = int(pages_el.text)
+                        if count > 0:
+                            return count
+        except Exception:
+            pass
+        return None
 
     def _build_page_map(self) -> dict:
         """
@@ -50,6 +74,17 @@ class DOCXParser:
             if para._element.findall(f'.//{{{W_NS}}}lastRenderedPageBreak'):
                 current_page += 1
                 para_to_page[para_idx] = current_page
+
+        # If the XML-based map found far fewer pages than the real count
+        # (common when DOCX lacks <w:lastRenderedPageBreak/> markers),
+        # fall back to proportional mapping using the real page count.
+        total_paras = len(self.doc.paragraphs)
+        if total_paras > 0 and self._real_page_count:
+            xml_pages = len(set(para_to_page.values()))
+            if self._real_page_count > xml_pages * 2:
+                for para_idx in range(total_paras):
+                    page = math.ceil((para_idx + 1) / total_paras * self._real_page_count)
+                    para_to_page[para_idx] = max(1, page)
 
         return para_to_page
 
@@ -295,9 +330,12 @@ class DOCXParser:
     
     def _get_page_count(self) -> int:
         """
-        Count pages by counting explicit page-break XML elements (<w:br w:type="page"/>).
-        Falls back to 1 if none are found.
+        Get total page count. Prefers the real count from DOCX extended properties;
+        falls back to counting explicit page-break XML elements.
         """
+        if self._real_page_count:
+            return self._real_page_count
+
         W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
         page_breaks = sum(
             1 for el in self.doc.element.body.iter(f'{{{W_NS}}}br')

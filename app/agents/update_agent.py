@@ -2,12 +2,12 @@
 Update Agent — uses GPT-4o to generate change proposals by comparing
 original text with research findings.
 
-Enhanced with:
-- Writing style matching (uses document's style profile)
-- Context-aware technical updates (aerospace-grade depth)
-- Multi-source synthesis (combines 3-5 sources into comprehensive updates)
-- Expanded change type support
-- Better constellation/mega-constellation update generation
+Hardcoded for "Understanding Space: An Introduction to Astronautics" (4th Edition).
+- Book-specific system prompt with exact style rules and anti-patterns
+- Context-aware: GPT sees surrounding paragraphs for style continuity
+- Few-shot style examples (bad vs good) injected per change type
+- Multi-source synthesis (combines up to 5 sources into comprehensive updates)
+- core_claim_status tracking (false / outdated / incomplete / still_true)
 """
 import json
 import uuid
@@ -22,7 +22,6 @@ from app.models.change import (
     ChangeProposal,
     ChangeType,
     ConfidenceLevel,
-    StyleProfile,
 )
 
 logger = get_logger(__name__)
@@ -32,118 +31,306 @@ RETRY_BASE_DELAY = 3
 MAX_CONCURRENT_PROPOSALS = 3  # Limit concurrent GPT calls
 
 # ------------------------------------------------------------------ #
-# System prompt — style-aware, context-rich update generation          #
+# Reference: Document style profile metadata                          #
+# ------------------------------------------------------------------ #
+
+STYLE_PROFILE = {
+    "book_title": "Understanding Space: An Introduction to Astronautics",
+    "edition": "4th",
+    "chapter": 2,
+    "grade_level": "undergraduate_sophomore_junior",
+    "technical_depth": "intermediate",
+    "tone": "authoritative_accessible",
+    "voice": "active_preferred",
+    "passive_voice_ratio": 0.06,
+    "avg_sentence_length_words": 20,
+    "sentence_complexity": "mixed_short_and_long",
+    "terminology_level": "technical_with_inline_definitions",
+    "numbers_style": "specific_with_dual_units",
+    "paragraph_length_sentences": "4_to_7",
+    "narrative_style": "chronological_storytelling",
+    "acronym_rule": "spell_out_on_first_use_then_abbreviate",
+    "figure_reference_style": "(see Figure X-XX) or (Figure X-XX)",
+}
+
+# ------------------------------------------------------------------ #
+# System prompt — hardcoded for "Understanding Space" 4th Edition      #
 # ------------------------------------------------------------------ #
 
 SYSTEM_PROMPT = """\
-You are an expert editor for academic and technical textbooks.
-Given a factual claim from a book and research findings with updated information,
-generate a **detailed, context-rich** update that matches the document's writing style.
+You are an expert editor for "Understanding Space: An Introduction to Astronautics" (4th Edition),
+a widely-used undergraduate aerospace engineering and astronautics textbook written for college
+sophomore and junior level students in STEM programs.
 
-## Document Writing Style Profile
-{style_instructions}
+Your task is to generate factually updated replacement text for outdated passages in this textbook.
+The updated text must be INDISTINGUISHABLE from the original authors' writing style.
 
-## Update Generation Rules
+═══════════════════════════════════════════════════
+DOCUMENT WRITING STYLE — FOLLOW THIS PRECISELY
+═══════════════════════════════════════════════════
 
-1. **Match the writing style**: Your update MUST match the document's grade level, tone,
-   sentence complexity, and terminology density described above. If the document uses formal
-   academic language with complex sentences, your update should too. If it uses simpler language,
-   match that.
+GRADE LEVEL & AUDIENCE:
+- Undergraduate college level (sophomore/junior STEM students)
+- Readers have basic physics and math background but are not yet specialists
+- Assume the reader is intelligent but encountering many of these concepts for the first time
 
-2. **Provide context and significance**: Don't just swap facts. Explain WHY the change matters.
-   Include implications, consequences, and engineering/scientific significance.
+TONE:
+- Authoritative yet accessible — confident without being condescending
+- Educational and engaging — this is a textbook, not a journal paper
+- Slightly narrative — events are told as a story with historical context
+- Never use jargon without immediately defining it
 
-3. **Include specific technical details**:
-   - Exact numbers, dates, and measurements
-   - System names, mission designations, technical standards
-   - Technical terminology appropriate to the field (e.g., LEO, GEO, orbital mechanics)
-   - Version numbers, specification identifiers
+SENTENCE STRUCTURE:
+- Mix short sentences (10–15 words) with longer explanatory ones (25–35 words)
+- Average sentence length: ~20 words
+- ACTIVE VOICE strongly preferred — use passive voice sparingly (less than 10% of sentences)
+- Use transitional phrases to connect ideas: "For example,", "More recently,", "Despite this,",
+  "In contrast,", "As a result,", "Building on this,"
 
-4. **Synthesize multiple sources**: Use ALL provided research sources to build a comprehensive
-   update. Cross-reference data points across sources. Don't just use the first source.
+TECHNICAL TERMINOLOGY RULES (CRITICAL):
+- Always spell out acronyms on first use: "Low Earth Orbit (LEO)", "International Space Station (ISS)"
+- Define technical terms in parentheses on first use: "mega-constellations (large fleets of hundreds
+  or thousands of satellites)", "pushbroom sensor (a detector array that scans swaths of terrain
+  as the satellite passes overhead)"
+- After defining, use the short form freely: "LEO", "the ISS", "mega-constellations"
+- Include specific technical details: exact altitudes, masses, dates, counts, velocities
 
-5. **For constellation/mega-constellation updates**: Include current constellation sizes (exact numbers),
-   growth trajectory, technical architecture (LEO vs MEO/GEO), new applications enabled,
-   engineering challenges (debris mitigation, spectrum allocation, inter-satellite links).
+NUMBERS AND DATA:
+- Always include specific numbers — never say "many" when you can say "5,400"
+- Use dual units for physical measurements: "550 kilometers (342 miles)", "250 kg (550 lb)"
+- Spell out numbers under ten; use numerals for 10 and above: "three satellites", "24 satellites"
+- Include exact dates when known: "launched on September 27, 2021", "as of early 2024"
+- Dollar figures with context: "$10 billion in annual revenue"
 
-6. **Preserve the original's scope**: If the original text was one sentence, the update can be
-   2-3 sentences if needed for technical accuracy. If the original was a paragraph, produce a
-   comparable paragraph. Don't produce a tiny update for a paragraph-level claim or vice versa.
+STRUCTURE OF AN UPDATE (MANDATORY PATTERN):
+1. CORRECTION FIRST — If the original claim is now false, state the correction in sentence 1.
+   Do NOT bury the correction in the middle of the paragraph.
+2. CONTEXT — Explain what changed and briefly why (1–2 sentences)
+3. SIGNIFICANCE — Explain what this means for the field or the reader (1 sentence)
+4. TECHNICAL DETAIL — Include specific system names, dates, numbers (woven throughout)
 
-For each update, return a JSON object with:
-- "old_content": the original text that needs to change
-- "new_content": the updated replacement text (style-matched, detailed, technical)
-- "change_type": one of "data_update", "tech_update", "mission_update", "company_update",
-  "regulatory_update", "constellation_update", "statistics_update", "system_update",
-  "regulation_update", "business_model_update", "historical_correction"
-- "confidence": "high" if multiple authoritative sources agree, "medium" if one good source, "low" if uncertain
-- "reasoning": brief explanation of why this change is needed and what sources support it
+PARAGRAPH LENGTH:
+- Match the original's scope: if original was 1 sentence → write 2–4 sentences
+- If original was a paragraph → write a comparable paragraph (4–7 sentences)
+- Never produce a one-word or one-clause update for a multi-sentence original
 
-Return a JSON object with a "proposals" array. If no update is warranted, return {{"proposals": []}}.
-Only return valid JSON — no markdown fences, no extra text.
+WHAT THE ORIGINAL TEXT LOOKS LIKE (EXAMPLES FOR STYLE MATCHING):
+
+Example 1 — Active voice, specific data, narrative:
+"SpaceX developed the Falcon 9 (Figure 2-58) in part with financial and technical support from NASA
+as part of a program called Commercial Orbital Transportation Services (COTS) to create systems to
+transport cargo to and from the ISS. Under COTS, SpaceX developed the Falcon 9 rocket and Dragon
+spacecraft, while Orbital Sciences Corporation developed the Antares rocket and Cygnus spacecraft."
+
+Example 2 — Accessible technical depth with definition:
+"Most communications services are provided by satellites in geosynchronous orbit, at an altitude of
+approximately 36,000 kilometers, where orbital velocity matches the speed of the Earth's rotation,
+making the satellite appear stationary as we'll explore in Chapters 4 and 5."
+
+Example 3 — Historical narrative style:
+"After the Space Shuttle Columbia was lost on re-entry on February 1, 2003, the U.S. decided to
+retire the Space Shuttle after the ISS was complete; the last Shuttle mission, STS-135, flew in
+July 2011."
+
+Example 4 — Company/mission update with context:
+"In the United States, a lack of commercial business caused Boeing and Lockheed Martin to merge
+their Delta and Atlas rocket programs into a joint venture, United Launch Alliance (ULA), which
+sells rockets primarily to U.S. government customers. More recently, SpaceX has entered the
+commercial launch market with its Falcon 9 rocket, launching its first commercial communications
+satellite in late 2013."
+
+═══════════════════════════════════════════════════
+UPDATE GENERATION RULES
+═══════════════════════════════════════════════════
+
+1. VERIFY THE CORE CLAIM FIRST:
+   Before writing the update, determine: Is the original claim still true today?
+   - If FALSE → Begin with the correction. Example: "Landsat-9, launched on September 27, 2021,
+     has since joined the fleet as the most recent addition..."
+   - If OUTDATED/INCOMPLETE → Expand with current data while correcting what's stale.
+   - If STILL TRUE but needs detail → Add context and updated numbers.
+
+2. SYNTHESIZE MULTIPLE SOURCES:
+   - Use information from ALL provided research sources, not just the first one
+   - Cross-reference data points — if two NASA sources agree on a number, use it confidently
+   - Prioritize: NASA/ESA/government sources > academic/industry > general news
+
+3. INCLUDE SPECIFIC TECHNICAL DETAILS:
+   - Mission names and designations (Crew Dragon Endeavour, Soyuz MS-25)
+   - Exact numbers (5,400 satellites, 550 km orbit, $2.7 billion contract)
+   - Dates (launched November 2020, as of February 2024)
+   - System specifications when relevant (pushbroom vs. whiskbroom, LEO vs. GEO)
+
+4. FOR CONSTELLATION / MEGA-CONSTELLATION UPDATES:
+   - State current constellation size with exact number and date
+   - Contrast with what the book said (e.g., "dozens" → now "thousands")
+   - Name the major players: Starlink, OneWeb, Amazon Kuiper, Chinese Guowang
+   - Mention key engineering implications: orbital debris, spectrum coordination,
+     inter-satellite laser links, LEO broadband coverage
+   - Include growth trajectory if relevant
+
+5. FOR COMPANY STATUS UPDATES:
+   - If a company went bankrupt or shut down → STATE THIS IN SENTENCE 1
+   - If leadership changed → mention who leads now and when change occurred
+   - If a program was cancelled → say so explicitly, don't soften with "faced challenges"
+
+6. FIGURE REFERENCES:
+   - Preserve any existing figure references from the original: "(see Figure 2-41)"
+   - If the original referenced a figure, keep that reference in your update
+
+7. WHAT NOT TO DO:
+   - Do NOT use passive voice as the primary voice
+   - Do NOT start updates with "It is worth noting that..." or "It should be mentioned..."
+   - Do NOT use hedging language like "may have" or "could potentially" when facts are known
+   - Do NOT write in a news article style (no inverted pyramid, no "According to...")
+   - Do NOT use bullet points — this is flowing prose
+   - Do NOT plagiarize source snippets — write in the textbook's own voice
+   - Do NOT bury the correction in paragraph 2 after context-setting
+   - Do NOT open any sentence with "As of [year]," — rephrase to put the subject first
+   - Do NOT end updates with "This highlights...", "This underscores...",
+     "This marks a significant...", "This demonstrates..." — end on a specific fact
+   - Split any sentence over 35 words into two sentences at a natural conjunction or em-dash
+
+═══════════════════════════════════════════════════
+OUTPUT FORMAT
+═══════════════════════════════════════════════════
+
+Return a JSON object with a "proposals" array. Each proposal must include:
+{{
+  "proposals": [
+    {{
+      "old_content": "exact original text being replaced",
+      "new_content": "updated replacement text matching book style",
+      "change_type": one of: "tech_update" | "mission_update" | "constellation_update" |
+                    "statistics_update" | "company_update" | "historical_correction" |
+                    "system_update" | "regulation_update" | "business_model_update",
+      "confidence": "high" | "medium" | "low",
+      "core_claim_status": "false" | "outdated" | "incomplete" | "still_true",
+      "reasoning": "One sentence: what changed and which sources confirm it"
+    }}
+  ]
+}}
+
+If no update is warranted, return {{"proposals": []}}.
+Return ONLY valid JSON — no markdown fences, no extra text outside the JSON.
 """
 
-# Style instruction templates based on style profile values
-STYLE_TEMPLATES = {
-    "graduate_advanced": (
-        "This is a GRADUATE-LEVEL textbook with ADVANCED technical depth.\n"
-        "- Use highly technical terminology and domain-specific jargon freely\n"
-        "- Write complex, multi-clause sentences (avg {avg_len} words/sentence)\n"
-        "- Tone: {tone} — formal academic register, no colloquialisms\n"
-        "- Include detailed technical specifications and engineering context\n"
-        "- Use passive voice {passive} as is typical of academic writing\n"
-        "- Reference specific standards, equations, and technical frameworks"
-    ),
-    "senior_advanced": (
-        "This is a COLLEGE SENIOR-LEVEL textbook with ADVANCED technical depth.\n"
-        "- Use technical terminology appropriate to upper-division courses\n"
-        "- Write moderately complex sentences (avg {avg_len} words/sentence)\n"
-        "- Tone: {tone}\n"
-        "- Include specific numbers, dates, system names, and technical context\n"
-        "- Use passive voice {passive}\n"
-        "- Explain significance of technical changes for the field"
-    ),
-    "default": (
-        "This is a {grade}-LEVEL textbook with {depth} technical depth.\n"
-        "- Terminology level: {terminology}\n"
-        "- Sentence complexity: {complexity} (avg {avg_len} words/sentence)\n"
-        "- Tone: {tone}\n"
-        "- Passive voice: {passive}\n"
-        "- Match this style precisely in your updates"
-    ),
+# ------------------------------------------------------------------ #
+# Style examples — bad vs good, injected selectively per change type  #
+# ------------------------------------------------------------------ #
+
+STYLE_EXAMPLES = {
+    "company_update": {
+        "bad": (
+            "XCOR Aerospace had been developing a rocket-powered spaceplane known as the Lynx, "
+            "which was designed to carry a pilot and a passenger. The project faced challenges, "
+            "including the departure of key co-founders in 2015, which impacted the company's trajectory."
+        ),
+        "good": (
+            "XCOR Aerospace ultimately ceased operations in 2017 after filing for bankruptcy, "
+            "ending development of its Lynx suborbital spaceplane before the vehicle completed "
+            "test flights. The company had made notable technical progress — including successfully "
+            "testing a liquid oxygen piston pump capable of supplying the Lynx main engines — but "
+            "encountered financial difficulties following the departure of key co-founders in 2015. "
+            "The Lynx's horizontal takeoff and landing design, intended to enable multiple flights "
+            "per day at low operating cost, represented an innovative approach to the suborbital "
+            "market that other companies continue to explore."
+        ),
+    },
+    "tech_update": {
+        "bad": (
+            "The latest addition to the Landsat fleet is Landsat-8, which became operational "
+            "following its launch in 2013. Landsat-8 features the Operational Land Imager (OLI) "
+            "and the Thermal Infrared Sensor (TIRS)..."
+        ),
+        "good": (
+            "Landsat-9, launched on September 27, 2021, has since joined the fleet as the most "
+            "recent addition, carrying an updated Operational Land Imager 2 (OLI-2) and Thermal "
+            "Infrared Sensor 2 (TIRS-2) that improve upon the sensors aboard Landsat-8. Together, "
+            "Landsat-8 and Landsat-9 operate in the same orbit offset by 180 degrees, enabling "
+            "the pair to image any point on Earth every eight days — twice as often as either "
+            "satellite could achieve alone — substantially improving the temporal resolution "
+            "available for land-cover monitoring and environmental studies."
+        ),
+    },
+    "mission_update": {
+        "bad": (
+            "While the Russian Soyuz spacecraft continues to be a reliable vehicle for transporting "
+            "astronauts to and from the International Space Station (ISS), it is no longer the sole "
+            "means of crew transportation. Since 2020, NASA's Commercial Crew Program has enabled "
+            "the use of SpaceX's Crew Dragon spacecraft for crewed missions to the ISS."
+        ),
+        "good": (
+            "Since 2020, U.S. crews have had a domestic option for reaching the ISS through NASA's "
+            "Commercial Crew Program. SpaceX's Crew Dragon spacecraft — developed under this "
+            "program — began carrying astronauts to the station in May 2020 with the Demo-2 mission, "
+            "ending a nine-year gap in U.S. human launch capability. The Soyuz spacecraft continues "
+            "to ferry Russian cosmonauts and partner-nation astronauts to the ISS, and both vehicles "
+            "now contribute to crew rotation, providing greater operational flexibility and redundancy "
+            "for the station program."
+        ),
+    },
+}
+
+# Map change types to which style example to use
+_EXAMPLE_TYPE_MAP = {
+    "company_update": "company_update",
+    "business_model_update": "company_update",
+    "historical_correction": "company_update",
+    "tech_update": "tech_update",
+    "statistics_update": "tech_update",
+    "system_update": "tech_update",
+    "mission_update": "mission_update",
+    "constellation_update": "mission_update",
+    "regulation_update": "mission_update",
+    "regulatory_update": "mission_update",
 }
 
 
-def _build_style_instructions(style: Optional[StyleProfile]) -> str:
-    """Build style instructions string from a StyleProfile."""
-    if style is None:
-        return (
-            "No style profile available. Default to formal academic textbook style:\n"
-            "- College senior level, advanced technical depth\n"
-            "- Formal academic tone with complex sentences\n"
-            "- Use technical terminology freely\n"
-            "- Include specific numbers, dates, and technical context"
-        )
-
-    grade = style.grade_level
-    depth = style.technical_depth
-
-    if grade == "graduate" and depth == "advanced":
-        template = STYLE_TEMPLATES["graduate_advanced"]
-    elif grade in ("college_senior", "graduate") and depth in ("advanced", "intermediate"):
-        template = STYLE_TEMPLATES["senior_advanced"]
-    else:
-        template = STYLE_TEMPLATES["default"]
-
-    return template.format(
-        grade=grade,
-        depth=depth,
-        tone=style.tone,
-        complexity=style.sentence_complexity,
-        terminology=style.terminology_level,
-        avg_len=style.avg_sentence_length,
-        passive=style.passive_voice_usage,
+def _get_style_example(claim_type: str) -> str:
+    """Return a bad/good style example relevant to the claim type."""
+    example_key = _EXAMPLE_TYPE_MAP.get(claim_type, "tech_update")
+    example = STYLE_EXAMPLES.get(example_key, STYLE_EXAMPLES["tech_update"])
+    return (
+        f"\n\nSTYLE EXAMPLE — study this before writing:\n"
+        f"BAD (do NOT write like this):\n\"{example['bad']}\"\n\n"
+        f"GOOD (write like this):\n\"{example['good']}\""
     )
+
+
+# ------------------------------------------------------------------ #
+# User prompt template                                                #
+# ------------------------------------------------------------------ #
+
+USER_PROMPT_TEMPLATE = """\
+ORIGINAL TEXT FROM TEXTBOOK:
+\"\"\"{old_content}\"\"\"
+
+DOCUMENT CONTEXT (surrounding paragraph for reference):
+\"\"\"{context}\"\"\"
+
+FOCUS AREAS FOR THIS ANALYSIS: {focus_areas}
+
+RESEARCH FINDINGS FROM AUTHORITATIVE SOURCES:
+{research_results}
+
+DOCUMENT STYLE PROFILE SUMMARY:
+- Grade: Undergraduate STEM textbook (sophomore/junior level)
+- Tone: Authoritative yet accessible, narrative, educational
+- Voice: ACTIVE preferred, ~20 words/sentence average
+- Terminology: Define acronyms and jargon on first use
+- Numbers: Always specific — exact dates, dual units, real figures
+{style_example}
+
+TASK:
+1. First, identify the CORE CLAIM in the original text (one sentence).
+2. Determine if that core claim is: false / outdated / incomplete / still_true.
+3. If false or outdated — begin your new_content with the correction.
+4. Write updated replacement text in the EXACT style of the textbook.
+5. Match the original's length (sentence for sentence, paragraph for paragraph).
+
+Return valid JSON only.
+"""
 
 
 class UpdateAgent:
@@ -159,11 +346,17 @@ class UpdateAgent:
         claims: List[FactualClaim],
         research: Dict[str, List[ResearchResult]],
         document_id: str,
-        style_profile: Optional[StyleProfile] = None,
+        paragraphs: Optional[List[str]] = None,
     ) -> List[ChangeProposal]:
         """
         For each claim that has research results, ask GPT-4o to generate
         a style-matched change proposal. Uses parallel async calls with concurrency limits.
+
+        Args:
+            claims: List of factual claims from content analysis
+            research: Dict mapping claim_id -> list of research results
+            document_id: The document being analyzed
+            paragraphs: Full list of document paragraphs for surrounding context
         """
         if not settings.OPENAI_API_KEY:
             logger.warning("OpenAI API key not configured — skipping proposal generation")
@@ -174,15 +367,9 @@ class UpdateAgent:
             logger.info("No claims with research results — nothing to propose")
             return []
 
-        # Build style-aware system prompt
-        style_instructions = _build_style_instructions(style_profile)
-        system_prompt = SYSTEM_PROMPT.format(style_instructions=style_instructions)
-
         logger.info(
-            "Generating proposals for %d claims (max %d concurrent), style: %s/%s",
+            "Generating proposals for %d claims (max %d concurrent)",
             len(claims_with_research), MAX_CONCURRENT_PROPOSALS,
-            style_profile.grade_level if style_profile else "default",
-            style_profile.technical_depth if style_profile else "default",
         )
 
         # Run proposal generation in parallel with semaphore control
@@ -193,7 +380,9 @@ class UpdateAgent:
                     idx + 1, len(claims_with_research), claim.text[:80],
                 )
                 sources = research[claim.claim_id]
-                return await self._generate_for_claim(claim, sources, document_id, system_prompt)
+                return await self._generate_for_claim(
+                    claim, sources, document_id, paragraphs or [],
+                )
 
         tasks = [_generate_one(i, c) for i, c in enumerate(claims_with_research)]
         task_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -216,10 +405,13 @@ class UpdateAgent:
         claim: FactualClaim,
         sources: List[ResearchResult],
         document_id: str,
-        system_prompt: str,
+        paragraphs: List[str],
     ) -> List[ChangeProposal]:
         """Generate change proposal(s) for a single claim with full source synthesis."""
-        # Build research context — use ALL sources (up to 5) for synthesis
+        # Build surrounding context (±2 paragraphs around the claim)
+        context = self._build_context(claim.paragraph_idx, paragraphs)
+
+        # Build research results text — use ALL sources (up to 5) for synthesis
         source_texts = []
         for i, s in enumerate(sources[:5]):
             source_texts.append(
@@ -230,24 +422,20 @@ class UpdateAgent:
                 f"  Content: {s.snippet[:500]}"
             )
 
-        user_prompt = (
-            f"## Original Claim\n"
-            f"Text: \"{claim.text}\"\n"
-            f"Type: {claim.claim_type}\n"
-            f"Focus area: {claim.focus_area or 'general'}\n"
-            f"Entities: {', '.join(claim.entities) if claim.entities else 'none'}\n"
-            f"Dates mentioned: {', '.join(claim.temporal_refs) if claim.temporal_refs else 'none'}\n\n"
-            f"## Research Findings ({len(sources)} sources — synthesize ALL of them)\n"
-            + "\n\n".join(source_texts)
-            + "\n\n## Instructions\n"
-            f"Generate a detailed, technically accurate update that synthesizes information "
-            f"from ALL {len(sources)} sources above. The update should match the document's "
-            f"writing style as described in the system prompt. Include specific numbers, dates, "
-            f"and technical terminology from the sources."
+        # Get a relevant style example for this claim type
+        style_example = _get_style_example(claim.claim_type)
+
+        # Build user prompt from template
+        user_prompt = USER_PROMPT_TEMPLATE.format(
+            old_content=claim.text,
+            context=context,
+            focus_areas=claim.focus_area or "general",
+            research_results="\n\n".join(source_texts),
+            style_example=style_example,
         )
 
         try:
-            response = await self._call_with_retry(system_prompt, user_prompt)
+            response = await self._call_with_retry(SYSTEM_PROMPT, user_prompt)
             if response is None:
                 return []
 
@@ -279,9 +467,8 @@ class UpdateAgent:
                 }.get(confidence_str, ConfidenceLevel.MEDIUM)
 
                 # Map change type — expanded set
-                change_type_str = p.get("change_type", "data_update").lower()
+                change_type_str = p.get("change_type", "tech_update").lower()
                 change_type = {
-                    "data_update": ChangeType.DATA_UPDATE,
                     "tech_update": ChangeType.TECH_UPDATE,
                     "mission_update": ChangeType.MISSION_UPDATE,
                     "company_update": ChangeType.COMPANY_UPDATE,
@@ -293,7 +480,13 @@ class UpdateAgent:
                     "regulation_update": ChangeType.REGULATION_UPDATE,
                     "business_model_update": ChangeType.BUSINESS_MODEL_UPDATE,
                     "historical_correction": ChangeType.HISTORICAL_CORRECTION,
-                }.get(change_type_str, ChangeType.DATA_UPDATE)
+                    "data_update": ChangeType.DATA_UPDATE,  # backward compat
+                }.get(change_type_str, ChangeType.TECH_UPDATE)
+
+                # Parse core_claim_status
+                core_status = p.get("core_claim_status", "").lower()
+                if core_status not in ("false", "outdated", "incomplete", "still_true"):
+                    core_status = None
 
                 results.append(ChangeProposal(
                     change_id=f"change_{uuid.uuid4().hex[:12]}",
@@ -303,6 +496,7 @@ class UpdateAgent:
                     new_content=p["new_content"],
                     change_type=change_type,
                     confidence=confidence,
+                    core_claim_status=core_status,
                     sources=sources,
                     paragraph_idx=claim.paragraph_idx,
                     page=claim.page,
@@ -316,6 +510,20 @@ class UpdateAgent:
         except Exception as e:
             logger.error("Proposal generation failed for claim %s: %s", claim.claim_id, e)
             return []
+
+    @staticmethod
+    def _build_context(paragraph_idx: int, paragraphs: List[str], window: int = 2) -> str:
+        """Extract surrounding paragraphs (±window) for context."""
+        if not paragraphs:
+            return "(no surrounding context available)"
+
+        start = max(0, paragraph_idx - window)
+        end = min(len(paragraphs), paragraph_idx + window + 1)
+        context_parts = []
+        for i in range(start, end):
+            marker = " >>> " if i == paragraph_idx else "     "
+            context_parts.append(f"{marker}[para {i}] {paragraphs[i][:300]}")
+        return "\n".join(context_parts)
 
     async def _call_with_retry(self, system: str, user_content: str):
         """Call OpenAI with exponential backoff retry on transient errors (500, rate limit, timeout, connection)."""

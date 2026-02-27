@@ -38,6 +38,13 @@ class ConfidenceLevel(str, Enum):
     LOW = "low"
 
 
+class CoreClaimStatus(str, Enum):
+    FALSE = "false"
+    OUTDATED = "outdated"
+    INCOMPLETE = "incomplete"
+    STILL_TRUE = "still_true"
+
+
 # --- Focus Area definitions ---
 class FocusArea(str, Enum):
     MISSIONS = "missions"
@@ -114,6 +121,7 @@ class ChangeProposal(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     reviewed_at: Optional[datetime] = None
     reviewer_note: Optional[str] = None
+    core_claim_status: Optional[str] = None  # false / outdated / incomplete / still_true
     # User edit fields
     user_edited_content: Optional[str] = None
     approval_action: Optional[str] = None  # approve_as_is / approve_with_edit / reject

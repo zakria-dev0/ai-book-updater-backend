@@ -180,16 +180,11 @@ async def propose_node(state: AnalysisState) -> dict:
         f"Generating style-matched change proposals for {len(state['research'])} researched claims",
     )
     try:
-        # Reconstruct StyleProfile from dict
-        style_profile = None
-        if state.get("style_profile"):
-            style_profile = StyleProfile(**state["style_profile"])
-
         proposals = await update_agent.generate_proposals(
             claims=state["claims"],
             research=state["research"],
             document_id=state["document_id"],
-            style_profile=style_profile,
+            paragraphs=state.get("paragraphs", []),
         )
         await _update_analysis_progress(
             state, "Proposals generated", 75,
