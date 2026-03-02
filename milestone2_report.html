@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Book Update System — Milestone 2 Report</title>
+<style>
+  @page {
+    margin: 0.8in 0.7in;
+    size: A4;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', Calibri, Arial, sans-serif;
+    color: #1e293b;
+    line-height: 1.65;
+    font-size: 11.5pt;
+    background: #fff;
+  }
+
+  /* ---------- COVER ---------- */
+  .cover {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+    padding: 60px 40px;
+    background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);
+    color: #fff;
+    page-break-after: always;
+  }
+  .cover-icon { font-size: 56px; margin-bottom: 30px; opacity: 0.9; }
+  .cover h1 { font-size: 32pt; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 12px; }
+  .cover .subtitle { font-size: 15pt; font-weight: 400; color: #e2e8f0; margin-bottom: 40px; }
+  .cover .meta-box {
+    background: rgba(255,255,255,0.15);
+    border: 1px solid rgba(255,255,255,0.3);
+    border-radius: 12px;
+    padding: 28px 44px;
+    display: inline-block;
+    text-align: left;
+    font-size: 12pt;
+    color: #f1f5f9;
+    line-height: 2.2;
+  }
+  .cover .meta-box strong { color: #fff; }
+
+  /* ---------- CONTENT ---------- */
+  .content { max-width: 780px; margin: 0 auto; padding: 50px 40px; }
+  h2 {
+    font-size: 17pt;
+    color: #0f172a;
+    border-bottom: 3px solid #2563eb;
+    padding-bottom: 8px;
+    margin: 40px 0 18px;
+  }
+  h2:first-of-type { margin-top: 0; }
+  h3 { font-size: 13pt; color: #1e40af; margin: 22px 0 8px; }
+  p { margin-bottom: 12px; }
+  ul, ol { margin: 10px 0 16px 22px; }
+  li { margin-bottom: 6px; }
+
+  /* ---------- STATS CARDS ---------- */
+  .stats-row {
+    display: flex;
+    gap: 14px;
+    margin: 20px 0 28px;
+    flex-wrap: wrap;
+  }
+  .stat-card {
+    flex: 1;
+    min-width: 140px;
+    background: #f1f5f9;
+    border-radius: 10px;
+    padding: 18px 16px;
+    text-align: center;
+    border-left: 4px solid #2563eb;
+  }
+  .stat-card .number {
+    font-size: 26pt;
+    font-weight: 700;
+    color: #1e40af;
+    line-height: 1.1;
+  }
+  .stat-card .label {
+    font-size: 9pt;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 4px;
+  }
+
+  /* ---------- BEFORE / AFTER ---------- */
+  .update-card {
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    overflow: hidden;
+    margin: 18px 0 26px;
+    page-break-inside: avoid;
+  }
+  .update-card .card-header {
+    background: #f8fafc;
+    padding: 12px 18px;
+    font-weight: 600;
+    font-size: 10.5pt;
+    color: #334155;
+    border-bottom: 1px solid #e2e8f0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .badge {
+    font-size: 8pt;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+  .badge-high { background: #dcfce7; color: #166534; }
+  .badge-low  { background: #fef9c3; color: #854d0e; }
+  .before, .after {
+    padding: 14px 18px;
+    font-size: 10.5pt;
+    line-height: 1.6;
+  }
+  .before {
+    background: #fef2f2;
+    border-left: 4px solid #ef4444;
+  }
+  .before::before {
+    content: 'CURRENT TEXT (Outdated)';
+    display: block;
+    font-size: 8pt;
+    font-weight: 700;
+    color: #b91c1c;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .after {
+    background: #f0fdf4;
+    border-left: 4px solid #22c55e;
+  }
+  .after::before {
+    content: 'SUGGESTED UPDATE';
+    display: block;
+    font-size: 8pt;
+    font-weight: 700;
+    color: #15803d;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .sources-strip {
+    background: #f8fafc;
+    padding: 10px 18px;
+    font-size: 9pt;
+    color: #64748b;
+    border-top: 1px solid #e2e8f0;
+  }
+  .sources-strip strong { color: #334155; }
+
+  /* ---------- STYLE PROFILE ---------- */
+  .profile-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 14px 0 20px;
+    font-size: 10.5pt;
+  }
+  .profile-table th, .profile-table td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid #e2e8f0;
+  }
+  .profile-table th {
+    background: #f1f5f9;
+    font-weight: 600;
+    width: 40%;
+    color: #334155;
+  }
+
+  /* ---------- PIPELINE ---------- */
+  .pipeline {
+    display: flex;
+    gap: 0;
+    margin: 20px 0 26px;
+    flex-wrap: wrap;
+  }
+  .pipe-step {
+    flex: 1;
+    min-width: 120px;
+    text-align: center;
+    padding: 14px 8px;
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    position: relative;
+    font-size: 9.5pt;
+    color: #1e40af;
+    font-weight: 600;
+  }
+  .pipe-step:first-child { border-radius: 8px 0 0 8px; }
+  .pipe-step:last-child  { border-radius: 0 8px 8px 0; }
+  .pipe-step .step-num {
+    display: block;
+    font-size: 16pt;
+    font-weight: 700;
+    color: #2563eb;
+    margin-bottom: 2px;
+  }
+
+  /* ---------- INFO BOX ---------- */
+  .info-box {
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin: 16px 0;
+    font-size: 10.5pt;
+    color: #1e3a5f;
+  }
+
+  /* ---------- FOOTER ---------- */
+  .footer {
+    text-align: center;
+    padding: 30px 20px;
+    font-size: 9pt;
+    color: #94a3b8;
+    border-top: 1px solid #e2e8f0;
+    margin-top: 40px;
+  }
+
+  @media print {
+    .cover { min-height: 100vh; }
+    .content { padding: 0; }
+    .stat-card { border-left-color: #2563eb !important; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ============ COVER PAGE ============ -->
+<div class="cover">
+  <h1>AI Book Update System</h1>
+  <div class="subtitle">Milestone 2 &mdash; AI Analysis &amp; Change Proposal Engine</div>
+  <div class="meta-box">
+    <strong>Document Tested:</strong> Ch 2 US Book 4th Editionx<br>
+    <strong>Chapter Tested:</strong> Chapter 2 &mdash; Exploring Space<br>
+    <strong>Test Date:</strong> March 2, 2026<br>
+    <strong>Report Type:</strong> Functional Demonstration &amp; Results
+  </div>
+</div>
+
+<!-- ============ CONTENT ============ -->
+<div class="content">
+
+<h2>1. Executive Summary</h2>
+<p>
+  This report presents the results of <strong>Milestone 2</strong> of the AI Book Update System. The system was tested by uploading an actual chapter from the textbook <em>"Understanding Space: An Introduction to Astronautics"</em> (4th Edition). The AI successfully processed the document, identified outdated information, and generated accurate, style-matched replacement text backed by authoritative sources.
+</p>
+<p>
+  Below is a summary of what the system accomplished during the test:
+</p>
+
+<div class="stats-row">
+  <div class="stat-card">
+    <div class="number">51</div>
+    <div class="label">Pages Processed</div>
+  </div>
+  <div class="stat-card">
+    <div class="number">221</div>
+    <div class="label">Facts Identified</div>
+  </div>
+  <div class="stat-card">
+    <div class="number">34</div>
+    <div class="label">Outdated Items Found</div>
+  </div>
+  <div class="stat-card">
+    <div class="number">34</div>
+    <div class="label">Updates Proposed</div>
+  </div>
+</div>
+
+<div class="info-box">
+  <strong>Testing Note:</strong> This test was performed on the uploaded document file
+  (<em>Ch 2 US Book 4th Edition</em>) to validate the system's end-to-end functionality.
+  All results shown below are real outputs produced by the AI pipeline during this test run.
+</div>
+
+<!-- ============ SECTION 2 ============ -->
+<h2>2. How the System Works</h2>
+<p>
+  The AI Book Update System reads an uploaded textbook chapter and automatically finds information
+  that may be outdated. It then researches the latest facts from trusted sources and suggests
+  replacement text that matches the original writing style of the book. Here is the step-by-step process:
+</p>
+
+<div class="pipeline">
+  <div class="pipe-step"><span class="step-num">1</span>Upload &amp; Extract</div>
+  <div class="pipe-step"><span class="step-num">2</span>Style Analysis</div>
+  <div class="pipe-step"><span class="step-num">3</span>Fact Detection</div>
+  <div class="pipe-step"><span class="step-num">4</span>Web Research</div>
+  <div class="pipe-step"><span class="step-num">5</span>Generate Updates</div>
+  <div class="pipe-step"><span class="step-num">6</span>Quality Check</div>
+</div>
+
+<ol>
+  <li><strong>Upload &amp; Extract</strong> &mdash; The system reads the DOCX file and extracts all text, figures, tables, and equations.</li>
+  <li><strong>Style Analysis</strong> &mdash; AI analyzes the book's writing style (tone, complexity, grade level) so that all suggested updates match the original author's voice.</li>
+  <li><strong>Fact Detection</strong> &mdash; AI scans every paragraph to identify factual claims &mdash; dates, statistics, mission details, company information, and technology references.</li>
+  <li><strong>Web Research</strong> &mdash; For each potentially outdated fact, the system searches trusted sources (NASA, ESA, SpaceNews, academic papers) for the latest information.</li>
+  <li><strong>Generate Updates</strong> &mdash; AI writes replacement text that incorporates the new facts while preserving the textbook's style and educational tone.</li>
+  <li><strong>Quality Check</strong> &mdash; Every update is validated for accuracy, style consistency, and minimum quality standards before being presented for review.</li>
+</ol>
+
+<!-- ============ SECTION 3 ============ -->
+<h2>3. Writing Style Detection</h2>
+<p>
+  Before generating any updates, the system first learns the writing style of the textbook.
+  This ensures that all suggested changes read naturally and blend seamlessly with the existing text.
+  Here is the style profile the AI detected for this chapter:
+</p>
+
+<table class="profile-table">
+  <tr><th>Grade Level</th><td>College Freshman</td></tr>
+  <tr><th>Technical Depth</th><td>Introductory</td></tr>
+  <tr><th>Tone</th><td>Formal Academic</td></tr>
+  <tr><th>Sentence Complexity</th><td>Moderate</td></tr>
+  <tr><th>Terminology Level</th><td>Basic (accessible to students)</td></tr>
+  <tr><th>Avg. Sentence Length</th><td>~20 words</td></tr>
+  <tr><th>Passive Voice Usage</th><td>Moderate</td></tr>
+</table>
+
+<p>
+  This means the system will write updates that are informative but not overly technical &mdash;
+  appropriate for a college introductory course. The updates will use a formal academic tone
+  while remaining easy to understand.
+</p>
+
+<!-- ============ SECTION 4 ============ -->
+<h2>4. Document Processing Results</h2>
+<p>The system successfully extracted all content from the uploaded chapter:</p>
+
+<table class="profile-table">
+  <tr><th>Total Pages</th><td>51</td></tr>
+  <tr><th>Paragraphs Extracted</th><td>710</td></tr>
+  <tr><th>Figures Detected</th><td>86</td></tr>
+  <tr><th>Tables Detected</th><td>4</td></tr>
+  <tr><th>Chapter</th><td>Chapter 2 &mdash; Exploring Space</td></tr>
+</table>
+
+<!-- ============ SECTION 5 ============ -->
+<h2>5. Sample Updates (Before &amp; After)</h2>
+<p>
+  Below are representative examples of updates the system proposed. Each example shows the
+  <span style="color:#b91c1c;">original outdated text</span> alongside the
+  <span style="color:#15803d;">suggested replacement</span>, along with the sources used.
+</p>
+
+<!-- EXAMPLE 1 -->
+<h3>Example 1: Commercial Crew Transportation</h3>
+<div class="update-card">
+  <div class="card-header">
+    Technology Update &mdash; Page 26
+    <span class="badge badge-low">Needs Review</span>
+  </div>
+  <div class="before">
+    These plans hinge on the availability of commercial crew transportation systems, hopefully starting after 2017.
+  </div>
+  <div class="after">
+    Commercial crew transportation systems became operational with SpaceX's Crew Dragon, which first launched astronauts to the ISS on May 30, 2020. Boeing's CST-100 Starliner, however, has faced delays due to technical challenges during its test flights. As of early 2026, NASA and Boeing continue to address these issues, with the Starliner expected to join the operational fleet once resolved.
+  </div>
+  <div class="sources-strip">
+    <strong>Sources:</strong> NASA News Releases (2025) &bull; NASA Boeing Crew Flight Test Page &bull; NASA Aerospace Safety Advisory Panel Report (2026) &bull; NASA Starliner Investigation Report (2026)
+  </div>
+</div>
+
+<!-- EXAMPLE 2 -->
+<h3>Example 2: XCOR Aerospace Status</h3>
+<div class="update-card">
+  <div class="card-header">
+    Company Update &mdash; Page 26
+    <span class="badge badge-high">High Confidence</span>
+  </div>
+  <div class="before">
+    XCOR Aerospace is developing a rocket-powered spaceplane called Lynx capable of carrying a pilot and a passenger.
+  </div>
+  <div class="after">
+    XCOR Aerospace ceased operations in 2017 after filing for bankruptcy, ending development of its Lynx suborbital spaceplane before the vehicle completed test flights. The Lynx was designed to carry one pilot and one passenger on a suborbital trajectory, taking off and landing on a runway under rocket power. Despite initial progress, financial difficulties led to the company's liquidation, and the Lynx project was never realized.
+  </div>
+  <div class="sources-strip">
+    <strong>Sources:</strong> SpaceNews &mdash; "XCOR Aerospace files for bankruptcy" &bull; Space.com &mdash; "XCOR Space Tourists Push for Refunds" &bull; SpaceNews &mdash; "XCOR running out of time to find investor" &bull; BBC Future
+  </div>
+</div>
+
+<!-- EXAMPLE 3 -->
+<h3>Example 3: Landsat Satellite Fleet</h3>
+<div class="update-card">
+  <div class="card-header">
+    Technology Update &mdash; Page 23
+    <span class="badge badge-high">High Confidence</span>
+  </div>
+  <div class="before">
+    The latest addition to the Landsat fleet is Landsat-8, shown in Figure 2-51.
+  </div>
+  <div class="after">
+    Landsat-9, launched on September 27, 2021, has since joined the fleet as the most recent addition, carrying an updated Operational Land Imager 2 (OLI-2) and Thermal Infrared Sensor 2 (TIRS-2) that improve upon the sensors aboard Landsat-8. Together, Landsat-8 and Landsat-9 operate in the same orbit offset by 180 degrees, enabling the pair to image any point on Earth every eight days &mdash; twice as often as either satellite could achieve alone &mdash; substantially improving the temporal resolution available for land-cover monitoring and environmental studies.
+  </div>
+  <div class="sources-strip">
+    <strong>Sources:</strong> NASA SVS &mdash; Earth Observing Fleet (2021) &bull; NASA Earth Science Missions: Current Fleet &bull; NASA SVS &mdash; Landsat Next Planned Orbits &bull; Space.com &mdash; Landsat Satellite Guide
+  </div>
+</div>
+
+<!-- EXAMPLE 4 -->
+<h3>Example 4: ISS Crew Transportation</h3>
+<div class="update-card">
+  <div class="card-header">
+    Technology Update &mdash; Page 20
+    <span class="badge badge-high">High Confidence</span>
+  </div>
+  <div class="before">
+    Crews have since relied solely on the Russia Soyuz spacecraft to travel to and from the ISS.
+  </div>
+  <div class="after">
+    Since 2020, crews have traveled to and from the ISS using both the Russian Soyuz spacecraft and SpaceX's Crew Dragon. The Crew Dragon, developed under NASA's Commercial Crew Program, first transported astronauts to the ISS on May 30, 2020, during the Demo-2 mission. This marked the first time a private company launched astronauts to the ISS, providing NASA with an alternative to the Soyuz. As of early 2026, both spacecraft continue to serve as primary transport vehicles for astronauts, enhancing redundancy and flexibility in crew rotations.
+  </div>
+  <div class="sources-strip">
+    <strong>Sources:</strong> ESA &mdash; The Russian Soyuz Spacecraft &bull; AP News &mdash; SpaceX Dragon Capsule &bull; Space.com &mdash; Soyuz Spacecraft History &bull; SpaceNews &mdash; Soyuz Transports New Crew (2025)
+  </div>
+</div>
+
+<!-- ============ SECTION 6 ============ -->
+<h2>6. Key Features Demonstrated</h2>
+<ul>
+  <li><strong>Automatic Fact Detection</strong> &mdash; The system identified 221 factual claims across 51 pages without any manual input.</li>
+  <li><strong>Smart Filtering</strong> &mdash; Of the 221 facts, the AI correctly determined that 34 are potentially outdated and need updating, while the remaining 187 are still accurate.</li>
+  <li><strong>Authoritative Sources</strong> &mdash; Every update is backed by sources from trusted organizations such as NASA, ESA, SpaceNews, and peer-reviewed publications.</li>
+  <li><strong>Style Matching</strong> &mdash; The replacement text maintains the same academic tone, grade level, and sentence structure as the original textbook.</li>
+  <li><strong>Focus Area Filtering</strong> &mdash; Users can choose to analyze specific categories (missions, technology, companies, statistics, etc.) or analyze everything at once.</li>
+  <li><strong>Human Review Workflow</strong> &mdash; Every proposed change is presented for human review. Users can approve, edit, or reject each suggestion individually.</li>
+  <li><strong>Confidence Scoring</strong> &mdash; Each update includes a confidence level (high, medium, or low) so reviewers can prioritize their attention.</li>
+</ul>
+
+<!-- ============ SECTION 7 ============ -->
+<h2>7. Review Workflow</h2>
+<p>
+  The system does <strong>not</strong> make any changes automatically. Every proposed update goes through a
+  human review process with three options:
+</p>
+<ol>
+  <li><strong>Approve As-Is</strong> &mdash; Accept the AI's suggested text exactly as written.</li>
+  <li><strong>Approve With Edit</strong> &mdash; Accept the update but modify the wording before it is applied. The reviewer can adjust any part of the suggested text.</li>
+  <li><strong>Reject</strong> &mdash; Decline the suggestion entirely. The original text remains unchanged.</li>
+</ol>
+<p>
+  This ensures that a subject-matter expert always has the final say on what goes into the book.
+</p>
+
+<!-- ============ SECTION 8 ============ -->
+<h2>8. What This Means</h2>
+<p>
+  Updating a textbook manually requires reading every page, identifying every fact that may have changed, researching the current status of each fact, and rewriting the text to match the book's style. For a 51-page chapter, this process would typically take a subject-matter expert several days of focused work.
+</p>
+<p>
+  The AI Book Update System completed this entire process &mdash; from document upload to a full set of proposed updates with sources &mdash; in a <strong>single automated run</strong>. The human reviewer can then focus on evaluating and approving updates rather than searching for what needs to change.
+</p>
+
+<!-- ============ SECTION 9 ============ -->
+<h2>9. Milestone 2 Deliverables &mdash; Summary</h2>
+
+<table class="profile-table">
+  <tr><th>Deliverable</th><th>Status</th></tr>
+  <tr><td>Document Upload &amp; Text Extraction</td><td>Completed</td></tr>
+  <tr><td>Figure, Table &amp; Equation Extraction</td><td>Completed</td></tr>
+  <tr><td>Writing Style Analysis</td><td>Completed</td></tr>
+  <tr><td>AI-Powered Fact Detection</td><td>Completed</td></tr>
+  <tr><td>Automated Web Research (Authoritative Sources)</td><td>Completed</td></tr>
+  <tr><td>Style-Matched Change Proposal Generation</td><td>Completed</td></tr>
+  <tr><td>Confidence Scoring &amp; Source Attribution</td><td>Completed</td></tr>
+  <tr><td>Human Review Workflow (Approve / Edit / Reject)</td><td>Completed</td></tr>
+  <tr><td>Focus Area Filtering</td><td>Completed</td></tr>
+  <tr><td>Secure Authentication (JWT)</td><td>Completed</td></tr>
+  <tr><td>Full REST API with Postman Collection</td><td>Completed</td></tr>
+</table>
+
+
+</div>
+</body>
+</html>

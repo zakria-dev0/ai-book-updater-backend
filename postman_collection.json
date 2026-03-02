@@ -10,7 +10,8 @@
     { "key": "access_token","value": "",                       "type": "string" },
     { "key": "document_id", "value": "",                       "type": "string" },
     { "key": "change_id",  "value": "",                       "type": "string" },
-    { "key": "equation_id","value": "",                       "type": "string" }
+    { "key": "equation_id","value": "",                       "type": "string" },
+    { "key": "refresh_token","value": "",                     "type": "string" }
   ],
   "item": [
     {
@@ -80,7 +81,11 @@
                   "pm.test('Has access token', () => json.access_token);",
                   "if (json.access_token) {",
                   "  pm.collectionVariables.set('access_token', json.access_token);",
-                  "  console.log('Token saved to collection variable: access_token');",
+                  "  console.log('access_token saved to collection variable');",
+                  "}",
+                  "if (json.refresh_token) {",
+                  "  pm.collectionVariables.set('refresh_token', json.refresh_token);",
+                  "  console.log('refresh_token saved to collection variable');",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -104,12 +109,32 @@
         },
         {
           "name": "Refresh Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const json = pm.response.json();",
+                  "if (json.access_token) {",
+                  "  pm.collectionVariables.set('access_token', json.access_token);",
+                  "  console.log('access_token refreshed and saved');",
+                  "}",
+                  "if (json.refresh_token) {",
+                  "  pm.collectionVariables.set('refresh_token', json.refresh_token);",
+                  "  console.log('refresh_token rotated and saved');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
           "request": {
             "method": "POST",
             "header": [{ "key": "Content-Type", "value": "application/json" }],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"refresh_token\": \"<paste refresh token here>\"\n}"
+              "raw": "{\n  \"refresh_token\": \"{{refresh_token}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}{{api_prefix}}/auth/refresh",

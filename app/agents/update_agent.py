@@ -12,6 +12,7 @@ Hardcoded for "Understanding Space: An Introduction to Astronautics" (4th Editio
 import json
 import uuid
 import asyncio
+from datetime import datetime
 from typing import Dict, List, Optional
 from openai import AsyncOpenAI, RateLimitError, APITimeoutError, APIError, APIConnectionError
 from app.core.config import settings
@@ -150,18 +151,34 @@ UPDATE GENERATION RULES
    - If OUTDATED/INCOMPLETE → Expand with current data while correcting what's stale.
    - If STILL TRUE but needs detail → Add context and updated numbers.
 
-2. SYNTHESIZE MULTIPLE SOURCES:
-   - Use information from ALL provided research sources, not just the first one
+2. SYNTHESIZE MULTIPLE SOURCES (MANDATORY — DO NOT SKIP):
+   - Extract KEY FACTS from EVERY provided source, not just Source 1
    - Cross-reference data points — if two NASA sources agree on a number, use it confidently
    - Prioritize: NASA/ESA/government sources > academic/industry > general news
+   - If sources tell a chronological story (mission launched → problem occurred → resolution),
+     your new_content MUST cover the FULL ARC, not just the beginning
+   - If a mission had a major anomaly, crew stranding, extended delay, or dramatic outcome,
+     you MUST describe what happened and how it was resolved
+   - If a vehicle returned, was decommissioned, or a program concluded, include the final status
+   - DO NOT write a generic summary when your sources contain specific dramatic events
 
-3. INCLUDE SPECIFIC TECHNICAL DETAILS:
+3. DATE AWARENESS (CRITICAL):
+   - Today's date will be provided in the user prompt as "TODAY'S DATE: YYYY-MM-DD"
+   - If a scheduled/target date in your sources has ALREADY PASSED and no confirmation of
+     the event occurring exists in the sources, you MUST state the event has been delayed
+     and no confirmed date has been announced
+   - NEVER present a past date as an upcoming future target
+   - Example: If today is 2026-03-01 and a source says "Artemis II targets September 2025"
+     but no source confirms it launched → write "Artemis II has been delayed beyond its
+     original September 2025 target, with no confirmed launch date as of early 2026"
+
+5. INCLUDE SPECIFIC TECHNICAL DETAILS:
    - Mission names and designations (Crew Dragon Endeavour, Soyuz MS-25)
    - Exact numbers (5,400 satellites, 550 km orbit, $2.7 billion contract)
    - Dates (launched November 2020, as of February 2024)
    - System specifications when relevant (pushbroom vs. whiskbroom, LEO vs. GEO)
 
-4. FOR CONSTELLATION / MEGA-CONSTELLATION UPDATES:
+6. FOR CONSTELLATION / MEGA-CONSTELLATION UPDATES:
    - State current constellation size with exact number and date
    - Contrast with what the book said (e.g., "dozens" → now "thousands")
    - Name the major players: Starlink, OneWeb, Amazon Kuiper, Chinese Guowang
@@ -169,16 +186,16 @@ UPDATE GENERATION RULES
      inter-satellite laser links, LEO broadband coverage
    - Include growth trajectory if relevant
 
-5. FOR COMPANY STATUS UPDATES:
+7. FOR COMPANY STATUS UPDATES:
    - If a company went bankrupt or shut down → STATE THIS IN SENTENCE 1
    - If leadership changed → mention who leads now and when change occurred
    - If a program was cancelled → say so explicitly, don't soften with "faced challenges"
 
-6. FIGURE REFERENCES:
+8. FIGURE REFERENCES:
    - Preserve any existing figure references from the original: "(see Figure 2-41)"
    - If the original referenced a figure, keep that reference in your update
 
-7. WHAT NOT TO DO:
+9. WHAT NOT TO DO:
    - Do NOT use passive voice as the primary voice
    - Do NOT start updates with "It is worth noting that..." or "It should be mentioned..."
    - Do NOT use hedging language like "may have" or "could potentially" when facts are known
@@ -469,6 +486,8 @@ Return the SAME JSON format as before. Only update the "new_content" field — k
 # ------------------------------------------------------------------ #
 
 USER_PROMPT_TEMPLATE = """\
+TODAY'S DATE: {today_date}
+
 ORIGINAL TEXT FROM TEXTBOOK:
 \"\"\"{old_content}\"\"\"
 
@@ -593,6 +612,7 @@ class UpdateAgent:
 
         # Build user prompt from template
         user_prompt = USER_PROMPT_TEMPLATE.format(
+            today_date=datetime.now().strftime("%Y-%m-%d"),
             old_content=claim.text,
             context=context,
             focus_areas=claim.focus_area or "general",

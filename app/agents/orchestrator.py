@@ -105,7 +105,7 @@ async def style_analyze_node(state: AnalysisState) -> dict:
 
         # Store style profile in document metadata
         db = state.get("db")
-        if db:
+        if db is not None:
             doc_repo = DocumentRepository(db)
             await doc_repo.update_fields(state["document_id"], {
                 "style_profile": profile_dict,
