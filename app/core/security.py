@@ -81,7 +81,8 @@ async def get_current_user(
                     headers={"WWW-Authenticate": "Bearer"},
                 )
 
-        return {"email": email, "token": token}
+        role: str = payload.get("role", "user")
+        return {"email": email, "role": role, "token": token}
     except JWTError:
         raise credentials_exception
 

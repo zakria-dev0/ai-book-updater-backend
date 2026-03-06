@@ -331,17 +331,30 @@ class DOCXParser:
     def _get_page_count(self) -> int:
         """
         Get total page count. Prefers the real count from DOCX extended properties;
-        falls back to counting explicit page-break XML elements.
+        falls back to counting explicit page-break XML elements + section breaks.
+        If that still seems too low, estimates from word count (~250 words/page).
         """
         if self._real_page_count:
             return self._real_page_count
 
         W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        # Count explicit page breaks
         page_breaks = sum(
             1 for el in self.doc.element.body.iter(f'{{{W_NS}}}br')
             if el.get(f'{{{W_NS}}}type') == 'page'
         )
-        return max(1, page_breaks + 1)
+        # Count section breaks (which also cause page breaks)
+        section_breaks = sum(
+            1 for el in self.doc.element.body.iter(f'{{{W_NS}}}sectPr')
+        )
+        xml_pages = max(1, page_breaks + section_breaks)
+
+        # Estimate from word count as a sanity check (~250 words per page)
+        total_words = sum(len(p.text.split()) for p in self.doc.paragraphs if p.text.strip())
+        word_estimate = max(1, math.ceil(total_words / 250))
+
+        # Use the higher of the two estimates
+        return max(xml_pages, word_estimate)
 
     def _generate_metadata(self) -> DocumentMetadata:
         """Generate document metadata including title and author from core properties"""

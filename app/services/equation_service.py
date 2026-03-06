@@ -1,12 +1,61 @@
 # equation_service.py
+import asyncio
+import base64
 import httpx
 import re
+from io import BytesIO
 from typing import List, Tuple
 from app.core.config import settings
 from app.models.document import Equation, Figure, Position
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Maximum concurrent Mathpix API calls
+MAX_CONCURRENT = 5
+
+# Figures larger than this (in bytes of base64 data) are likely photos, not equations
+# ~50KB of base64 ≈ 37KB image — most equations are smaller than this
+MAX_EQUATION_IMAGE_SIZE = 80_000
+
+# Minimum aspect ratio (width/height) for equation candidates
+# Equations tend to be wider than tall; photos are more square
+MIN_ASPECT_RATIO = 0.3
+
+
+def _is_likely_equation_image(fig: Figure) -> bool:
+    """
+    Quick heuristic to check if a figure image could plausibly be an equation.
+    Filters out large photos, diagrams, and full-page images before calling Mathpix.
+    """
+    if not fig.image_base64:
+        return False
+
+    # Check raw base64 size — large images are almost certainly not equations
+    b64_size = len(fig.image_base64)
+    if b64_size > MAX_EQUATION_IMAGE_SIZE:
+        return False
+
+    # Try to check image dimensions
+    try:
+        from PIL import Image as PILImage
+        img_data = base64.b64decode(fig.image_base64)
+        img = PILImage.open(BytesIO(img_data))
+        w, h = img.size
+
+        # Very large images (> 800px in both dimensions) are likely photos
+        if w > 800 and h > 800:
+            return False
+
+        # Very small images (< 20px) are likely artifacts
+        if w < 20 or h < 20:
+            return False
+
+    except Exception:
+        # If we can't check dimensions, allow it through
+        pass
+
+    return True
 
 
 class MathpixService:
@@ -22,7 +71,7 @@ class MathpixService:
     def is_configured(self) -> bool:
         return bool(self.app_id and self.app_key)
 
-    async def _call_mathpix(self, image_base64: str) -> dict | None:
+    async def _call_mathpix(self, client: httpx.AsyncClient, image_base64: str) -> dict | None:
         """Send a single image to Mathpix and return the JSON response."""
         headers = {
             "app_id": self.app_id,
@@ -36,10 +85,9 @@ class MathpixService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(self.API_URL, json=payload, headers=headers)
-                resp.raise_for_status()
-                return resp.json()
+            resp = await client.post(self.API_URL, json=payload, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
         except httpx.HTTPStatusError as e:
             logger.error("Mathpix HTTP error %s: %s", e.response.status_code, e.response.text)
             return None
@@ -102,34 +150,23 @@ class MathpixService:
         match = re.search(r'\([\d][\d.\-]*\)', latex)
         return match.group(0) if match else None
 
-    async def extract_equations_from_figures(
-        self, figures: List[Figure]
-    ) -> Tuple[List[Equation], List[Figure]]:
-        """
-        Send each figure to Mathpix to detect whether it contains an equation.
-
-        Returns:
-            (equations_found, remaining_figures)
-            - equations_found: Figure images that Mathpix identified as equations
-            - remaining_figures: Figures that are NOT equations
-        """
-        if not self.is_configured:
-            logger.warning("Mathpix API keys not configured — skipping image equation extraction")
-            return [], figures
-
-        equations: List[Equation] = []
-        remaining_figures: List[Figure] = []
-
-        for idx, fig in enumerate(figures):
-            logger.info("Mathpix: processing figure %d/%d (%s)", idx + 1, len(figures), fig.figure_id)
-            result = await self._call_mathpix(fig.image_base64)
+    async def _process_single_figure(
+        self,
+        client: httpx.AsyncClient,
+        semaphore: asyncio.Semaphore,
+        fig: Figure,
+        idx: int,
+        total: int,
+    ) -> Tuple[Equation | None, Figure | None]:
+        """Process a single figure through Mathpix, returning either an equation or the original figure."""
+        async with semaphore:
+            logger.info("Mathpix: processing figure %d/%d (%s)", idx + 1, total, fig.figure_id)
+            result = await self._call_mathpix(client, fig.image_base64)
 
             if result is None:
                 logger.warning("  → Mathpix returned no result, keeping as figure")
-                remaining_figures.append(fig)
-                continue
+                return None, fig
 
-            # Debug logging — show what Mathpix returned
             latex = result.get("latex_styled", "")
             text = result.get("text", "")
             confidence = result.get("confidence", None)
@@ -145,21 +182,81 @@ class MathpixService:
             if self._has_math(result):
                 content = latex or text
                 eq_number = self._extract_eq_number(content)
-                equations.append(Equation(
+                eq = Equation(
                     equation_id=f"eq_mathpix_{fig.figure_id}",
                     latex=content,
                     image_base64=fig.image_base64,
                     position=fig.position,
                     number=eq_number,
-                ))
+                )
                 logger.info("  → EQUATION detected: %s", content[:120])
+                return eq, None
             else:
                 logger.info("  → not an equation (latex=%r, text=%r)",
                             latex[:60] if latex else "", text[:60] if text else "")
+                return None, fig
+
+    async def extract_equations_from_figures(
+        self, figures: List[Figure]
+    ) -> Tuple[List[Equation], List[Figure]]:
+        """
+        Send each candidate figure to Mathpix to detect whether it contains an equation.
+        Pre-filters figures by size/dimensions to skip obvious non-equations.
+        Processes up to MAX_CONCURRENT figures in parallel.
+
+        Returns:
+            (equations_found, remaining_figures)
+            - equations_found: Figure images that Mathpix identified as equations
+            - remaining_figures: Figures that are NOT equations
+        """
+        if not self.is_configured:
+            logger.warning("Mathpix API keys not configured — skipping image equation extraction")
+            return [], figures
+
+        # Pre-filter: only send plausible equation candidates to Mathpix
+        candidates = []
+        remaining_figures: List[Figure] = []
+
+        for fig in figures:
+            if _is_likely_equation_image(fig):
+                candidates.append(fig)
+            else:
+                remaining_figures.append(fig)
+
+        skipped = len(figures) - len(candidates)
+        if skipped > 0:
+            logger.info(
+                "Pre-filter: %d/%d figures skipped (too large for equations), %d candidates remain",
+                skipped, len(figures), len(candidates),
+            )
+
+        if not candidates:
+            logger.info("No equation candidates after pre-filtering")
+            return [], remaining_figures
+
+        # Process candidates concurrently with a semaphore
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+        equations: List[Equation] = []
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            tasks = [
+                self._process_single_figure(client, semaphore, fig, idx, len(candidates))
+                for idx, fig in enumerate(candidates)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error("Mathpix task failed: %s", result)
+                continue
+            eq, fig = result
+            if eq is not None:
+                equations.append(eq)
+            if fig is not None:
                 remaining_figures.append(fig)
 
         logger.info(
-            "Mathpix done: %d equations extracted from %d figures",
-            len(equations), len(figures),
+            "Mathpix done: %d equations extracted from %d candidates (%d total figures, %d skipped)",
+            len(equations), len(candidates), len(figures), skipped,
         )
         return equations, remaining_figures

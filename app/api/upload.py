@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status, Request
 from app.core.security import get_current_user_dep
 from app.database.connection import get_database
 from app.database.repositories.document_repo import DocumentRepository
@@ -6,6 +6,7 @@ from app.models.document import Document, DocumentType
 from app.utils.file_handler import validate_file, save_upload_file
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.core.rate_limit import limiter
 import os
 
 logger = get_logger(__name__)
@@ -23,7 +24,9 @@ router = APIRouter(prefix="/upload", tags=["Upload"])
         500: {"description": "File save error"},
     },
 )
+@limiter.limit("10/minute")
 async def upload_document(
+    request: Request,
     file: UploadFile = File(..., description="DOCX file to upload"),
     current_user: dict = Depends(get_current_user_dep),
     db=Depends(get_database),

@@ -7,6 +7,8 @@ Enhanced with:
 - Better query building for constellation/mega-constellation topics
 - Claim-type-aware search strategies
 - More search results for comprehensive synthesis
+- Query deduplication to avoid redundant API calls
+- Higher concurrency for faster throughput
 """
 import asyncio
 from typing import Dict, List
@@ -16,8 +18,8 @@ from app.services.research_service import TavilyResearchService
 
 logger = get_logger(__name__)
 
-# Max concurrent Tavily searches to avoid rate limits
-MAX_CONCURRENT_SEARCHES = 3
+# Max concurrent Tavily searches — Tavily allows ~100 req/min
+MAX_CONCURRENT_SEARCHES = 15
 
 
 class ResearchAgent:
@@ -30,6 +32,8 @@ class ResearchAgent:
     ) -> Dict[str, List[ResearchResult]]:
         """
         Research each outdated claim via Tavily using parallel async calls.
+        Deduplicates identical search queries so each unique query is only
+        executed once, then shares results across all claims with that query.
         Returns a dict mapping claim_id -> list of ResearchResult.
         """
         if not self.tavily.is_configured:
@@ -41,34 +45,60 @@ class ResearchAgent:
             logger.info("No outdated claims to research")
             return {}
 
-        logger.info("Researching %d outdated claims (max %d concurrent)", len(outdated), MAX_CONCURRENT_SEARCHES)
+        # ── Step 1: Build queries and deduplicate ─────────────────────
+        # Map each claim to its query, then group claims by query
+        query_to_claims: Dict[str, List[FactualClaim]] = {}
+        claim_queries: Dict[str, str] = {}
 
-        # Run searches in parallel with semaphore-based concurrency limit
-        tasks = [self._research_single(claim, idx, len(outdated)) for idx, claim in enumerate(outdated)]
-        task_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for claim in outdated:
+            query = self._build_query(claim)
+            claim_queries[claim.claim_id] = query
+            if query not in query_to_claims:
+                query_to_claims[query] = []
+            query_to_claims[query].append(claim)
 
-        results: Dict[str, List[ResearchResult]] = {}
-        for claim, result in zip(outdated, task_results):
-            if isinstance(result, Exception):
-                logger.error("Research failed for claim %s: %s", claim.claim_id, result)
-                continue
-            if result:
-                results[claim.claim_id] = result
+        unique_queries = list(query_to_claims.keys())
+        dedup_savings = len(outdated) - len(unique_queries)
 
         logger.info(
-            "Research complete: %d/%d claims have results",
-            len(results), len(outdated),
+            "Researching %d outdated claims → %d unique queries (%d deduplicated), max %d concurrent",
+            len(outdated), len(unique_queries), dedup_savings, MAX_CONCURRENT_SEARCHES,
+        )
+
+        # ── Step 2: Execute unique queries in parallel ────────────────
+        tasks = [
+            self._research_query(query, idx, len(unique_queries))
+            for idx, query in enumerate(unique_queries)
+        ]
+        task_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # ── Step 3: Map results back to claim IDs ─────────────────────
+        query_results: Dict[str, List[ResearchResult]] = {}
+        for query, result in zip(unique_queries, task_results):
+            if isinstance(result, Exception):
+                logger.error("Research failed for query '%s': %s", query[:60], result)
+                continue
+            if result:
+                query_results[query] = result
+
+        results: Dict[str, List[ResearchResult]] = {}
+        for claim in outdated:
+            query = claim_queries[claim.claim_id]
+            if query in query_results:
+                results[claim.claim_id] = query_results[query]
+
+        logger.info(
+            "Research complete: %d/%d claims have results (%d unique queries executed)",
+            len(results), len(outdated), len(unique_queries),
         )
         return results
 
-    async def _research_single(
-        self, claim: FactualClaim, idx: int, total: int
+    async def _research_query(
+        self, query: str, idx: int, total: int
     ) -> List[ResearchResult]:
-        """Research a single claim with semaphore-based concurrency control."""
+        """Execute a single search query with semaphore-based concurrency control."""
         async with self._semaphore:
-            logger.info("Researching claim %d/%d [%s]: %s", idx + 1, total, claim.claim_type, claim.text[:80])
-            query = self._build_query(claim)
-            logger.info("  Search query: %s", query)
+            logger.info("Searching query %d/%d: %s", idx + 1, total, query[:100])
             search_results = await self.tavily.search_authoritative(query)
 
             if search_results:
@@ -81,6 +111,7 @@ class ResearchAgent:
             else:
                 logger.info("  -> no results found")
 
+            await asyncio.sleep(0)  # Yield to event loop
             return search_results
 
     @staticmethod

@@ -1,10 +1,17 @@
 # main.py
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from app.core.config import settings
-from app.database.connection import connect_to_mongo, close_mongo_connection
-from app.api import auth, upload, processing, analysis
+from app.core.rate_limit import limiter
+from app.core.websocket import ws_manager
+from app.database.connection import connect_to_mongo, close_mongo_connection, get_database
+from app.database.repositories.document_repo import DocumentRepository
+from app.api import auth, upload, processing, analysis, admin, export
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -18,6 +25,17 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+# ── Rate Limiting ─────────────────────────────────────────────────────────────
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": f"Rate limit exceeded: {exc.detail}"},
+    )
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
@@ -44,6 +62,8 @@ app.include_router(auth.router, prefix=settings.API_V1_PREFIX)
 app.include_router(upload.router, prefix=settings.API_V1_PREFIX)
 app.include_router(processing.router, prefix=settings.API_V1_PREFIX)
 app.include_router(analysis.router, prefix=settings.API_V1_PREFIX)
+app.include_router(admin.router, prefix=settings.API_V1_PREFIX)
+app.include_router(export.router, prefix=settings.API_V1_PREFIX)
 
 # ── Utility endpoints ─────────────────────────────────────────────────────────
 @app.get("/health", tags=["Health"])
@@ -59,6 +79,43 @@ async def root():
         "redoc": "/redoc",
         "version": "1.0.0",
     }
+
+
+# ── WebSocket for real-time processing status ────────────────────────────────
+@app.websocket("/ws/documents/{document_id}/status")
+async def websocket_document_status(websocket: WebSocket, document_id: str):
+    """
+    WebSocket endpoint for real-time processing status updates.
+    Clients connect here instead of polling GET /documents/{id}/status.
+    """
+    await ws_manager.connect(document_id, websocket)
+    try:
+        # Send current status immediately on connect
+        db = get_database()
+        repo = DocumentRepository(db)
+        doc = await repo.find_by_id(document_id)
+        if doc:
+            history = []
+            for h in doc.get("processing_history", []):
+                entry = dict(h)
+                if hasattr(entry.get("timestamp"), "isoformat"):
+                    entry["timestamp"] = entry["timestamp"].isoformat()
+                history.append(entry)
+            await websocket.send_json({
+                "type": "status",
+                "document_id": document_id,
+                "status": doc.get("status", ""),
+                "progress": doc.get("progress", 0),
+                "current_stage": doc.get("current_stage", ""),
+                "processing_history": history,
+            })
+        # Keep connection alive, wait for client disconnect
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_manager.disconnect(document_id, websocket)
+    except Exception:
+        ws_manager.disconnect(document_id, websocket)
 
 
 # ── Custom OpenAPI schema (adds Bearer security scheme) ───────────────────────
