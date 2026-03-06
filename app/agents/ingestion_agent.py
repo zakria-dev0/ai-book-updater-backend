@@ -26,7 +26,45 @@ logger = get_logger(__name__)
 
 # Retry settings
 MAX_RETRIES = 5
-RETRY_BASE_DELAY = 3  # seconds
+RETRY_BASE_DELAY = 1  # seconds (shorter since we throttle proactively)
+
+# Token-rate-aware throttling for OpenAI TPM limits
+# With 30K TPM, we budget tokens across a sliding window
+import time as _time
+
+TPM_LIMIT = 30000
+_token_log: list[tuple[float, int]] = []  # (timestamp, tokens_used)
+_throttle_lock: asyncio.Lock | None = None
+
+
+def _get_throttle_lock() -> asyncio.Lock:
+    global _throttle_lock
+    if _throttle_lock is None:
+        _throttle_lock = asyncio.Lock()
+    return _throttle_lock
+
+
+async def _throttle_for_tpm(estimated_tokens: int):
+    """Wait if necessary to stay under the TPM rate limit."""
+    lock = _get_throttle_lock()
+    async with lock:
+        now = _time.monotonic()
+        # Purge entries older than 60 seconds
+        cutoff = now - 60.0
+        while _token_log and _token_log[0][0] < cutoff:
+            _token_log.pop(0)
+        # Sum tokens used in the last 60 seconds
+        used = sum(t for _, t in _token_log)
+        if used + estimated_tokens > TPM_LIMIT * 0.85:  # 85% safety margin
+            # Wait until enough budget frees up
+            if _token_log:
+                oldest_time = _token_log[0][0]
+                wait = 60.0 - (now - oldest_time) + 0.5
+                if wait > 0:
+                    logger.info("TPM throttle: used %d/%d, waiting %.1fs", used, TPM_LIMIT, wait)
+                    await asyncio.sleep(wait)
+        # Record this request
+        _token_log.append((_time.monotonic(), estimated_tokens))
 
 SYSTEM_PROMPT = """\
 You are an expert fact-checker for academic and technical books.
@@ -187,15 +225,19 @@ Return ONLY a JSON object with these fields. No extra text, no markdown fences.
 Example: {{"grade_level": "college_senior", "technical_depth": "advanced", "tone": "formal_academic", "sentence_complexity": "complex", "terminology_level": "highly_technical", "avg_sentence_length": 28, "passive_voice_usage": "moderate"}}
 """
 
-CHUNK_SIZE = 8  # paragraphs per GPT call
+CHUNK_SIZE = 16  # paragraphs per GPT call
+MAX_CONCURRENT_CHUNKS = 4  # parallel GPT calls — limited by 30K TPM on OpenAI
 
 
 class ContentAnalysisAgent:
     def __init__(self):
         self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         self.model = settings.GPT_MODEL
+        # Use gpt-4o-mini for bulk claim extraction (faster, higher TPM limits)
+        self.analysis_model = "gpt-4o-mini"
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        self._chunk_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHUNKS)
 
     # ------------------------------------------------------------------ #
     # Writing Style Analysis                                               #
@@ -280,18 +322,37 @@ class ContentAnalysisAgent:
 
         all_claims: List[FactualClaim] = []
 
-        # Process paragraphs in chunks
-        for chunk_start in range(0, len(paragraphs), CHUNK_SIZE):
-            chunk = paragraphs[chunk_start : chunk_start + CHUNK_SIZE]
-            chunk_claims = await self._analyze_chunk(chunk, chunk_start)
-            all_claims.extend(chunk_claims)
-            logger.info(
-                "Document %s — chunk %d–%d: found %d claims",
-                document_id,
-                chunk_start,
-                chunk_start + len(chunk) - 1,
-                len(chunk_claims),
-            )
+        # Process paragraphs in chunks — parallel with semaphore
+        chunk_ranges = list(range(0, len(paragraphs), CHUNK_SIZE))
+        total_chunks = len(chunk_ranges)
+        logger.info(
+            "Document %s: %d paragraphs → %d chunks (max %d concurrent)",
+            document_id, len(paragraphs), total_chunks, MAX_CONCURRENT_CHUNKS,
+        )
+
+        async def _process_chunk(chunk_start: int, chunk_idx: int) -> List[FactualClaim]:
+            async with self._chunk_semaphore:
+                chunk = paragraphs[chunk_start : chunk_start + CHUNK_SIZE]
+                chunk_claims = await self._analyze_chunk(chunk, chunk_start)
+                logger.info(
+                    "Document %s — chunk %d/%d (paras %d–%d): found %d claims",
+                    document_id, chunk_idx + 1, total_chunks,
+                    chunk_start, chunk_start + len(chunk) - 1,
+                    len(chunk_claims),
+                )
+                await asyncio.sleep(0)  # Yield to event loop
+                return chunk_claims
+
+        tasks = [
+            _process_chunk(cs, i) for i, cs in enumerate(chunk_ranges)
+        ]
+        chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in chunk_results:
+            if isinstance(result, Exception):
+                logger.error("Chunk analysis failed: %s", result)
+                continue
+            all_claims.extend(result)
 
         # Assign focus_area to each claim based on claim_type
         for claim in all_claims:
@@ -425,7 +486,7 @@ class ContentAnalysisAgent:
             logger.info("First chunk content being sent to GPT:\n%s", numbered[:1000])
 
         try:
-            response = await self._call_with_retry(system, numbered)
+            response = await self._call_with_retry(system, numbered, model=self.analysis_model)
             if response is None:
                 return []
 
@@ -481,12 +542,18 @@ class ContentAnalysisAgent:
             logger.error("Content analysis chunk failed: %s", e)
             return []
 
-    async def _call_with_retry(self, system: str, user_content: str):
-        """Call OpenAI with exponential backoff retry on transient errors."""
+    async def _call_with_retry(self, system: str, user_content: str, model: str = None):
+        """Call OpenAI with TPM-aware throttling and retry on transient errors."""
+        import re
+        use_model = model or self.model
+        # Estimate tokens (~4 chars per token) for throttling
+        estimated_tokens = (len(system) + len(user_content)) // 4
+        await _throttle_for_tpm(estimated_tokens)
+
         for attempt in range(MAX_RETRIES):
             try:
                 return await self.client.chat.completions.create(
-                    model=self.model,
+                    model=use_model,
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": user_content},
@@ -495,7 +562,24 @@ class ContentAnalysisAgent:
                     response_format={"type": "json_object"},
                     timeout=120.0,
                 )
-            except (RateLimitError, APITimeoutError, APIConnectionError, APIError) as e:
+            except RateLimitError as e:
+                # Parse "Please try again in Xs" from the error message
+                msg = str(e)
+                match = re.search(r'try again in (\d+(?:\.\d+)?)\s*s', msg)
+                if match:
+                    delay = float(match.group(1)) + 0.5
+                else:
+                    delay = min(RETRY_BASE_DELAY * (2 ** attempt), 15)
+                logger.warning(
+                    "OpenAI RateLimitError (attempt %d/%d), waiting %.1fs",
+                    attempt + 1, MAX_RETRIES, delay,
+                )
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error("OpenAI call failed after %d retries (rate limit)", MAX_RETRIES)
+                    return None
+            except (APITimeoutError, APIConnectionError, APIError) as e:
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
                 error_type = type(e).__name__
                 status_code = getattr(e, "status_code", "N/A")

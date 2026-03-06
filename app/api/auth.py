@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from datetime import timedelta
 from app.models.user import UserCreate, UserLogin, Token, User
 from app.core.security import (
@@ -9,6 +9,7 @@ from app.core.security import (
 from app.core.config import settings
 from app.database.connection import get_database
 from app.core.logger import get_logger
+from app.core.rate_limit import limiter
 
 logger = get_logger(__name__)
 
@@ -24,7 +25,9 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
         400: {"description": "Email already registered"},
     },
 )
+@limiter.limit("5/minute")
 async def register(
+    request: Request,
     user_data: UserCreate,
     db=Depends(get_database),
 ):
@@ -59,7 +62,9 @@ async def register(
         401: {"description": "Invalid credentials"},
     },
 )
+@limiter.limit("10/minute")
 async def login(
+    request: Request,
     user_credentials: UserLogin,
     db=Depends(get_database),
 ):
@@ -89,6 +94,35 @@ async def login(
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
+    }
+
+
+@router.get(
+    "/me",
+    response_model=dict,
+    summary="Get current authenticated user info",
+    responses={
+        200: {"description": "Current user info"},
+        401: {"description": "Not authenticated"},
+    },
+)
+async def get_me(
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """
+    Return the profile of the currently authenticated user.
+    """
+    user = await db.users.find_one({"email": current_user["email"]})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+    return {
+        "email": user["email"],
+        "role": user.get("role", "user"),
+        "created_at": user.get("created_at", "").isoformat() if user.get("created_at") else None,
     }
 
 

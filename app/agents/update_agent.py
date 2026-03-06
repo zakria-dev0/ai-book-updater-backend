@@ -27,9 +27,9 @@ from app.models.change import (
 
 logger = get_logger(__name__)
 
-MAX_RETRIES = 5
-RETRY_BASE_DELAY = 3
-MAX_CONCURRENT_PROPOSALS = 3  # Limit concurrent GPT calls
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 1
+MAX_CONCURRENT_PROPOSALS = 3  # Limit concurrent GPT calls — constrained by 30K TPM
 
 # ------------------------------------------------------------------ #
 # Reference: Document style profile metadata                          #
@@ -565,9 +565,11 @@ class UpdateAgent:
                     idx + 1, len(claims_with_research), claim.text[:80],
                 )
                 sources = research[claim.claim_id]
-                return await self._generate_for_claim(
+                result = await self._generate_for_claim(
                     claim, sources, document_id, paragraphs or [],
                 )
+                await asyncio.sleep(0)  # Yield to event loop
+                return result
 
         tasks = [_generate_one(i, c) for i, c in enumerate(claims_with_research)]
         task_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -790,7 +792,12 @@ class UpdateAgent:
         return "\n".join(context_parts)
 
     async def _call_with_retry(self, system: str, user_content: str):
-        """Call OpenAI with exponential backoff retry on transient errors (500, rate limit, timeout, connection)."""
+        """Call OpenAI with TPM-aware throttling and retry on transient errors."""
+        import re
+        from app.agents.ingestion_agent import _throttle_for_tpm
+        estimated_tokens = (len(system) + len(user_content)) // 4
+        await _throttle_for_tpm(estimated_tokens)
+
         for attempt in range(MAX_RETRIES):
             try:
                 return await self.client.chat.completions.create(
@@ -803,7 +810,23 @@ class UpdateAgent:
                     response_format={"type": "json_object"},
                     timeout=120.0,
                 )
-            except (RateLimitError, APITimeoutError, APIConnectionError, APIError) as e:
+            except RateLimitError as e:
+                msg = str(e)
+                match = re.search(r'try again in (\d+(?:\.\d+)?)\s*s', msg)
+                if match:
+                    delay = float(match.group(1)) + 0.5
+                else:
+                    delay = min(RETRY_BASE_DELAY * (2 ** attempt), 15)
+                logger.warning(
+                    "OpenAI RateLimitError (attempt %d/%d), waiting %.1fs",
+                    attempt + 1, MAX_RETRIES, delay,
+                )
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error("OpenAI call failed after %d retries (rate limit)", MAX_RETRIES)
+                    return None
+            except (APITimeoutError, APIConnectionError, APIError) as e:
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
                 error_type = type(e).__name__
                 status_code = getattr(e, "status_code", "N/A")

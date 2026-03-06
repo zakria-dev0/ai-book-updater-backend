@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, BackgroundTasks, Request
 from typing import List, Optional
 from pydantic import BaseModel, Field
 from datetime import datetime
@@ -10,6 +10,7 @@ from app.models.document import DocumentStatus
 from app.models.change import ChangeStatus, ApprovalAction, FocusArea
 from app.agents.orchestrator import run_analysis
 from app.core.logger import get_logger
+from app.core.rate_limit import limiter
 
 logger = get_logger(__name__)
 
@@ -43,6 +44,18 @@ class ReviewRequest(BaseModel):
     )
 
 
+class BatchReviewRequest(BaseModel):
+    action: str = Field(
+        ...,
+        description="Action to apply to all specified changes: 'approve_as_is' or 'reject'",
+    )
+    change_ids: Optional[List[str]] = Field(
+        default=None,
+        description="Specific change IDs. If omitted, applies to ALL pending changes.",
+    )
+    note: str = Field(default="", description="Optional reviewer note")
+
+
 # ------------------------------------------------------------------ #
 # Helpers                                                              #
 # ------------------------------------------------------------------ #
@@ -51,8 +64,9 @@ async def _get_owned_document(
     document_id: str,
     current_user: dict,
     repo: DocumentRepository,
+    lightweight: bool = True,
 ) -> dict:
-    document = await repo.find_by_id(document_id)
+    document = await repo.find_by_id(document_id, lightweight=lightweight)
     if not document:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
     if document["user_id"] != current_user["email"]:
@@ -76,47 +90,60 @@ def _validate_focus_areas(focus_areas: List[str]) -> List[str]:
 # Trigger analysis                                                     #
 # ------------------------------------------------------------------ #
 
+async def _run_analysis_task(document_id: str, db, focus_areas: List[str]):
+    """Background task: run the full AI analysis pipeline."""
+    try:
+        await run_analysis(document_id, db, focus_areas=focus_areas)
+        logger.info("Background analysis completed for %s", document_id)
+    except Exception as e:
+        logger.error("Background analysis failed for %s: %s", document_id, e)
+        # run_analysis already sets ERROR status on failure, but guard just in case
+        try:
+            doc_repo = DocumentRepository(db)
+            await doc_repo.update_fields(document_id, {
+                "status": DocumentStatus.ERROR,
+                "error_message": f"Analysis failed: {str(e)}",
+            })
+        except Exception:
+            pass
+
+
 @router.post(
     "/{document_id}/analyze",
     summary="Trigger AI analysis pipeline",
     responses={
-        200: {"description": "Analysis completed"},
+        200: {"description": "Analysis started"},
         400: {"description": "Document not processed yet or already analyzing"},
         403: {"description": "Not authorized"},
         404: {"description": "Document not found"},
-        500: {"description": "Analysis failed"},
     },
 )
+@limiter.limit("3/minute")
 async def analyze_document(
+    request: Request,
     document_id: str,
+    background_tasks: BackgroundTasks,
     body: AnalyzeRequest = Body(default=AnalyzeRequest()),
     current_user: dict = Depends(get_current_user_dep),
     db=Depends(get_database),
 ):
     """
-    Run the full AI analysis pipeline on a processed document:
-    1. Writing Style Analysis — determine document grade level, tone, complexity
-    2. Content Analysis — identify factual claims via GPT-4o (filtered by focus_areas)
-    3. Research — search for updated info via Tavily
-    4. Proposals — generate style-matched change suggestions
-    5. Validation — quality checks on proposals
+    Start the AI analysis pipeline in the background.
+
+    Returns immediately. Poll `GET /documents/{id}/analysis/status` for progress.
 
     **focus_areas** (optional): Filter analysis to specific categories.
     Options: missions, constellations, technology, statistics, companies,
     business_philosophy, historical_facts, all (default).
-
-    Example: {"focus_areas": ["missions", "constellations"]}
     """
     doc_repo = DocumentRepository(db)
-    document = await _get_owned_document(document_id, current_user, doc_repo)
+    # Need full doc to check text_content exists
+    document = await _get_owned_document(document_id, current_user, doc_repo, lightweight=False)
 
-    if document["status"] == DocumentStatus.ANALYZING:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Document is already being analyzed",
-        )
-
-    if document["status"] not in (DocumentStatus.COMPLETED, DocumentStatus.ERROR):
+    if document["status"] not in (
+        DocumentStatus.COMPLETED, DocumentStatus.ERROR,
+        DocumentStatus.EXPORT_READY, DocumentStatus.ANALYZING,
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Document must be processed before analysis. Current status: " + document["status"],
@@ -128,29 +155,76 @@ async def analyze_document(
             detail="Document has no text content — process it first",
         )
 
-    # Validate focus areas
     focus_areas = _validate_focus_areas(body.focus_areas)
 
-    try:
-        changelog = await run_analysis(document_id, db, focus_areas=focus_areas)
+    # Set status to 'analyzing' and reset progress BEFORE scheduling background task
+    # This ensures the first poll sees the correct state
+    await doc_repo.update_fields(document_id, {
+        "status": DocumentStatus.ANALYZING,
+        "progress": 0,
+        "current_stage": "Starting analysis...",
+    })
+
+    background_tasks.add_task(_run_analysis_task, document_id, db, focus_areas)
+
+    return {
+        "document_id": document_id,
+        "status": "analyzing",
+        "message": "Analysis started. Poll GET /documents/{id}/analysis/status for progress.",
+        "focus_areas": focus_areas,
+    }
+
+
+# ------------------------------------------------------------------ #
+# Cancel analysis                                                      #
+# ------------------------------------------------------------------ #
+
+@router.post(
+    "/{document_id}/analyze/cancel",
+    summary="Cancel a running or stuck analysis",
+    responses={
+        200: {"description": "Analysis cancelled or already not analyzing"},
+        403: {"description": "Not authorized"},
+        404: {"description": "Document not found"},
+    },
+)
+async def cancel_analysis(
+    document_id: str,
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """
+    Cancel a running or stuck analysis and reset the document status
+    back to 'completed' so the user can access previous results or re-run.
+    """
+    doc_repo = DocumentRepository(db)
+    document = await _get_owned_document(document_id, current_user, doc_repo)
+
+    current_status = document["status"]
+
+    # If already not analyzing, return success with current status (no-op)
+    if current_status != DocumentStatus.ANALYZING:
+        logger.info(
+            "Cancel requested for document %s but status is already '%s'",
+            document_id, current_status,
+        )
         return {
             "document_id": document_id,
-            "status": "completed",
-            "message": "AI analysis completed successfully",
-            "focus_areas": focus_areas,
-            "style_profile": changelog.style_profile,
-            "summary": {
-                "total_claims": changelog.total_claims,
-                "total_outdated": changelog.total_outdated,
-                "total_changes": changelog.total_changes,
-            },
+            "status": current_status,
+            "message": f"Document is not analyzing (current status: {current_status}). No action needed.",
         }
-    except Exception as e:
-        logger.error("Analysis failed for %s: %s", document_id, e)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Analysis failed: {str(e)}",
-        )
+
+    await doc_repo.update_fields(document_id, {
+        "status": DocumentStatus.COMPLETED,
+    })
+
+    logger.info("Analysis cancelled for document %s by user %s", document_id, current_user["email"])
+
+    return {
+        "document_id": document_id,
+        "status": "completed",
+        "message": "Analysis cancelled. Document status reset to completed.",
+    }
 
 
 # ------------------------------------------------------------------ #
@@ -173,14 +247,16 @@ async def get_analysis_status(
 ):
     """Check whether a document is being analyzed and get summary stats."""
     doc_repo = DocumentRepository(db)
-    document = await _get_owned_document(document_id, current_user, doc_repo)
+    document = await _get_owned_document(document_id, current_user, doc_repo)  # lightweight by default
 
     change_repo = ChangeRepository(db)
-    changelog = await change_repo.find_changelog_by_document(document_id)
+    changelog = await change_repo.find_changelog_by_document(document_id, summary_only=True)
 
     return {
         "document_id": document_id,
         "status": document["status"],
+        "progress": document.get("progress", 0),
+        "current_stage": document.get("current_stage", ""),
         "is_analyzed": changelog is not None,
         "style_profile": document.get("style_profile"),
         "analysis_summary": {
@@ -300,6 +376,73 @@ async def list_changes(
         "page": page,
         "page_size": page_size,
         "total_pages": (total + page_size - 1) // page_size if total else 0,
+    }
+
+
+# ------------------------------------------------------------------ #
+# Batch review — approve all / reject all                              #
+# NOTE: This must be defined BEFORE the {change_id} wildcard routes    #
+# so that "batch" is not captured as a change_id.                      #
+# ------------------------------------------------------------------ #
+
+@router.put(
+    "/{document_id}/changes/batch",
+    summary="Batch approve or reject changes",
+    responses={
+        200: {"description": "Batch update completed"},
+        400: {"description": "Invalid action"},
+        403: {"description": "Not authorized"},
+        404: {"description": "Document not found"},
+    },
+)
+async def batch_review_changes(
+    document_id: str,
+    body: BatchReviewRequest = Body(...),
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """
+    Bulk approve or reject multiple (or all pending) change proposals.
+
+    - **action**: 'approve_as_is' or 'reject'
+    - **change_ids**: Optional list of IDs. If omitted, targets all pending changes.
+    """
+    doc_repo = DocumentRepository(db)
+    await _get_owned_document(document_id, current_user, doc_repo)
+
+    if body.action not in (ApprovalAction.APPROVE_AS_IS, ApprovalAction.REJECT):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Batch action must be 'approve_as_is' or 'reject'",
+        )
+
+    change_repo = ChangeRepository(db)
+
+    if body.change_ids:
+        target_ids = body.change_ids
+    else:
+        # Get all pending changes for this document
+        pending = await change_repo.find_by_status(document_id, ChangeStatus.PENDING, skip=0, limit=5000)
+        target_ids = [c.get("change_id") or c["id"] for c in pending if c.get("change_id") or c.get("id")]
+
+    if not target_ids:
+        return {"document_id": document_id, "updated": 0, "message": "No changes to update"}
+
+    new_status = ChangeStatus.REJECTED if body.action == ApprovalAction.REJECT else ChangeStatus.APPROVED
+    updated = await change_repo.batch_update_status(
+        document_id=document_id,
+        change_ids=target_ids,
+        status=new_status.value,
+        reviewer_note=body.note,
+        approval_action=body.action,
+    )
+
+    logger.info("Batch %s %d changes for document %s", body.action, updated, document_id)
+    return {
+        "document_id": document_id,
+        "action": body.action,
+        "updated": updated,
+        "message": f"Batch reviewed: {updated} changes {body.action}",
     }
 
 

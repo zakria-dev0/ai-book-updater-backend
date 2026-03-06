@@ -30,6 +30,7 @@ from app.agents.update_agent import UpdateAgent
 from app.database.repositories.change_repo import ChangeRepository
 from app.database.repositories.document_repo import DocumentRepository
 from app.models.document import DocumentStatus
+from app.core.config import settings
 
 logger = get_logger(__name__)
 
@@ -81,6 +82,8 @@ async def _update_analysis_progress(state: AnalysisState, stage: str, progress: 
             "progress": progress,
         })
         await doc_repo.push_history_entry(state["document_id"], entry)
+        # Yield to event loop so other HTTP requests (list docs, status polls) aren't starved
+        await asyncio.sleep(0)
     except Exception as e:
         logger.warning("Failed to update analysis progress: %s", e)
 
@@ -134,29 +137,35 @@ async def style_analyze_node(state: AnalysisState) -> dict:
 async def analyze_node(state: AnalysisState) -> dict:
     """Stage 1: Analyze document text for factual claims (with focus area filtering)."""
     focus_areas = state.get("focus_areas", ["all"])
+    paragraphs = state["paragraphs"]
+    total_paras = len(paragraphs)
     logger.info(
-        "Orchestrator [analyze]: starting for document %s (focus: %s)",
-        state["document_id"], focus_areas,
+        "Orchestrator [analyze]: starting for document %s (%d paragraphs, focus: %s)",
+        state["document_id"], total_paras, focus_areas,
     )
     await _update_analysis_progress(
-        state, "Analyzing content", 10,
-        f"Scanning text for factual claims via GPT-4o (focus: {', '.join(focus_areas)})",
+        state, "Scanning for factual claims", 10,
+        f"Analyzing {total_paras} paragraphs for factual claims (focus: {', '.join(focus_areas)})",
     )
     try:
         claims = await content_agent.analyze_document(
             document_id=state["document_id"],
             text_content=state["text_content"],
-            paragraphs=state["paragraphs"],
+            paragraphs=paragraphs,
             focus_areas=focus_areas,
         )
         outdated_count = sum(1 for c in claims if c.is_outdated)
         await _update_analysis_progress(
-            state, "Analysis complete", 30,
-            f"Found {len(claims)} claims, {outdated_count} flagged outdated",
+            state, "Verifying claims", 28,
+            f"Found {len(claims)} claims, {outdated_count} flagged outdated — verifying...",
+        )
+        await _update_analysis_progress(
+            state, "Content analysis complete", 30,
+            f"Found {len(claims)} claims, {outdated_count} confirmed outdated",
         )
         return {
             "claims": claims,
-            "stage": "Analysis complete",
+            "stage": "Content analysis complete",
             "progress": 30,
         }
     except Exception as e:
@@ -169,19 +178,19 @@ async def research_node(state: AnalysisState) -> dict:
     outdated_count = sum(1 for c in state["claims"] if c.is_outdated)
     logger.info("Orchestrator [research]: researching %d claims", outdated_count)
     await _update_analysis_progress(
-        state, "Researching claims", 35,
-        f"Searching for updated information on {outdated_count} outdated claims",
+        state, "Researching outdated claims", 35,
+        f"Web searching for updated information on {outdated_count} claims",
     )
     try:
         research = await research_agent.research_claims(state["claims"])
         await _update_analysis_progress(
-            state, "Research complete", 55,
-            f"Found research results for {len(research)} claims",
+            state, "Research complete", 50,
+            f"Found authoritative sources for {len(research)} claims",
         )
         return {
             "research": research,
             "stage": "Research complete",
-            "progress": 55,
+            "progress": 50,
         }
     except Exception as e:
         logger.error("Research node failed: %s", e)
@@ -190,10 +199,11 @@ async def research_node(state: AnalysisState) -> dict:
 
 async def propose_node(state: AnalysisState) -> dict:
     """Stage 3: Generate style-matched change proposals from research."""
-    logger.info("Orchestrator [propose]: generating proposals")
+    num_researched = len(state['research'])
+    logger.info("Orchestrator [propose]: generating proposals for %d claims", num_researched)
     await _update_analysis_progress(
-        state, "Generating proposals", 60,
-        f"Generating style-matched change proposals for {len(state['research'])} researched claims",
+        state, "Generating update proposals", 55,
+        f"Writing style-matched replacement text for {num_researched} outdated claims",
     )
     try:
         proposals = await update_agent.generate_proposals(
@@ -203,13 +213,13 @@ async def propose_node(state: AnalysisState) -> dict:
             paragraphs=state.get("paragraphs", []),
         )
         await _update_analysis_progress(
-            state, "Proposals generated", 75,
+            state, "Proposals generated", 80,
             f"Generated {len(proposals)} change proposals",
         )
         return {
             "proposals": proposals,
             "stage": "Proposals generated",
-            "progress": 75,
+            "progress": 80,
         }
     except Exception as e:
         logger.error("Propose node failed: %s", e)
@@ -267,8 +277,8 @@ async def validate_node(state: AnalysisState) -> dict:
     and verify source-claim relevance."""
     logger.info("Orchestrator [validate]: validating %d proposals", len(state["proposals"]))
     await _update_analysis_progress(
-        state, "Validating proposals", 80,
-        f"Quality-checking {len(state['proposals'])} proposals",
+        state, "Validating proposals", 85,
+        f"Quality-checking {len(state['proposals'])} proposals against sources",
     )
     validated = []
 
@@ -410,8 +420,8 @@ async def run_analysis(
     doc_repo = DocumentRepository(db)
     change_repo = ChangeRepository(db)
 
-    # Load document text
-    document = await doc_repo.find_by_id(document_id)
+    # Load only the fields the pipeline needs (skip heavy figures/equations/tables)
+    document = await doc_repo.find_by_id(document_id, analysis_mode=True)
     if not document:
         raise ValueError(f"Document {document_id} not found")
 
@@ -428,8 +438,18 @@ async def run_analysis(
     if not focus_areas:
         focus_areas = ["all"]
 
-    # Update document status
-    await doc_repo.update_fields(document_id, {"status": DocumentStatus.ANALYZING})
+    # Update document status and set initial progress immediately
+    await doc_repo.update_fields(document_id, {
+        "status": DocumentStatus.ANALYZING,
+        "current_stage": "Initializing analysis pipeline",
+        "progress": 2,
+    })
+
+    # Snapshot token counts before pipeline (agents are singletons, counters accumulate)
+    _pre_analysis_prompt = content_agent.total_prompt_tokens
+    _pre_analysis_completion = content_agent.total_completion_tokens
+    _pre_update_prompt = update_agent.total_prompt_tokens
+    _pre_update_completion = update_agent.total_completion_tokens
 
     # Build and run the LangGraph pipeline
     workflow = build_graph()
@@ -456,6 +476,22 @@ async def run_analysis(
         claims = result.get("claims", [])
         proposals = result.get("validated_proposals", []) or result.get("proposals", [])
         style_profile = result.get("style_profile")
+
+        # ── Deduplicate proposals: keep only one per claim (highest confidence) ──
+        # This ensures total_changes <= total_outdated
+        if proposals:
+            best_per_claim: dict[str, ChangeProposal] = {}
+            confidence_rank = {ConfidenceLevel.HIGH: 3, ConfidenceLevel.MEDIUM: 2, ConfidenceLevel.LOW: 1}
+            for p in proposals:
+                existing = best_per_claim.get(p.claim_id)
+                if existing is None or confidence_rank.get(p.confidence, 0) > confidence_rank.get(existing.confidence, 0):
+                    best_per_claim[p.claim_id] = p
+            if len(best_per_claim) < len(proposals):
+                logger.info(
+                    "Deduplicated proposals: %d → %d (one per claim)",
+                    len(proposals), len(best_per_claim),
+                )
+            proposals = list(best_per_claim.values())
 
         # ── Diagnostic logging ────────────────────────────────────────
         outdated_count = sum(1 for c in claims if c.is_outdated)
@@ -496,16 +532,41 @@ async def run_analysis(
         claims_dicts = [c.model_dump() for c in claims]
         proposals_dicts = [p.model_dump() for p in proposals]
 
+        # ── Capture token usage ─────────────────────────────────────────
+        analysis_prompt = content_agent.total_prompt_tokens - _pre_analysis_prompt
+        analysis_completion = content_agent.total_completion_tokens - _pre_analysis_completion
+        update_prompt = update_agent.total_prompt_tokens - _pre_update_prompt
+        update_completion = update_agent.total_completion_tokens - _pre_update_completion
+
+        token_usage = {
+            "analysis_prompt_tokens": analysis_prompt,
+            "analysis_completion_tokens": analysis_completion,
+            "update_prompt_tokens": update_prompt,
+            "update_completion_tokens": update_completion,
+            "total_prompt_tokens": analysis_prompt + update_prompt,
+            "total_completion_tokens": analysis_completion + update_completion,
+            "model": settings.GPT_MODEL,
+        }
+        logger.info(
+            "Token usage for %s: prompt=%d, completion=%d",
+            document_id,
+            token_usage["total_prompt_tokens"],
+            token_usage["total_completion_tokens"],
+        )
+
         changelog_data = {
             "log_id": f"log_{uuid.uuid4().hex[:12]}",
             "document_id": document_id,
             "total_claims": len(claims),
-            "total_outdated": outdated_count,
+            # Show outdated count = proposals count so the numbers are consistent
+            # (outdated claims without research/proposals aren't actionable)
+            "total_outdated": len(proposals),
             "total_changes": len(proposals),
             "claims": claims_dicts,
             "changes": proposals_dicts,
             "focus_areas": focus_areas,
             "style_profile": style_profile,
+            "token_usage": token_usage,
             "created_at": datetime.utcnow(),
         }
 
@@ -535,7 +596,7 @@ async def run_analysis(
             log_id=changelog_data["log_id"],
             document_id=document_id,
             total_claims=len(claims),
-            total_outdated=outdated_count,
+            total_outdated=len(proposals),
             total_changes=len(proposals),
             claims=claims,
             changes=proposals,

@@ -39,11 +39,15 @@ class ChangeRepository:
         return ids
 
     async def find_by_id(self, change_id: str) -> Optional[dict]:
+        # Try by MongoDB _id first, then by the change_id field
         try:
             doc = await self.changes.find_one({"_id": ObjectId(change_id)})
-            return self._serialize(doc) if doc else None
+            if doc:
+                return self._serialize(doc)
         except Exception:
-            return None
+            pass
+        doc = await self.changes.find_one({"change_id": change_id})
+        return self._serialize(doc) if doc else None
 
     async def find_by_document(
         self, document_id: str, skip: int = 0, limit: int = 50
@@ -91,11 +95,61 @@ class ChangeRepository:
         if user_edited_content:
             update_fields["user_edited_content"] = user_edited_content
 
+        # Try by MongoDB _id first, then by the change_id field
+        try:
+            result = await self.changes.update_one(
+                {"_id": ObjectId(change_id)},
+                {"$set": update_fields},
+            )
+            if result.matched_count > 0:
+                return result.modified_count > 0
+        except Exception:
+            pass
         result = await self.changes.update_one(
-            {"_id": ObjectId(change_id)},
+            {"change_id": change_id},
             {"$set": update_fields},
         )
         return result.modified_count > 0
+
+    async def batch_update_status(
+        self, document_id: str, change_ids: List[str],
+        status: str, reviewer_note: str = "", approval_action: str = "",
+    ) -> int:
+        """Bulk-update status for multiple change proposals at once."""
+        oids = []
+        string_ids = []
+        for cid in change_ids:
+            try:
+                oids.append(ObjectId(cid))
+            except Exception:
+                string_ids.append(cid)
+
+        update_fields = {
+            "status": status,
+            "reviewed_at": datetime.utcnow(),
+            "reviewer_note": reviewer_note,
+        }
+        if approval_action:
+            update_fields["approval_action"] = approval_action
+
+        total_modified = 0
+        # Match by MongoDB _id
+        if oids:
+            result = await self.changes.update_many(
+                {"_id": {"$in": oids}, "document_id": document_id},
+                {"$set": update_fields},
+            )
+            total_modified += result.modified_count
+        # Match by change_id field
+        if string_ids:
+            result = await self.changes.update_many(
+                {"change_id": {"$in": string_ids}, "document_id": document_id},
+                {"$set": update_fields},
+            )
+            total_modified += result.modified_count
+
+        logger.info("Batch updated %d changes for document %s", total_modified, document_id)
+        return total_modified
 
     async def delete_by_document(self, document_id: str) -> int:
         result = await self.changes.delete_many({"document_id": document_id})
@@ -117,9 +171,24 @@ class ChangeRepository:
             logger.info("Deleted %d old changelogs for document %s", result.deleted_count, document_id)
         return result.deleted_count
 
-    async def find_changelog_by_document(self, document_id: str) -> Optional[dict]:
+    # Summary-only projection: excludes heavy claims/changes arrays
+    _CHANGELOG_SUMMARY_PROJECTION = {
+        "claims": 0,
+        "changes": 0,
+    }
+
+    async def find_changelog_by_document(
+        self, document_id: str, summary_only: bool = False,
+    ) -> Optional[dict]:
+        """Fetch the most recent changelog for a document.
+
+        When summary_only=True, excludes the claims and changes arrays
+        for fast status checks (only returns counts and metadata).
+        """
+        projection = self._CHANGELOG_SUMMARY_PROJECTION if summary_only else None
         doc = await self.changelogs.find_one(
             {"document_id": document_id},
+            projection=projection,
             sort=[("created_at", -1)],
         )
         if not doc:
@@ -128,7 +197,7 @@ class ChangeRepository:
         doc = self._serialize(doc)
 
         # If claims were stored separately (large changelog), load them back
-        if doc.get("claims_stored_separately"):
+        if not summary_only and doc.get("claims_stored_separately"):
             claims = await self.find_claims_by_document(doc.get("document_id", ""))
             doc["claims"] = claims
             logger.info(
