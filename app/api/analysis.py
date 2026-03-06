@@ -69,9 +69,19 @@ async def _get_owned_document(
     document = await repo.find_by_id(document_id, lightweight=lightweight)
     if not document:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-    if document["user_id"] != current_user["email"]:
+    # Admins can access any document; regular users can only access their own
+    if current_user.get("role") != "admin" and document["user_id"] != current_user["email"]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
     return document
+
+
+def _require_admin_role(current_user: dict):
+    """Raise 403 if the current user is not an admin."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required. Only admins can approve or reject changes.",
+        )
 
 
 def _validate_focus_areas(focus_areas: List[str]) -> List[str]:
@@ -403,10 +413,12 @@ async def batch_review_changes(
 ):
     """
     Bulk approve or reject multiple (or all pending) change proposals.
+    **Admin only** — regular users cannot approve or reject changes.
 
     - **action**: 'approve_as_is' or 'reject'
     - **change_ids**: Optional list of IDs. If omitted, targets all pending changes.
     """
+    _require_admin_role(current_user)
     doc_repo = DocumentRepository(db)
     await _get_owned_document(document_id, current_user, doc_repo)
 
@@ -503,9 +515,12 @@ async def review_change(
     - **approve_with_edit**: Accept with user modifications (provide edited_content)
     - **reject**: Reject this change proposal
 
+    **Admin only** — regular users cannot approve or reject changes.
+
     When applying changes later (Milestone 4), the system will use
     user_edited_content if it exists, otherwise new_content.
     """
+    _require_admin_role(current_user)
     doc_repo = DocumentRepository(db)
     await _get_owned_document(document_id, current_user, doc_repo)
 

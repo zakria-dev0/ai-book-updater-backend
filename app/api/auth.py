@@ -84,10 +84,10 @@ async def login(
         )
 
     access_token = create_access_token(
-        data={"sub": user["email"]},
+        data={"sub": user["email"], "role": user.get("role", "user")},
         expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
     )
-    refresh_token = create_refresh_token(data={"sub": user["email"]})
+    refresh_token = create_refresh_token(data={"sub": user["email"], "role": user.get("role", "user")})
 
     logger.info("User logged in: %s", user_credentials.email)
     return {
@@ -192,11 +192,12 @@ async def refresh_token(
         )
 
     email = payload.get("sub")
+    role = payload.get("role", "user")
     new_access_token = create_access_token(
-        data={"sub": email},
+        data={"sub": email, "role": role},
         expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
     )
-    new_refresh_token = create_refresh_token(data={"sub": email})
+    new_refresh_token = create_refresh_token(data={"sub": email, "role": role})
 
     logger.info("Token refreshed for: %s", email)
     return {

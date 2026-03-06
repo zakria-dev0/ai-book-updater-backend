@@ -424,3 +424,105 @@ async def get_api_metrics(
         "total_errors": total_errors,
         "documents_by_status": documents_by_status,
     }
+
+
+# ------------------------------------------------------------------ #
+# Admin: list ALL documents (all users)                               #
+# ------------------------------------------------------------------ #
+
+@router.get(
+    "/documents",
+    summary="List all documents from all users",
+    responses={
+        200: {"description": "Paginated document list"},
+        403: {"description": "Admin only"},
+    },
+)
+async def list_all_documents(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    status_filter: Optional[str] = Query(default=None, description="Filter by status"),
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """List all documents across all users. Admin only."""
+    await _require_admin(current_user, db)
+
+    query = {}
+    if status_filter:
+        query["status"] = status_filter
+
+    skip = (page - 1) * page_size
+    total = await db.documents.count_documents(query)
+    docs_cursor = db.documents.find(
+        query,
+        {
+            "text_content": 0,
+            "equations": 0,
+            "figures": 0,
+            "tables": 0,
+            "processing_history": 0,
+        },
+    ).sort("uploaded_at", -1).skip(skip).limit(page_size)
+    docs = await docs_cursor.to_list(page_size)
+
+    documents = []
+    for doc in docs:
+        documents.append({
+            "id": str(doc["_id"]),
+            "original_filename": doc.get("original_filename", "Unknown"),
+            "file_type": doc.get("file_type", ""),
+            "user_id": doc.get("user_id", ""),
+            "status": doc.get("status", "uploaded"),
+            "uploaded_at": doc["uploaded_at"].isoformat() if hasattr(doc.get("uploaded_at"), "isoformat") else doc.get("uploaded_at"),
+            "processing_completed_at": doc["processing_completed_at"].isoformat() if hasattr(doc.get("processing_completed_at"), "isoformat") else doc.get("processing_completed_at"),
+            "progress": doc.get("progress", 0),
+            "current_stage": doc.get("current_stage", ""),
+        })
+
+    return {
+        "documents": documents,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size if total else 0,
+    }
+
+
+# ------------------------------------------------------------------ #
+# Admin: get changes for any document                                  #
+# ------------------------------------------------------------------ #
+
+@router.get(
+    "/documents/{document_id}/changes",
+    summary="List changes for any document (admin)",
+    responses={
+        200: {"description": "Changes list"},
+        403: {"description": "Admin only"},
+        404: {"description": "Document not found"},
+    },
+)
+async def admin_list_changes(
+    document_id: str,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=100, ge=1, le=500),
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """List all change proposals for any document. Admin only."""
+    await _require_admin(current_user, db)
+
+    from app.database.repositories.change_repo import ChangeRepository
+    change_repo = ChangeRepository(db)
+    skip = (page - 1) * page_size
+    changes = await change_repo.find_by_document(document_id, skip, page_size)
+    total = await change_repo.count_by_document(document_id)
+
+    return {
+        "document_id": document_id,
+        "changes": changes,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size if total else 0,
+    }
