@@ -1,0 +1,698 @@
+{
+  "info": {
+    "name": "AI Book Updater Backend",
+    "description": "Complete API collection for the AI Book Update System backend.\n\n**How to use:**\n1. Set the `base_url` variable to your server (default: http://localhost:8000)\n2. Call POST /auth/register to create an account\n3. Call POST /auth/login — the collection auto-saves the token\n4. Upload a DOCX file via POST /upload\n5. Trigger processing via POST /documents/{id}/process\n6. Poll GET /documents/{id}/status until status = 'completed'\n7. Retrieve content via the /content/* endpoints",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url",    "value": "http://localhost:8000", "type": "string" },
+    { "key": "api_prefix",  "value": "/api/v1",               "type": "string" },
+    { "key": "access_token","value": "",                       "type": "string" },
+    { "key": "document_id", "value": "",                       "type": "string" },
+    { "key": "change_id",  "value": "",                       "type": "string" },
+    { "key": "equation_id","value": "",                       "type": "string" },
+    { "key": "refresh_token","value": "",                     "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{base_url}}/health", "host": ["{{base_url}}"], "path": ["health"] },
+            "description": "Verify the server is running."
+          }
+        },
+        {
+          "name": "Root",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{base_url}}/", "host": ["{{base_url}}"], "path": [""] },
+            "description": "Returns service info and links to API docs."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Authentication",
+      "item": [
+        {
+          "name": "Register",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Has message', () => pm.response.json().message);"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"user@example.com\",\n  \"password\": \"password123\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/auth/register",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["auth", "register"]
+            },
+            "description": "Create a new user account. Email must be unique."
+          }
+        },
+        {
+          "name": "Login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const json = pm.response.json();",
+                  "pm.test('Has access token', () => json.access_token);",
+                  "if (json.access_token) {",
+                  "  pm.collectionVariables.set('access_token', json.access_token);",
+                  "  console.log('access_token saved to collection variable');",
+                  "}",
+                  "if (json.refresh_token) {",
+                  "  pm.collectionVariables.set('refresh_token', json.refresh_token);",
+                  "  console.log('refresh_token saved to collection variable');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"user@example.com\",\n  \"password\": \"password123\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/auth/login",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["auth", "login"]
+            },
+            "description": "Authenticate and receive JWT access + refresh tokens. The test script auto-saves the access token."
+          }
+        },
+        {
+          "name": "Refresh Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const json = pm.response.json();",
+                  "if (json.access_token) {",
+                  "  pm.collectionVariables.set('access_token', json.access_token);",
+                  "  console.log('access_token refreshed and saved');",
+                  "}",
+                  "if (json.refresh_token) {",
+                  "  pm.collectionVariables.set('refresh_token', json.refresh_token);",
+                  "  console.log('refresh_token rotated and saved');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh_token\": \"{{refresh_token}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/auth/refresh",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["auth", "refresh"]
+            },
+            "description": "Exchange a valid refresh token for a new access + refresh token pair."
+          }
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/auth/logout",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["auth", "logout"]
+            },
+            "description": "Revoke the current access token. The token is blacklisted until it naturally expires."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Upload",
+      "item": [
+        {
+          "name": "Upload DOCX",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const json = pm.response.json();",
+                  "pm.test('Has document_id', () => json.document_id);",
+                  "if (json.document_id) {",
+                  "  pm.collectionVariables.set('document_id', json.document_id);",
+                  "  console.log('document_id saved:', json.document_id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "",
+                  "description": "Select a .docx file from your machine"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/upload/",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["upload", ""]
+            },
+            "description": "Upload a DOCX file (max 50 MB). Returns a document_id for tracking. Only .docx is accepted — PDF is out of scope."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Documents",
+      "item": [
+        {
+          "name": "List Documents",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/?page=1&page_size=20",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", ""],
+              "query": [
+                { "key": "page",      "value": "1" },
+                { "key": "page_size", "value": "20" }
+              ]
+            },
+            "description": "Paginated list of all documents uploaded by the authenticated user. Sorted newest first."
+          }
+        },
+        {
+          "name": "Get Document",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}"]
+            },
+            "description": "Full document details including all extracted content (text, figures, tables, equations)."
+          }
+        },
+        {
+          "name": "Delete Document",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}"]
+            },
+            "description": "Permanently delete the document record and its uploaded file from storage."
+          }
+        },
+        {
+          "name": "Process Document",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/process",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "process"]
+            },
+            "description": "Start extracting text, figures, tables, and equations from the uploaded DOCX. Progress is tracked in the DB — poll the status endpoint to monitor."
+          }
+        },
+        {
+          "name": "Get Processing Status",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/status",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "status"]
+            },
+            "description": "Poll processing status. Returns:\n- **status**: uploaded | processing | completed | error\n- **progress**: 0–100%\n- **current_stage**: Current processing stage label\n- **processing_history**: Full timestamped log of every stage"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Extracted Content",
+      "item": [
+        {
+          "name": "Get Text Content",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/content/text",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "content", "text"]
+            },
+            "description": "Returns the full plain-text content extracted from the DOCX. Requires document status = completed."
+          }
+        },
+        {
+          "name": "Get Figures",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/content/figures",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "content", "figures"]
+            },
+            "description": "Returns all extracted figures. Each figure includes:\n- **figure_id**: Unique identifier\n- **image_base64**: Base64-encoded image data\n- **caption**: Detected caption text (e.g. 'Figure 6-5: ...')\n- **number**: Extracted figure number\n- **position**: Paragraph index in the document"
+          }
+        },
+        {
+          "name": "Get Tables",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/content/tables",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "content", "tables"]
+            },
+            "description": "Returns all extracted tables. Each table includes:\n- **table_id**: Unique identifier\n- **content**: 2D array of cell strings\n- **caption**: Detected caption text (e.g. 'Table 6-1: ...')\n- **number**: Extracted table number\n- **position**: Paragraph index in the document"
+          }
+        },
+        {
+          "name": "Get Equations",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/content/equations",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "content", "equations"]
+            },
+            "description": "Returns all extracted equations. Each equation includes:\n- **equation_id**: Unique identifier\n- **latex**: LaTeX representation converted from OMML\n- **raw_omml**: Original OMML XML (for re-processing with Mathpix etc.)\n- **number**: Equation number as found in document (e.g. '(6-4)')\n- **position**: Paragraph index in the document"
+          }
+        },
+        {
+          "name": "Batch Process Equations",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/equations/batch-process",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "equations", "batch-process"]
+            },
+            "description": "Re-process all figures through Mathpix OCR to detect equations.\n- Replaces existing Mathpix-detected equations with fresh results\n- Keeps OMML-extracted equations intact\n- Requires MATHPIX_APP_ID and MATHPIX_APP_KEY in .env"
+          }
+        },
+        {
+          "name": "Equation Preview",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/equations/{{equation_id}}/preview",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "equations", "{{equation_id}}", "preview"]
+            },
+            "description": "Get equation data for rendering preview. Returns:\n- **latex**: LaTeX string for KaTeX/MathJax rendering\n- **image_base64**: Base64 image (if available from Mathpix)\n- **position**: Where the equation appears in the document\n- **number**: Equation number (e.g. '(6-4)')"
+          }
+        }
+      ]
+    }
+    ,
+    {
+      "name": "AI Analysis",
+      "item": [
+        {
+          "name": "Trigger Analysis (All Focus Areas)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"focus_areas\": [\"all\"]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/analyze",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "analyze"]
+            },
+            "description": "Run the full AI analysis pipeline on a processed document:\n1. **Writing Style Analysis** — determines grade level, tone, complexity\n2. **Content Analysis** — GPT-4o scans text for factual claims (filtered by focus_areas)\n3. **Research** — Tavily searches for updated information (authoritative sources only)\n4. **Proposals** — GPT-4o generates style-matched change suggestions\n5. **Validation** — cross-reference quality checks\n\n**focus_areas** options: missions, constellations, technology, statistics, companies, business_philosophy, historical_facts, all (default)\n\nRequires document status = completed."
+          }
+        },
+        {
+          "name": "Trigger Analysis (Filtered: Missions + Constellations)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"focus_areas\": [\"missions\", \"constellations\"]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/analyze",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "analyze"]
+            },
+            "description": "Run analysis filtered to only missions and constellations. The system will SKIP technology updates, company changes, etc.\n\nUseful for history chapters or mission-focused content."
+          }
+        },
+        {
+          "name": "Trigger Analysis (Filtered: Historical + Companies)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"focus_areas\": [\"historical_facts\", \"companies\", \"business_philosophy\"]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/analyze",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "analyze"]
+            },
+            "description": "Run analysis filtered to historical facts, companies, and business philosophy. Useful for industry/policy chapters."
+          }
+        },
+        {
+          "name": "Trigger Analysis (Filtered: Technology + Statistics)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"focus_areas\": [\"technology\", \"statistics\"]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/analyze",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "analyze"]
+            },
+            "description": "Run analysis filtered to technology and statistics. Useful for technical chapters with equations and system specs."
+          }
+        },
+        {
+          "name": "Get Analysis Status",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/analysis/status",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "analysis", "status"]
+            },
+            "description": "Check analysis status. Returns:\n- **status**: current document status\n- **is_analyzed**: boolean\n- **style_profile**: document writing style (grade_level, tone, complexity, etc.)\n- **analysis_summary**: total claims, outdated, changes, focus_areas used"
+          }
+        },
+        {
+          "name": "Get Claims (All)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/claims?outdated_only=false",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "claims"],
+              "query": [
+                { "key": "outdated_only", "value": "false", "description": "Set to true to only see outdated claims" },
+                { "key": "focus_area", "value": "", "description": "Filter by focus area: missions, constellations, technology, statistics, companies, business_philosophy, historical_facts", "disabled": true }
+              ]
+            },
+            "description": "Return all factual claims identified during analysis. Each claim includes:\n- **claim_id**: Unique identifier\n- **text**: Original text containing the claim\n- **claim_type**: statistic, date, company_info, mission, technology, constellation, etc.\n- **focus_area**: Resolved focus category (missions, constellations, technology, etc.)\n- **entities**: Named entities mentioned\n- **temporal_refs**: Dates/years found\n- **is_outdated**: Whether the claim is flagged as potentially outdated"
+          }
+        },
+        {
+          "name": "Get Claims (Outdated Only)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/claims?outdated_only=true",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "claims"],
+              "query": [
+                { "key": "outdated_only", "value": "true" }
+              ]
+            },
+            "description": "Return only claims flagged as outdated."
+          }
+        },
+        {
+          "name": "Get Claims (By Focus Area)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/claims?focus_area=constellations",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "claims"],
+              "query": [
+                { "key": "focus_area", "value": "constellations", "description": "Filter: missions, constellations, technology, statistics, companies, business_philosophy, historical_facts" }
+              ]
+            },
+            "description": "Return claims filtered by a specific focus area."
+          }
+        },
+        {
+          "name": "List Change Proposals",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/changes?page=1&page_size=20",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "changes"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "page_size", "value": "20" },
+                { "key": "status_filter", "value": "", "description": "Filter by: pending, approved, rejected, applied", "disabled": true },
+                { "key": "change_type", "value": "", "description": "Filter by type: data_update, tech_update, mission_update, company_update, constellation_update, statistics_update, system_update, regulation_update, business_model_update, historical_correction", "disabled": true }
+              ]
+            },
+            "description": "Paginated list of AI-generated change proposals. Each proposal includes:\n- **old_content**: Original text\n- **new_content**: Style-matched suggested replacement (technical depth matched to document)\n- **change_type**: data_update, tech_update, mission_update, constellation_update, statistics_update, system_update, regulation_update, business_model_update, historical_correction, etc.\n- **confidence**: high, medium, low\n- **sources**: Authoritative research sources (NASA, ESA, IEEE, etc.) with URLs\n- **status**: pending, approved, rejected\n- **user_edited_content**: User's modified version (if edited)\n- **approval_action**: approve_as_is, approve_with_edit, reject"
+          }
+        },
+        {
+          "name": "List Changes (By Type: constellation_update)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/changes?change_type=constellation_update",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "changes"],
+              "query": [
+                { "key": "change_type", "value": "constellation_update" }
+              ]
+            },
+            "description": "Filter change proposals by type. Example: only constellation-related updates."
+          }
+        },
+        {
+          "name": "Get Change Detail",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/changes/{{change_id}}",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "changes", "{{change_id}}"]
+            },
+            "description": "Get full details of a single change proposal including all research sources, confidence, and style-matched content."
+          }
+        },
+        {
+          "name": "Review: Approve As-Is",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"approve_as_is\",\n  \"note\": \"Looks good, using AI suggestion directly\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/changes/{{change_id}}",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "changes", "{{change_id}}"]
+            },
+            "description": "Approve a change proposal as-is. Uses the AI-generated new_content directly.\n\n**action** options:\n- `approve_as_is` — accept AI suggestion\n- `approve_with_edit` — accept with user modifications (requires edited_content)\n- `reject` — reject this change"
+          }
+        },
+        {
+          "name": "Review: Approve With Edit",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"approve_with_edit\",\n  \"note\": \"Modified the AI suggestion to better fit the chapter context\",\n  \"edited_content\": \"Your custom edited text goes here. This will be used instead of the AI-generated new_content when applying changes.\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/changes/{{change_id}}",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "changes", "{{change_id}}"]
+            },
+            "description": "Approve a change with user edits. The user-modified text is saved in `user_edited_content` and will be used instead of the AI's `new_content` when applying changes in Milestone 4.\n\n**edited_content** is REQUIRED when action = 'approve_with_edit'."
+          }
+        },
+        {
+          "name": "Review: Reject Change",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"reject\",\n  \"note\": \"Not applicable to this chapter\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/changes/{{change_id}}",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "changes", "{{change_id}}"]
+            },
+            "description": "Reject a change proposal. Status changes to 'rejected'."
+          }
+        },
+        {
+          "name": "Get Changelog",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/changelog",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "changelog"]
+            },
+            "description": "Full change log for the most recent analysis run. Includes all claims, proposals, style_profile, focus_areas, and summary stats."
+          }
+        },
+        {
+          "name": "Export Changelog",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}{{api_prefix}}/documents/{{document_id}}/changelog/export",
+              "host": ["{{base_url}}{{api_prefix}}"],
+              "path": ["documents", "{{document_id}}", "changelog", "export"]
+            },
+            "description": "Export the full changelog as JSON (v2.0). Includes document metadata with style_profile, all claims with focus_area, proposals with user_edited_content, and research sources."
+          }
+        }
+      ]
+    }
+  ],
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      { "key": "token", "value": "{{access_token}}", "type": "string" }
+    ]
+  }
+}
