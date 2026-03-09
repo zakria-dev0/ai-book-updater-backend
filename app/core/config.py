@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     ALLOWED_EXTENSIONS: List[str] = [".docx"]  # PDF skipped per client confirmation
 
     # CORS
-    CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8000"]
+    CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8000", "http://72.62.175.115:8001", "http://72.62.175.115:8000", "http://publisher-ai.decodersdigital.net/", "http://72.62.175.115:3000/login"]
     
     # Storage Paths
     UPLOAD_DIR: str = "./storage/uploads"
