@@ -24,6 +24,7 @@ class ChangeType(str, Enum):
     REGULATION_UPDATE = "regulation_update"
     BUSINESS_MODEL_UPDATE = "business_model_update"
     HISTORICAL_CORRECTION = "historical_correction"
+    AI_PROMPT = "ai_prompt"
 
 
 class ApprovalAction(str, Enum):

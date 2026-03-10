@@ -36,8 +36,8 @@ async def export_updated_docx(
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
-    if doc.get("user_id") != current_user["email"]:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your document")
+    if current_user.get("role") != "admin" and doc.get("user_id") != current_user["email"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
 
     # Get approved changes
     approved_changes = await db.changes.find({
@@ -67,6 +67,107 @@ async def export_updated_docx(
         path=output_path,
         filename=download_name,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+
+@router.get(
+    "/{document_id}/export/docx-highlighted",
+    summary="Download highlighted DOCX with changes marked in yellow/green",
+    responses={
+        200: {"description": "Highlighted DOCX file", "content": {"application/vnd.openxmlformats-officedocument.wordprocessingml.document": {}}},
+        404: {"description": "Document or export not found"},
+    },
+)
+async def export_highlighted_docx(
+    document_id: str,
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """
+    Generate and download a highlighted DOCX file.
+    - Regular changes: highlighted in yellow
+    - AI-generated content: highlighted in green
+    """
+    doc = await db.documents.find_one({"_id": ObjectId(document_id)})
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    if current_user.get("role") != "admin" and doc.get("user_id") != current_user["email"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    approved_changes = await db.changes.find({
+        "document_id": document_id,
+        "status": {"$in": ["approved", "applied"]},
+    }).to_list(None)
+
+    if not approved_changes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No approved changes to apply",
+        )
+
+    output_path = await ExportService.generate_updated_docx(doc, approved_changes, highlighted=True)
+    if not output_path or not os.path.exists(output_path):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate highlighted document",
+        )
+
+    original_name = doc.get("original_filename", "document.docx")
+    base_name = os.path.splitext(original_name)[0]
+    download_name = f"{base_name}_highlighted.docx"
+
+    return FileResponse(
+        path=output_path,
+        filename=download_name,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+
+@router.get(
+    "/{document_id}/export/preview",
+    summary="Preview highlighted document as PDF in browser",
+    responses={
+        200: {"description": "PDF preview of highlighted document", "content": {"application/pdf": {}}},
+        400: {"description": "No approved changes"},
+        404: {"description": "Document not found"},
+    },
+)
+async def preview_highlighted(
+    document_id: str,
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """Return a PDF of the highlighted document for in-browser preview."""
+    doc = await db.documents.find_one({"_id": ObjectId(document_id)})
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    if current_user.get("role") != "admin" and doc.get("user_id") != current_user["email"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    approved_changes = await db.changes.find({
+        "document_id": document_id,
+        "status": {"$in": ["approved", "applied"]},
+    }).to_list(None)
+
+    if not approved_changes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No approved changes to preview",
+        )
+
+    pdf_path = await ExportService.generate_preview_pdf(doc, approved_changes)
+    if not pdf_path or not os.path.exists(pdf_path):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate preview",
+        )
+
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline"},
     )
 
 
