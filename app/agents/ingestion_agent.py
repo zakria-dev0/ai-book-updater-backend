@@ -1,17 +1,21 @@
 """
 Content Analysis Agent — uses GPT-4o to scan document text and identify
-factual claims that may be outdated (dates, statistics, company info,
-missions, technologies, policies, citations, constellations).
+factual claims that may be outdated.
 
 Supports:
+- Document age estimation (analyzes references to determine publication era)
+- Age-aware claim detection (adjusts sensitivity based on document age)
 - Focus area filtering (only detect claims matching selected categories)
 - Writing style analysis (determine document's grade level, tone, complexity)
-- Enhanced constellation/mega-constellation detection patterns
+- Comprehensive detection: explicit facts, state-of-field descriptions,
+  predictions, reference staleness, organizational changes, technology landscape
 """
 import json
+import re
 import uuid
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Dict
+from datetime import datetime
 from openai import AsyncOpenAI, RateLimitError, APITimeoutError, APIError, APIConnectionError
 from app.core.config import settings
 from app.core.logger import get_logger
@@ -66,139 +70,175 @@ async def _throttle_for_tpm(estimated_tokens: int):
         # Record this request
         _token_log.append((_time.monotonic(), estimated_tokens))
 
-SYSTEM_PROMPT = """\
-You are an expert fact-checker for academic and technical books.
-Analyze the text below and identify **factual claims** that could become outdated.
 
-Look for ANY of these types of claims:
-- Statistics, numbers, percentages, measurements
-- Dates, years, or time references (e.g. "in 2019", "currently", "recently", "as of")
-- Company information (revenue, employees, headquarters, leadership, products)
-- Mission statements, organizational goals, or strategic plans
-- Technology descriptions (versions, capabilities, specifications, comparisons)
-- Policy or regulation references (laws, standards, guidelines)
-- Citations to research, studies, or reports
-- Named entities with associated factual information (people, organizations, places)
-- Descriptions of current state of any field, industry, or technology
-- Any sentence with a verifiable fact that could change over time
-- Satellite constellations: constellation sizes, numbers of satellites, constellation purposes,
-  mega-constellation references, orbital network descriptions. Pay special attention to statements
-  about constellation sizes in "dozens" or "hundreds" — modern mega-constellations have thousands.
+# ------------------------------------------------------------------ #
+# Document Age Estimation Prompt                                       #
+# ------------------------------------------------------------------ #
 
-For EACH claim you find, return a JSON object with these fields:
-- "text": the exact sentence or phrase containing the claim
-- "claim_type": one of "statistic", "date", "company_info", "mission", "technology", "policy", "citation", "regulation", "constellation", "historical", "business_philosophy"
-- "paragraph_idx": the paragraph index (provided with the text)
-- "entities": list of named entities (people, orgs, places) mentioned
-- "temporal_refs": list of dates or years mentioned (e.g. "2019", "March 2020")
-- "is_outdated": whether the claim's TRUTH VALUE has likely changed (see rules below)
+DOCUMENT_AGE_PROMPT = """\
+You are an expert publication date analyst for technical books.
 
-CLAIM TYPE GUIDANCE:
-- "constellation": ANY mention of satellite constellations, constellation sizes, GPS/GLONASS/Galileo
-  constellations, Starlink, OneWeb, Kuiper, mega-constellations, orbital networks, satellite counts
-- "mission": Space missions, launches, mission names, rocket flights, exploration programs
-- "technology": Hardware, software, systems, tech versions, spacecraft capabilities
-- "statistic": Numerical data, percentages, rankings, metrics, budgets
-- "company_info": Company details, leadership, ownership, mergers, acquisitions
-- "business_philosophy": Industry trends, commercial space evolution, market dynamics
-- "historical": Historical dates, events, milestones, founding dates
-- "date": Time-sensitive references using "currently", "now", "as of", "recently"
-- "policy"/"regulation": Laws, standards, guidelines, treaties, regulatory frameworks
+Examine this text and estimate when it was written or last updated by analyzing:
+1. Most recent reference/citation years
+2. Technology or systems described as "new" or "emerging"
+3. Forward-looking language about events that may have already occurred
+4. Named programs, organizations, or products and their known active periods
 
-CRITICAL RULES for determining "is_outdated":
-
-The key question is: "Would a reader be MISLED by this statement in {current_year}?"
-
-Set is_outdated = FALSE for:
-- Historical facts about past events that remain true (founding dates, release dates,
-  when something happened, discontinuation dates, past milestones).
-- Historical data anchored to a specific year AND using PAST TENSE
-  (e.g. "revenue was $X in 2019", "was founded in 1994").
-- Statements using past tense that record what occurred at a specific time.
-- Broad trends or general truths that are still largely accurate, even if the exact
-  situation has evolved gradually (e.g. general market trends, widely-used technologies).
-- Statements that are still substantially correct, even if details have slightly shifted.
-
-Set is_outdated = TRUE when ANY of these apply:
-- The claim makes a specific present-tense assertion that is CLEARLY WRONG today
-  (e.g. someone "is" the CEO but has since stepped down, something "is the latest version"
-  but newer versions have been released, something "is the newest" but has been replaced).
-- The claim states a specific number, ranking, or position as current that is now
-  demonstrably different (not just slightly evolved but fundamentally changed).
-- The claim uses "currently", "now", "the latest", "the newest" and the underlying
-  fact has been specifically superseded by a known successor or replacement.
-
-- **FUTURE-TENSE CLAIMS ABOUT PAST EVENTS** (CRITICAL — DO NOT MISS THESE):
-  If a claim uses FUTURE TENSE ("will launch", "plans to", "scheduled for", "is expected to",
-  "will be available", "will start launching", "will join", "will visit", "will collect",
-  "will return", "will replace") AND the referenced date/year has ALREADY PASSED
-  (i.e. the date is before {current_year}), then is_outdated = TRUE.
-  Examples:
-    - "will launch in 2016" → 2016 has passed → is_outdated = TRUE
-    - "plans to send humans by 2025" → 2025 has passed → is_outdated = TRUE
-    - "scheduled for launch in late 2018" → 2018 has passed → is_outdated = TRUE
-    - "will start launching in 2015" → 2015 has passed → is_outdated = TRUE
-    - "will be available for launch in 2015" → 2015 has passed → is_outdated = TRUE
-    - "will visit the asteroid Bennu in 2018" → 2018 has passed → is_outdated = TRUE
-    - "will join the A-Train in 2014" → 2014 has passed → is_outdated = TRUE
-    - "NASA plans to adapt the design for Mars 2020" → if the event has occurred → is_outdated = TRUE
-  The reader would think these events haven't happened yet, when they either already
-  occurred or were cancelled — either way, the future tense is misleading.
-
-- **COMPANIES/ORGANIZATIONS THAT NO LONGER EXIST**:
-  If a claim uses present tense ("is working with", "plans to", "seeks to") about
-  a company or organization that has gone bankrupt, been acquired, or ceased operations,
-  then is_outdated = TRUE.
-
-- For constellations: statements about constellation sizes that are dramatically outdated
-  (e.g. "constellations typically consist of 24-48 satellites" — now mega-constellations
-  have thousands). Statements about constellation purposes limited to navigation only,
-  when modern constellations serve broadband, IoT, imaging, etc.
-
-When in doubt about historical/past-tense claims, set is_outdated = FALSE.
-But for FUTURE-TENSE claims with past dates, ALWAYS set is_outdated = TRUE.
-
-IMPORTANT: Return a JSON object with a "claims" key containing an array of claim objects.
-Example: {{"claims": [{{"text": "...", "claim_type": "...", ...}}]}}
-If no factual claims are found, return {{"claims": []}}.
-Only return valid JSON — no markdown fences, no extra text.
-Be thorough — even technical or academic text often contains verifiable facts.
+Return ONLY a JSON object:
+{{
+  "estimated_publication_year": <integer>,
+  "newest_reference_year": <integer or null>,
+  "confidence": "high" | "medium" | "low",
+  "document_age_years": <{current_year} minus estimated_publication_year>
+}}
+No markdown fences, no extra text.
 """
+
+
+# ------------------------------------------------------------------ #
+# Claim Detection Prompt (age-aware, multi-category)                   #
+# ------------------------------------------------------------------ #
+
+SYSTEM_PROMPT = """\
+You are an expert technical textbook update assistant.
+Systematically identify EVERY statement that may need updating for a modern reader.
+
+DOCUMENT CONTEXT:
+- Estimated publication: ~{estimated_pub_year} ({document_age} years old)
+- Current year: {current_year}
+
+=======================================
+DETECTION CATEGORIES -- check ALL of these
+=======================================
+
+A. EXPLICIT FACTS: Statistics, dates, named technologies, company/org info,
+   policy/regulation references, program or mission names with status claims.
+
+B. STATE-OF-FIELD DESCRIPTIONS: Any description of a field or technology as
+   "emerging", "in its infancy", "nascent", "beginning to", "not yet mature",
+   "only recently", "early stages". In a {document_age}-year-old document,
+   these fields are likely now well-established.
+
+C. PREDICTIONS & FORWARD-LOOKING CLAIMS: "will", "plans to", "is expected to",
+   "we anticipate", "should become". If the timeframe has passed, it is outdated
+   regardless of outcome -- the reader needs what ACTUALLY happened.
+
+D. REFERENCE STALENESS: Citations older than 15 years in fast-evolving fields.
+   Standards, guidelines, or reports that may have newer editions.
+
+E. ORGANIZATIONAL CHANGES: Orgs that may have merged, dissolved, renamed, or
+   been restructured. Programs that were cancelled, completed, or renamed.
+
+F. TECHNOLOGY LANDSCAPE: Systems described as "new"/"advanced"/"cutting-edge"
+   that may now be legacy. Cost figures, capability limits, or comparisons
+   that may have fundamentally shifted.
+
+G. IMPLICIT TIME-SENSITIVITY: Present-tense descriptions of dynamic situations.
+   "There are now...", "Currently...", "Today's..." in a {document_age}-year-old text.
+
+=======================================
+STALENESS RULES
+=======================================
+
+Core question: "Would a student reading this in {current_year} form an INACCURATE
+understanding of the current state of affairs?"
+
+is_outdated = TRUE when:
+- Present-tense claim about a dynamic situation in a document 10+ years old
+- Prediction whose timeframe has passed
+- Field described as "emerging"/"nascent" in a document 15+ years old
+- Organization/company has fundamentally changed
+- Cost, count, or market figures are likely >25% different
+- Technology described as limited/experimental that is now mature
+- Future-tense claims ("will launch", "plans to") where the date has passed
+- Companies/orgs referenced in present tense that no longer exist or were acquired
+
+is_outdated = FALSE only when:
+- Permanent historical fact in past tense ("Apollo 11 landed on July 20, 1969")
+- Physical law, mathematical formula, or stable definition
+- Trivially minor changes that would not mislead a reader
+
+AGE SENSITIVITY: This document is ~{document_age} years old. For 10+ year old documents,
+MOST present-tense claims about technology, industry, or organizations ARE likely outdated.
+Finding fewer than 10 claims in a full chapter likely means under-detection.
+
+=======================================
+OUTPUT FORMAT
+=======================================
+
+Return JSON:
+{{"claims": [
+    {{
+      "text": "exact sentence or phrase from the text",
+      "claim_type": "statistic"|"date"|"company_info"|"mission"|"technology"|
+                   "policy"|"citation"|"regulation"|"constellation"|"historical"|
+                   "business_philosophy"|"landscape"|"prediction"|"reference"|"methodology",
+      "paragraph_idx": <integer>,
+      "entities": ["named", "entities"],
+      "temporal_refs": ["years", "or", "dates"],
+      "is_outdated": true or false
+    }}
+]}}
+
+Only valid JSON -- no markdown, no extra text. Be thorough.
+"""
+
+
+# ------------------------------------------------------------------ #
+# Verification Prompt (age-aware, less conservative)                   #
+# ------------------------------------------------------------------ #
 
 VERIFICATION_PROMPT = """\
-You are a precise fact-checker. Review each claim below and determine if it is truly outdated
-as of {current_year}. For each claim, decide if a reader would be MISLED by the statement today.
+You are a senior technical editor verifying outdated-claim flags in a textbook.
 
-Rules:
-- A claim is outdated if its core assertion is DEMONSTRABLY FALSE or MISLEADING today.
-- Broad generalizations that are still substantially true are NOT outdated.
-- Historical facts using PAST TENSE anchored to dates are NOT outdated
-  (e.g. "revenue was $X in 2019", "was founded in 1994", "was released in 2015").
-- CRITICAL: Claims using PRESENT TENSE superlatives like "is the latest", "is the newest",
-  "is the most popular" ARE outdated if a successor or replacement exists.
+CONTEXT: Document is ~{document_age} years old (est. published {estimated_pub_year}).
+Current year: {current_year}.
 
-- **FUTURE-TENSE CLAIMS WITH PAST DATES** — ALWAYS mark as outdated:
-  If a claim says "will launch in [year]", "scheduled for [year]", "plans to [do X] by [year]",
-  "will be available in [year]", "will join in [year]", "will visit in [year]"
-  AND that year is before {current_year}, then is_outdated = TRUE.
-  The future tense misleads readers into thinking the event hasn't happened yet.
-  Examples: "will launch in 2016" → outdated. "scheduled for 2018" → outdated.
-  "NASA plans to adapt the design for Mars 2020" → the mission already launched → outdated.
+RULES:
 
-- **DEFUNCT COMPANIES**: Claims using present tense about companies that have gone bankrupt,
-  been acquired, or ceased operations → is_outdated = TRUE.
+KEEP is_outdated = TRUE when:
+- Specific factual claim about a dynamic situation (e.g., "X costs $Y", "there are N satellites")
+- Prediction with a passed timeframe ("will launch by 2010", "plans to")
+- Field described as "emerging"/"nascent" in a 15+ year old document
+- Specific cost/market/count figures from {estimated_pub_year} or earlier
+- Named organization or program that likely changed significantly
+- Future-tense claims where the date has clearly passed
+- Companies/orgs referenced in present tense that may no longer exist
 
-- For constellation claims: statements about small constellation sizes (24-48 satellites as "typical")
-  ARE outdated given modern mega-constellations (thousands of satellites).
+FLIP to FALSE when:
+- Permanent historical fact that cannot change
+- Physical law or mathematical principle
+- GENERAL TRUISMS that are STILL TRUE regardless of age. Examples:
+  * "Methods may change as a result of evolving technology" → still true, not outdated
+  * "We must find a way to reduce costs" → still true, not outdated
+  * "The way we do X is continually evolving" → still true, not outdated
+  * "End users receive and use the products" → definition, not outdated
+  * "Operators control and maintain the space and ground assets" → role definition
+- Descriptions of ROLES, PROCESSES, or GENERAL PRINCIPLES that haven't fundamentally changed
+- Statements about the NATURE of engineering/design that are timeless
+- You are CERTAIN the situation has NOT materially changed
 
-For each claim, return:
-- "claim_id": the original claim_id
-- "is_outdated": true or false (your corrected assessment)
-- "reason": brief explanation of why it is or isn't outdated
+KEY DISTINCTION: A claim that describes HOW THINGS WORK IN GENERAL (process, role, principle)
+is different from a claim about A SPECIFIC STATE OF AFFAIRS (count, cost, status, capability).
+General principles rarely become outdated. Specific states of affairs in a {document_age}-year-old
+document usually ARE outdated.
 
-Return a JSON object: {{"verified_claims": [...]}}
-Only return valid JSON — no markdown fences, no extra text.
+For a {document_age}-year-old document, when in doubt about SPECIFIC FACTS -> KEEP the outdated flag.
+When in doubt about GENERAL PRINCIPLES -> FLIP to FALSE.
+
+For each claim return:
+- "claim_id": original claim_id
+- "is_outdated": true or false
+- "reason": brief explanation
+
+Return JSON: {{"verified_claims": [...]}}
+No markdown fences, no extra text.
 """
+
+
+# ------------------------------------------------------------------ #
+# Style Analysis Prompt (unchanged)                                    #
+# ------------------------------------------------------------------ #
 
 STYLE_ANALYSIS_PROMPT = """\
 You are an expert linguistic analyst. Analyze the writing style of the following document excerpt
@@ -225,19 +265,122 @@ Return ONLY a JSON object with these fields. No extra text, no markdown fences.
 Example: {{"grade_level": "college_senior", "technical_depth": "advanced", "tone": "formal_academic", "sentence_complexity": "complex", "terminology_level": "highly_technical", "avg_sentence_length": 28, "passive_voice_usage": "moderate"}}
 """
 
-CHUNK_SIZE = 16  # paragraphs per GPT call
-MAX_CONCURRENT_CHUNKS = 4  # parallel GPT calls — limited by 30K TPM on OpenAI
+CHUNK_SIZE = 12  # paragraphs per GPT call (smaller = more thorough per chunk)
+MAX_CONCURRENT_CHUNKS = 3  # parallel GPT calls — limited by 30K TPM on OpenAI
 
 
 class ContentAnalysisAgent:
     def __init__(self):
         self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         self.model = settings.GPT_MODEL
-        # Use gpt-4o-mini for bulk claim extraction (faster, higher TPM limits)
-        self.analysis_model = "gpt-4o-mini"
+        # Use the full gpt-4o model for claim extraction — mini misses subtle staleness
+        self.analysis_model = settings.GPT_MODEL
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self._chunk_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHUNKS)
+        # Document age context — set by estimate_document_age() before analysis
+        self._estimated_pub_year: int | None = None
+        self._document_age: int | None = None
+
+    # ------------------------------------------------------------------ #
+    # Document Age Estimation                                              #
+    # ------------------------------------------------------------------ #
+
+    async def estimate_document_age(self, text_content: str) -> Dict:
+        """
+        Estimate when the document was published by analyzing references,
+        language patterns, and technology descriptions.
+        Returns dict with estimated_publication_year and document_age_years.
+        """
+        if not settings.OPENAI_API_KEY:
+            logger.warning("OpenAI API key not configured — skipping age estimation")
+            return self._fallback_age_estimation(text_content)
+
+        # Send first 5000 chars + last 3000 chars (references are often at the end)
+        excerpt = text_content[:5000]
+        if len(text_content) > 8000:
+            excerpt += "\n\n--- END OF DOCUMENT ---\n\n" + text_content[-3000:]
+
+        current_year = datetime.utcnow().year
+        system = DOCUMENT_AGE_PROMPT.format(current_year=current_year)
+
+        try:
+            response = await self._call_with_retry(system, excerpt)
+            if response is None:
+                logger.warning("Age estimation call failed — using fallback")
+                return self._fallback_age_estimation(text_content)
+
+            if response.usage:
+                self.total_prompt_tokens += response.usage.prompt_tokens
+                self.total_completion_tokens += response.usage.completion_tokens
+
+            raw = response.choices[0].message.content
+            logger.info("Document age estimation raw: %s", raw[:500])
+            data = json.loads(raw)
+
+            est_year = data.get("estimated_publication_year", current_year - 5)
+            doc_age = current_year - est_year
+
+            # Sanity check: age should be between 0 and 60
+            if doc_age < 0:
+                doc_age = 0
+                est_year = current_year
+            elif doc_age > 60:
+                doc_age = 60
+                est_year = current_year - 60
+
+            self._estimated_pub_year = est_year
+            self._document_age = doc_age
+
+            logger.info(
+                "Document age estimation: published ~%d (%d years old), confidence=%s",
+                est_year, doc_age, data.get("confidence", "unknown"),
+            )
+            return {
+                "estimated_publication_year": est_year,
+                "document_age_years": doc_age,
+                "confidence": data.get("confidence", "medium"),
+                "newest_reference_year": data.get("newest_reference_year"),
+            }
+
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse age estimation response: %s", e)
+            return self._fallback_age_estimation(text_content)
+        except Exception as e:
+            logger.error("Age estimation failed: %s", e)
+            return self._fallback_age_estimation(text_content)
+
+    def _fallback_age_estimation(self, text_content: str) -> Dict:
+        """
+        Fallback: extract years from text using regex and estimate from the
+        most recent reference year found.
+        """
+        current_year = datetime.utcnow().year
+        # Find all 4-digit years in the text
+        years = [int(y) for y in re.findall(r'\b(19\d{2}|20\d{2})\b', text_content)]
+        # Filter to reasonable range
+        years = [y for y in years if 1950 <= y <= current_year]
+
+        if years:
+            newest = max(years)
+            est_year = min(newest + 2, current_year)  # Publication usually ~2 years after newest ref
+        else:
+            est_year = current_year - 10  # Conservative default
+
+        doc_age = current_year - est_year
+        self._estimated_pub_year = est_year
+        self._document_age = doc_age
+
+        logger.info(
+            "Fallback age estimation: newest ref year=%s, est. published ~%d (%d years old)",
+            max(years) if years else "none", est_year, doc_age,
+        )
+        return {
+            "estimated_publication_year": est_year,
+            "document_age_years": doc_age,
+            "confidence": "low",
+            "newest_reference_year": max(years) if years else None,
+        }
 
     # ------------------------------------------------------------------ #
     # Writing Style Analysis                                               #
@@ -314,6 +457,10 @@ class ContentAnalysisAgent:
         if paragraphs is None:
             paragraphs = [p for p in text_content.split("\n") if p.strip()]
 
+        # Ensure document age is estimated
+        if self._estimated_pub_year is None:
+            await self.estimate_document_age(text_content)
+
         # Resolve focus areas
         active_focus = None
         if focus_areas and "all" not in focus_areas:
@@ -326,8 +473,9 @@ class ContentAnalysisAgent:
         chunk_ranges = list(range(0, len(paragraphs), CHUNK_SIZE))
         total_chunks = len(chunk_ranges)
         logger.info(
-            "Document %s: %d paragraphs → %d chunks (max %d concurrent)",
+            "Document %s: %d paragraphs -> %d chunks (max %d concurrent), doc age=%d years",
             document_id, len(paragraphs), total_chunks, MAX_CONCURRENT_CHUNKS,
+            self._document_age or 0,
         )
 
         async def _process_chunk(chunk_start: int, chunk_idx: int) -> List[FactualClaim]:
@@ -335,7 +483,7 @@ class ContentAnalysisAgent:
                 chunk = paragraphs[chunk_start : chunk_start + CHUNK_SIZE]
                 chunk_claims = await self._analyze_chunk(chunk, chunk_start)
                 logger.info(
-                    "Document %s — chunk %d/%d (paras %d–%d): found %d claims",
+                    "Document %s -- chunk %d/%d (paras %d-%d): found %d claims",
                     document_id, chunk_idx + 1, total_chunks,
                     chunk_start, chunk_start + len(chunk) - 1,
                     len(chunk_claims),
@@ -364,11 +512,11 @@ class ContentAnalysisAgent:
             before_count = len(all_claims)
             all_claims = [c for c in all_claims if c.focus_area in active_focus]
             logger.info(
-                "Focus area filter: %d → %d claims (kept areas: %s)",
+                "Focus area filter: %d -> %d claims (kept areas: %s)",
                 before_count, len(all_claims), active_focus,
             )
 
-        # Verification pass: double-check outdated flags
+        # Verification pass: double-check outdated flags with age-aware prompt
         outdated_claims = [c for c in all_claims if c.is_outdated]
         if outdated_claims:
             logger.info(
@@ -390,13 +538,16 @@ class ContentAnalysisAgent:
     ) -> List[FactualClaim]:
         """
         Verification pass: send all claims flagged as outdated to GPT for a
-        second opinion. Corrects false positives where GPT was too aggressive.
+        second opinion. Uses age-aware prompt that favors keeping outdated flags
+        for older documents.
         """
         outdated_claims = [c for c in claims if c.is_outdated]
         if not outdated_claims:
             return claims
 
-        from datetime import datetime
+        current_year = datetime.utcnow().year
+        est_pub_year = self._estimated_pub_year or (current_year - 10)
+        doc_age = self._document_age or 10
 
         # Build the verification request
         claims_for_review = []
@@ -410,7 +561,11 @@ class ContentAnalysisAgent:
             })
 
         user_content = json.dumps({"claims_to_verify": claims_for_review}, indent=2)
-        system = VERIFICATION_PROMPT.format(current_year=datetime.utcnow().year)
+        system = VERIFICATION_PROMPT.format(
+            current_year=current_year,
+            estimated_pub_year=est_pub_year,
+            document_age=doc_age,
+        )
 
         try:
             response = await self._call_with_retry(system, user_content)
@@ -432,7 +587,7 @@ class ContentAnalysisAgent:
 
             verified = data.get("verified_claims", [])
 
-            # Build lookup: claim_id → verified is_outdated
+            # Build lookup: claim_id -> verified is_outdated
             corrections = {}
             for v in verified:
                 cid = v.get("claim_id")
@@ -440,7 +595,7 @@ class ContentAnalysisAgent:
                     corrections[cid] = v.get("is_outdated", True)
                     reason = v.get("reason", "")
                     logger.info(
-                        "Verification [%s]: is_outdated=%s — %s",
+                        "Verification [%s]: is_outdated=%s -- %s",
                         cid, corrections[cid], reason,
                     )
 
@@ -452,7 +607,7 @@ class ContentAnalysisAgent:
                     if new_flag != claim.is_outdated:
                         corrected_count += 1
                         logger.info(
-                            "Corrected claim %s: outdated %s → %s",
+                            "Corrected claim %s: outdated %s -> %s",
                             claim.claim_id, claim.is_outdated, new_flag,
                         )
                     claim.is_outdated = new_flag
@@ -476,10 +631,14 @@ class ContentAnalysisAgent:
             f"[Paragraph {start_idx + i}]: {p}" for i, p in enumerate(paragraphs)
         )
 
-        from datetime import datetime
+        current_year = datetime.utcnow().year
+        est_pub_year = self._estimated_pub_year or (current_year - 10)
+        doc_age = self._document_age or 10
+
         system = SYSTEM_PROMPT.format(
-            staleness_years=settings.CONTENT_STALENESS_YEARS,
-            current_year=datetime.utcnow().year,
+            estimated_pub_year=est_pub_year,
+            document_age=doc_age,
+            current_year=current_year,
         )
 
         if start_idx == 0:
@@ -544,7 +703,6 @@ class ContentAnalysisAgent:
 
     async def _call_with_retry(self, system: str, user_content: str, model: str = None):
         """Call OpenAI with TPM-aware throttling and retry on transient errors."""
-        import re
         use_model = model or self.model
         # Estimate tokens (~4 chars per token) for throttling
         estimated_tokens = (len(system) + len(user_content)) // 4

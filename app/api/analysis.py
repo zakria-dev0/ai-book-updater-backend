@@ -671,51 +671,155 @@ async def export_changelog(
 # Section extraction helper                                            #
 # ------------------------------------------------------------------ #
 
-# Patterns that match typical section/chapter headings in textbooks
+# Patterns that match typical section/chapter headings in textbooks.
+# Ordered from most specific to least specific.
 _HEADING_PATTERNS = [
-    _re.compile(r'^(Chapter\s+\d+[\.:]\s*.+)$', _re.MULTILINE | _re.IGNORECASE),
-    _re.compile(r'^(\d+\.\d+[\.:]\s*.+)$', _re.MULTILINE),
-    _re.compile(r'^(\d+\.\d+\.\d+[\.:]\s*.+)$', _re.MULTILINE),
-    _re.compile(r'^([A-Z][A-Z\s]{5,60})$', _re.MULTILINE),  # ALL-CAPS headings
-    _re.compile(r'^((?:Section|Part)\s+\d+[\.:]\s*.+)$', _re.MULTILINE | _re.IGNORECASE),
+    # "Chapter 1: Title" or "Chapter 1 Title" or "Chapter One: Title"
+    _re.compile(r'^(Chapter\s+[\dIVXLCivxlc]+[\.:\s]\s*.+)$', _re.MULTILINE | _re.IGNORECASE),
+    # "Section 1: Title", "Part 1: Title", "Part I: Title"
+    _re.compile(r'^((?:Section|Part|Unit|Module|Lesson|Appendix)\s+[\dIVXLCivxlcA-Z]+[\.:\s]\s*.+)$', _re.MULTILINE | _re.IGNORECASE),
+    # "1.2.3 Title" or "1.2.3: Title" (triple decimal — match before double)
+    _re.compile(r'^(\d+\.\d+\.\d+[\.:\s]\s*.+)$', _re.MULTILINE),
+    # "1.2 Title" or "1.2: Title" or "1.2. Title"
+    _re.compile(r'^(\d+\.\d+[\.:\s]\s*.+)$', _re.MULTILINE),
+    # "1. Title" or "1: Title" or "1 Title" (single number heading)
+    _re.compile(r'^(\d{1,3}[\.:\s]\s*[A-Z].{2,80})$', _re.MULTILINE),
+    # Roman numeral headings: "I. Introduction", "IV Background"
+    _re.compile(r'^([IVXLC]{1,6}[\.:\s]\s*[A-Z].{2,80})$', _re.MULTILINE),
+    # ALL-CAPS headings (allow numbers, hyphens, colons, commas, apostrophes)
+    _re.compile(r'^([A-Z][A-Z0-9\s\-:,\'\.]{3,80})$', _re.MULTILINE),
+    # "Chapter One", "Chapter Two" etc. without colon
+    _re.compile(r'^(Chapter\s+\w+)$', _re.MULTILINE | _re.IGNORECASE),
 ]
+
+# Words that are commonly NOT headings (body text fragments, page artifacts)
+_NON_HEADING_WORDS = {
+    "the", "and", "for", "that", "this", "with", "from", "have", "been",
+    "will", "are", "was", "were", "not", "but", "all", "can", "had",
+    "her", "his", "its", "our", "has", "also", "than", "then",
+}
+
+
+def _is_likely_heading(line: str, paragraphs: list, para_idx: int) -> bool:
+    """Additional heuristic checks to confirm a line is a heading, not body text."""
+    # Very short lines that are just common words are not headings
+    words = line.split()
+    if len(words) == 1 and line.lower() in _NON_HEADING_WORDS:
+        return False
+
+    # Lines ending with period are usually sentences, not headings
+    # (Exception: abbreviations like "U.S." or numbered like "1.")
+    if line.endswith('.') and not _re.search(r'\d\.$', line) and len(line) > 30:
+        return False
+
+    # ALL-CAPS check: if the line is all caps but is very long, likely body text
+    if line.isupper() and len(line) > 80:
+        return False
+
+    return True
+
+
+def _normalize_heading(text: str) -> str:
+    """Normalize a heading for dedup: strip numbering prefix, lowercase, collapse spaces."""
+    t = text.strip().lower()
+    # Remove leading numbering like "chapter 1", "1.", "1.2.", "1.2.3"
+    t = _re.sub(r'^(chapter|section|part|unit|module|lesson|appendix)\s+[\divxlc]+[\.:\s]*', '', t)
+    t = _re.sub(r'^\d+(\.\d+)*[\.:\s]*', '', t)
+    t = _re.sub(r'^[ivxlc]+[\.:\s]+', '', t)
+    return _re.sub(r'\s+', ' ', t).strip()
 
 
 def _extract_sections(text_content: str) -> list:
-    """Extract section headings from document text content."""
+    """Extract section headings from document text content.
+
+    Uses multiple regex patterns to detect common heading formats,
+    plus heuristic checks to filter out false positives.
+    Deduplicates by normalizing headings (stripping numbering prefixes).
+    """
     if not text_content:
         return []
 
     paragraphs = text_content.split('\n')
     sections = []
-    seen_titles = set()
+    seen_lines = set()       # Track original lines to avoid re-processing
+    seen_normalized = set()   # Track normalized titles to catch cross-pattern duplicates
 
     for para_idx, para in enumerate(paragraphs):
         line = para.strip()
         if not line or len(line) > 120 or len(line) < 3:
             continue
 
+        # Skip if we already processed this exact line
+        if line in seen_lines:
+            continue
+
         for pattern in _HEADING_PATTERNS:
             match = pattern.match(line)
             if match:
                 title = match.group(1).strip()
-                # Avoid duplicates and very short/generic headings
-                if title not in seen_titles and len(title) > 3:
-                    seen_titles.add(title)
-                    sections.append({
-                        "index": len(sections),
-                        "title": title,
-                        "paragraph_idx": para_idx,
-                    })
+                if len(title) <= 3:
+                    break
+                # Heuristic check to filter out body text false positives
+                if not _is_likely_heading(title, paragraphs, para_idx):
+                    break
+                # Dedup: normalize to catch "Chapter 1 Space" vs "1 Space" as same
+                norm = _normalize_heading(title)
+                if norm and norm in seen_normalized:
+                    break
+                seen_lines.add(line)
+                if norm:
+                    seen_normalized.add(norm)
+                sections.append({
+                    "index": len(sections),
+                    "title": title,
+                    "paragraph_idx": para_idx,
+                })
                 break
 
-    # If no headings found, fall back to page-range sections
+    # If very few headings found (< 3), also try Title Case heuristic
+    # to catch headings like "The Future of Space", "Understanding Gravity"
+    if len(sections) < 3:
+        for para_idx, para in enumerate(paragraphs):
+            line = para.strip()
+            if not line or len(line) > 80 or len(line) < 5:
+                continue
+            if line in seen_lines:
+                continue
+            # Title Case: most words start uppercase, short line, not a sentence
+            words = line.split()
+            if len(words) < 2 or len(words) > 12:
+                continue
+            # Count capitalized words (skip short prepositions/articles)
+            small_words = {"a", "an", "the", "and", "or", "of", "in", "on", "to", "for", "at", "by", "is", "it"}
+            cap_count = sum(1 for w in words if w[0].isupper() or w.lower() in small_words)
+            if cap_count >= len(words) * 0.7 and not line.endswith('.'):
+                # Check surrounding context — headings usually preceded/followed by empty lines
+                prev_empty = para_idx == 0 or not paragraphs[para_idx - 1].strip()
+                next_empty = para_idx >= len(paragraphs) - 1 or not paragraphs[para_idx + 1].strip()
+                if prev_empty or next_empty:
+                    norm = _normalize_heading(line)
+                    if norm and norm in seen_normalized:
+                        continue
+                    seen_lines.add(line)
+                    if norm:
+                        seen_normalized.add(norm)
+                    sections.append({
+                        "index": len(sections),
+                        "title": line,
+                        "paragraph_idx": para_idx,
+                    })
+
+        # Re-sort by paragraph_idx and re-index
+        sections.sort(key=lambda s: s["paragraph_idx"])
+        for i, s in enumerate(sections):
+            s["index"] = i
+
+    # If still no headings found, fall back to page-range sections
     if not sections:
         total_paras = len(paragraphs)
         chunk_size = max(total_paras // 10, 20)
         for i in range(0, total_paras, chunk_size):
             end = min(i + chunk_size, total_paras)
-            # Use first non-empty line as preview
             preview = ""
             for j in range(i, min(i + 5, end)):
                 if paragraphs[j].strip():
@@ -726,6 +830,10 @@ def _extract_sections(text_content: str) -> list:
                 "title": f"Section {len(sections) + 1} — {preview}..." if preview else f"Section {len(sections) + 1}",
                 "paragraph_idx": i,
             })
+
+    logger.info("Extracted %d sections from document", len(sections))
+    for s in sections:
+        logger.debug("  Section %d: '%s' (para_idx=%d)", s["index"], s["title"][:60], s["paragraph_idx"])
 
     return sections
 
@@ -996,6 +1104,7 @@ async def generate_ai_prompt(
             "prompt": body.prompt,
             "placement": body.placement,
             "section_index": body.section_index,
+            "section_title": section["title"] if body.placement in ("after_section", "replace_section") and body.section_index is not None and body.section_index < len(sections) else None,
             "summary": summary,
         },
     }

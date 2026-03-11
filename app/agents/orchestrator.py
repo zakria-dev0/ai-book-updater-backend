@@ -1,8 +1,9 @@
 """
 LangGraph Orchestrator — coordinates the full AI analysis pipeline:
-  style_analyze → analyze → research → propose → validate → complete
+  age_estimate → style_analyze → analyze → research → propose → validate → complete
 
 Enhanced with:
+- Document age estimation (determines publication era for age-aware detection)
 - Focus area filtering (only analyze/research selected categories)
 - Writing style analysis (run once, pass to proposal generation)
 - Style-matched update generation
@@ -44,6 +45,8 @@ class AnalysisState(TypedDict):
     text_content: str
     paragraphs: List[str]
     focus_areas: List[str]
+    estimated_pub_year: Optional[int]  # Estimated publication year from age detection
+    document_age: Optional[int]  # Estimated document age in years
     style_profile: Optional[dict]  # StyleProfile as dict for serialization
     claims: List[FactualClaim]
     research: Dict[str, List[ResearchResult]]
@@ -88,8 +91,51 @@ async def _update_analysis_progress(state: AnalysisState, stage: str, progress: 
         logger.warning("Failed to update analysis progress: %s", e)
 
 
+async def age_estimate_node(state: AnalysisState) -> dict:
+    """Stage 0: Estimate document publication year for age-aware analysis."""
+    logger.info("Orchestrator [age_estimate]: estimating document age for %s", state["document_id"])
+    await _update_analysis_progress(
+        state, "Estimating document age", 2,
+        "Analyzing references and language to determine publication era",
+    )
+    try:
+        age_data = await content_agent.estimate_document_age(state["text_content"])
+        est_year = age_data.get("estimated_publication_year", datetime.utcnow().year - 10)
+        doc_age = age_data.get("document_age_years", 10)
+
+        logger.info(
+            "Document age estimation complete: published ~%d (%d years old, confidence=%s)",
+            est_year, doc_age, age_data.get("confidence", "unknown"),
+        )
+
+        # Store in document metadata
+        db = state.get("db")
+        if db is not None:
+            doc_repo = DocumentRepository(db)
+            await doc_repo.update_fields(state["document_id"], {
+                "estimated_pub_year": est_year,
+                "document_age": doc_age,
+            })
+
+        return {
+            "estimated_pub_year": est_year,
+            "document_age": doc_age,
+            "stage": "Document age estimated",
+            "progress": 4,
+        }
+    except Exception as e:
+        logger.error("Age estimation node failed: %s", e, exc_info=True)
+        current_year = datetime.utcnow().year
+        return {
+            "estimated_pub_year": current_year - 10,
+            "document_age": 10,
+            "stage": "Age estimation failed (using 10-year default)",
+            "progress": 3,
+        }
+
+
 async def style_analyze_node(state: AnalysisState) -> dict:
-    """Stage 0: Analyze writing style of the document (run once)."""
+    """Stage 1: Analyze writing style of the document (run once)."""
     logger.info("Orchestrator [style]: analyzing writing style for document %s", state["document_id"])
     await _update_analysis_progress(
         state, "Analyzing writing style", 5,
@@ -211,6 +257,8 @@ async def propose_node(state: AnalysisState) -> dict:
             research=state["research"],
             document_id=state["document_id"],
             paragraphs=state.get("paragraphs", []),
+            style_profile=state.get("style_profile"),
+            document_age=state.get("document_age"),
         )
         await _update_analysis_progress(
             state, "Proposals generated", 80,
@@ -272,9 +320,163 @@ def _check_source_relevance(proposal: ChangeProposal) -> float:
     return relevant_count / len(proposal.sources) if proposal.sources else 0.0
 
 
+def _detect_fabrication_signals(proposal: ChangeProposal) -> list[str]:
+    """
+    Detect signs that GPT may have fabricated content not supported by sources.
+    Returns a list of warning reasons (empty = no issues detected).
+    """
+    import re
+    warnings = []
+    new_lower = proposal.new_content.lower()
+    source_text = " ".join(
+        f"{s.source_title} {s.snippet}".lower() for s in proposal.sources
+    ) if proposal.sources else ""
+
+    # Check for specific dollar amounts / thresholds in new_content
+    # that don't appear in any source
+    dollar_amounts = re.findall(r'\$[\d,.]+\s*(?:billion|million|trillion|B|M|T)?', proposal.new_content, re.IGNORECASE)
+    for amount in dollar_amounts:
+        # Normalize for matching: strip $ and spaces
+        amount_core = amount.replace("$", "").replace(",", "").strip().split()[0]
+        if amount_core not in source_text and amount_core.replace(".", "") not in source_text:
+            warnings.append(f"Dollar amount '{amount}' not found in any source")
+
+    # Check for specific percentages not in sources
+    percentages = re.findall(r'\d+(?:\.\d+)?%', proposal.new_content)
+    for pct in percentages:
+        pct_num = pct.replace("%", "")
+        if pct_num not in source_text:
+            warnings.append(f"Percentage '{pct}' not found in any source")
+
+    # Check for invented successor names (e.g., "FireSat II", "XYZ-2")
+    # If new_content introduces a proper noun not in old_content OR sources
+    old_lower = proposal.old_content.lower()
+    new_proper_nouns = set(
+        w.strip(".,;:()\"'") for w in proposal.new_content.split()
+        if w and w[0].isupper() and len(w) >= 3
+    )
+    old_proper_nouns = set(
+        w.strip(".,;:()\"'") for w in proposal.old_content.split()
+        if w and w[0].isupper() and len(w) >= 3
+    )
+    novel_nouns = new_proper_nouns - old_proper_nouns
+    for noun in novel_nouns:
+        noun_lower = noun.lower()
+        if noun_lower not in source_text and len(noun) >= 4:
+            # Skip common words that happen to be capitalized (sentence starters)
+            common_starts = {
+                "the", "this", "these", "that", "such", "for", "more", "since",
+                "recent", "furthermore", "consequently", "however", "contrary",
+                "nasa", "esa",  # well-known abbreviations
+            }
+            if noun_lower not in common_starts:
+                warnings.append(f"Novel proper noun '{noun}' not found in sources")
+
+    return warnings
+
+
+def _detect_tense_fabrication(proposal: ChangeProposal) -> list[str]:
+    """
+    Detect cases where GPT presents something as completed/achieved when sources
+    only describe it as planned/proposed/tested. This catches subtle fabrications
+    like "oxygen was produced on the Moon in 2025" when sources only say "planned."
+    """
+    import re
+    warnings = []
+    if not proposal.sources:
+        return warnings
+
+    new_text = proposal.new_content.lower()
+    source_text = " ".join(
+        f"{s.source_title} {s.snippet}".lower() for s in proposal.sources
+    )
+
+    # Words that indicate something HAPPENED vs was PLANNED
+    completed_indicators = [
+        "enabled", "achieved", "produced", "demonstrated", "completed",
+        "successfully", "has been deployed", "was deployed", "landed",
+        "constructed", "built", "established", "operational since",
+    ]
+    planned_indicators = [
+        "planned", "proposed", "aims to", "expected to", "scheduled",
+        "will be", "to be launched", "under development", "in development",
+        "preparing for", "demonstration", "demo", "test", "prototype",
+        "concept", "feasibility",
+    ]
+
+    # For each "completed" claim in new_content, check if sources only mention it as "planned"
+    for indicator in completed_indicators:
+        if indicator in new_text:
+            # Find the sentence containing this indicator
+            sentences = re.split(r'[.!?]\s+', proposal.new_content)
+            for sent in sentences:
+                sent_lower = sent.lower()
+                if indicator in sent_lower:
+                    # Extract key nouns from this sentence to search in sources
+                    key_words = [w for w in sent_lower.split() if len(w) >= 5
+                                 and w not in {"which", "their", "these", "those", "about",
+                                               "being", "while", "after", "since", "through"}]
+                    # Check if sources only describe this as planned/proposed
+                    for kw in key_words[:5]:
+                        if kw in source_text:
+                            # Found the topic in sources — check tense context
+                            # Get surrounding context in source
+                            idx = source_text.index(kw)
+                            context = source_text[max(0, idx-100):idx+100]
+                            source_is_planned = any(p in context for p in planned_indicators)
+                            source_is_completed = any(c in context for c in completed_indicators)
+                            if source_is_planned and not source_is_completed:
+                                warnings.append(
+                                    f"Claim uses '{indicator}' but source context for '{kw}' "
+                                    f"only mentions planned/proposed status"
+                                )
+                            break  # Only check first matching keyword per sentence
+
+    return warnings
+
+
+def _compute_content_sourcing_score(proposal: ChangeProposal) -> float:
+    """
+    Measure what fraction of key facts in new_content are actually grounded
+    in source snippets. Returns 0.0 (nothing sourced) to 1.0 (fully sourced).
+    """
+    import re
+    if not proposal.sources:
+        return 0.0
+
+    source_text = " ".join(
+        f"{s.source_title} {s.snippet}".lower() for s in proposal.sources
+    )
+
+    # Extract verifiable facts from new_content:
+    # 1. Years (4-digit numbers that look like years)
+    # 2. Specific numbers (with units or context)
+    # 3. Proper nouns not in original
+    new_lower = proposal.new_content.lower()
+    old_lower = proposal.old_content.lower()
+
+    # Extract years from new_content that aren't in old_content
+    new_years = set(re.findall(r'\b(19\d{2}|20\d{2})\b', proposal.new_content))
+    old_years = set(re.findall(r'\b(19\d{2}|20\d{2})\b', proposal.old_content))
+    novel_years = new_years - old_years
+
+    # Extract numbers with context (e.g., "400 small satellites", "$365 million")
+    new_numbers = set(re.findall(r'\b(\d{2,})\b', proposal.new_content))
+    old_numbers = set(re.findall(r'\b(\d{2,})\b', proposal.old_content))
+    novel_numbers = new_numbers - old_numbers - new_years
+
+    # Combine all verifiable facts
+    all_facts = list(novel_years) + list(novel_numbers)
+    if not all_facts:
+        return 0.8  # No novel facts to verify — likely a qualitative rewrite, OK
+
+    sourced_count = sum(1 for fact in all_facts if fact in source_text)
+    return sourced_count / len(all_facts)
+
+
 async def validate_node(state: AnalysisState) -> dict:
     """Stage 4: Quality validation — cross-reference sources, check confidence,
-    and verify source-claim relevance."""
+    reject fabricated content, and verify source-claim relevance."""
     logger.info("Orchestrator [validate]: validating %d proposals", len(state["proposals"]))
     await _update_analysis_progress(
         state, "Validating proposals", 85,
@@ -288,17 +490,57 @@ async def validate_node(state: AnalysisState) -> dict:
             logger.info("Skipping no-change proposal: %s", proposal.change_id)
             continue
 
+        # ── Fabrication detection ─────────────────────────────────────
+        fab_warnings = _detect_fabrication_signals(proposal)
+
+        # ── Tense fabrication: "completed" claims sourced only as "planned" ──
+        tense_warnings = _detect_tense_fabrication(proposal)
+        if tense_warnings:
+            logger.warning(
+                "Tense fabrication in proposal %s: %s",
+                proposal.change_id, "; ".join(tense_warnings[:2]),
+            )
+            fab_warnings.extend(tense_warnings)
+
+        if len(fab_warnings) >= 3:
+            logger.warning(
+                "REJECTING proposal %s: %d fabrication signals detected: %s",
+                proposal.change_id, len(fab_warnings), "; ".join(fab_warnings[:3]),
+            )
+            continue
+        elif fab_warnings:
+            logger.warning(
+                "Fabrication signals in proposal %s (%d): %s — downgrading confidence",
+                proposal.change_id, len(fab_warnings), "; ".join(fab_warnings),
+            )
+            proposal.confidence = ConfidenceLevel.LOW
+
+        # ── Content-sourcing score: are facts in new_content backed by sources? ──
+        sourcing_score = _compute_content_sourcing_score(proposal)
+        if sourcing_score < 0.25:
+            # Less than 25% of novel facts traceable to sources → reject
+            logger.warning(
+                "REJECTING proposal %s: sourcing score %.0f%% — most facts unsupported by sources",
+                proposal.change_id, sourcing_score * 100,
+            )
+            continue
+        elif sourcing_score < 0.50:
+            # Less than 50% sourced → force LOW confidence
+            logger.info(
+                "Proposal %s: sourcing score %.0f%% — downgrading to LOW",
+                proposal.change_id, sourcing_score * 100,
+            )
+            proposal.confidence = ConfidenceLevel.LOW
+
         # ── Source-claim relevance check ──────────────────────────────
         relevance_ratio = _check_source_relevance(proposal)
         if relevance_ratio < 0.2:
-            # Less than 20% of sources mention claim entities → downgrade to LOW
             logger.warning(
                 "Proposal %s: only %.0f%% sources are content-relevant — downgrading to LOW",
                 proposal.change_id, relevance_ratio * 100,
             )
             proposal.confidence = ConfidenceLevel.LOW
         elif relevance_ratio < 0.5:
-            # Less than 50% relevant → cap at MEDIUM
             logger.info(
                 "Proposal %s: %.0f%% sources content-relevant — capping at MEDIUM",
                 proposal.change_id, relevance_ratio * 100,
@@ -314,16 +556,14 @@ async def validate_node(state: AnalysisState) -> dict:
 
         authoritative_count = gov_sources + academic_sources + industry_sources
 
-        # Only upgrade confidence if sources are also content-relevant
-        if relevance_ratio >= 0.5:
+        # Only upgrade if sources relevant, no fabrication, AND good sourcing score
+        if relevance_ratio >= 0.5 and not fab_warnings and sourcing_score >= 0.50:
             if gov_sources >= 1 and (academic_sources >= 1 or industry_sources >= 1):
                 proposal.confidence = ConfidenceLevel.HIGH
             elif authoritative_count >= 2:
-                proposal.confidence = ConfidenceLevel.HIGH
+                if proposal.confidence != ConfidenceLevel.HIGH:
+                    proposal.confidence = ConfidenceLevel.MEDIUM  # Cap at medium, not auto-high
             elif authoritative_count >= 1 or technical_sources >= 2:
-                if proposal.confidence == ConfidenceLevel.LOW:
-                    proposal.confidence = ConfidenceLevel.MEDIUM
-            elif len(proposal.sources) >= 3:
                 if proposal.confidence == ConfidenceLevel.LOW:
                     proposal.confidence = ConfidenceLevel.MEDIUM
 
@@ -373,13 +613,15 @@ def should_propose(state: AnalysisState) -> str:
 def build_graph() -> StateGraph:
     graph = StateGraph(AnalysisState)
 
+    graph.add_node("age_estimate", age_estimate_node)
     graph.add_node("style_analyze", style_analyze_node)
     graph.add_node("analyze", analyze_node)
     graph.add_node("research", research_node)
     graph.add_node("propose", propose_node)
     graph.add_node("validate", validate_node)
 
-    graph.set_entry_point("style_analyze")
+    graph.set_entry_point("age_estimate")
+    graph.add_edge("age_estimate", "style_analyze")
     graph.add_edge("style_analyze", "analyze")
 
     graph.add_conditional_edges("analyze", should_research, {
@@ -459,6 +701,8 @@ async def run_analysis(
         "text_content": text_content,
         "paragraphs": paragraphs,
         "focus_areas": focus_areas,
+        "estimated_pub_year": None,
+        "document_age": None,
         "style_profile": None,
         "claims": [],
         "research": {},

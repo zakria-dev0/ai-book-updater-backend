@@ -24,6 +24,10 @@ class ChangeType(str, Enum):
     REGULATION_UPDATE = "regulation_update"
     BUSINESS_MODEL_UPDATE = "business_model_update"
     HISTORICAL_CORRECTION = "historical_correction"
+    REFERENCE_UPDATE = "reference_update"
+    METHODOLOGY_UPDATE = "methodology_update"
+    LANDSCAPE_UPDATE = "landscape_update"
+    PREDICTION_UPDATE = "prediction_update"
     AI_PROMPT = "ai_prompt"
 
 
@@ -71,6 +75,10 @@ CLAIM_TYPE_TO_FOCUS_AREA = {
     "policy": FocusArea.BUSINESS_PHILOSOPHY,
     "regulation": FocusArea.BUSINESS_PHILOSOPHY,
     "citation": FocusArea.TECHNOLOGY,
+    "landscape": FocusArea.TECHNOLOGY,
+    "prediction": FocusArea.TECHNOLOGY,
+    "reference": FocusArea.HISTORICAL_FACTS,
+    "methodology": FocusArea.BUSINESS_PHILOSOPHY,
 }
 
 

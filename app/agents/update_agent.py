@@ -2,8 +2,8 @@
 Update Agent — uses GPT-4o to generate change proposals by comparing
 original text with research findings.
 
-Hardcoded for "Understanding Space: An Introduction to Astronautics" (4th Edition).
-- Book-specific system prompt with exact style rules and anti-patterns
+Generic for any technical textbook:
+- Dynamic style profile from document analysis (not hardcoded to any book)
 - Context-aware: GPT sees surrounding paragraphs for style continuity
 - Few-shot style examples (bad vs good) injected per change type
 - Multi-source synthesis (combines up to 5 sources into comprehensive updates)
@@ -32,263 +32,161 @@ RETRY_BASE_DELAY = 1
 MAX_CONCURRENT_PROPOSALS = 3  # Limit concurrent GPT calls — constrained by 30K TPM
 
 # ------------------------------------------------------------------ #
-# Reference: Document style profile metadata                          #
-# ------------------------------------------------------------------ #
-
-STYLE_PROFILE = {
-    "book_title": "Understanding Space: An Introduction to Astronautics",
-    "edition": "4th",
-    "chapter": 2,
-    "grade_level": "undergraduate_sophomore_junior",
-    "technical_depth": "intermediate",
-    "tone": "authoritative_accessible",
-    "voice": "active_preferred",
-    "passive_voice_ratio": 0.06,
-    "avg_sentence_length_words": 20,
-    "sentence_complexity": "mixed_short_and_long",
-    "terminology_level": "technical_with_inline_definitions",
-    "numbers_style": "specific_with_dual_units",
-    "paragraph_length_sentences": "4_to_7",
-    "narrative_style": "chronological_storytelling",
-    "acronym_rule": "spell_out_on_first_use_then_abbreviate",
-    "figure_reference_style": "(see Figure X-XX) or (Figure X-XX)",
-}
-
-# ------------------------------------------------------------------ #
-# System prompt — hardcoded for "Understanding Space" 4th Edition      #
+# System prompt — dynamic, adapts to any textbook via style profile    #
 # ------------------------------------------------------------------ #
 
 SYSTEM_PROMPT = """\
-You are an expert editor for "Understanding Space: An Introduction to Astronautics" (4th Edition),
-a widely-used undergraduate aerospace engineering and astronautics textbook written for college
-sophomore and junior level students in STEM programs.
+You are an expert editor for a technical textbook. Your task is to generate factually
+updated replacement text for outdated passages. The updated text must be INDISTINGUISHABLE
+from the original authors' writing style.
 
-Your task is to generate factually updated replacement text for outdated passages in this textbook.
-The updated text must be INDISTINGUISHABLE from the original authors' writing style.
-
-═══════════════════════════════════════════════════
+=======================================
 DOCUMENT WRITING STYLE — FOLLOW THIS PRECISELY
-═══════════════════════════════════════════════════
+=======================================
 
-GRADE LEVEL & AUDIENCE:
-- Undergraduate college level (sophomore/junior STEM students)
-- Readers have basic physics and math background but are not yet specialists
-- Assume the reader is intelligent but encountering many of these concepts for the first time
+{style_section}
 
-TONE:
-- Authoritative yet accessible — confident without being condescending
-- Educational and engaging — this is a textbook, not a journal paper
-- Slightly narrative — events are told as a story with historical context
-- Never use jargon without immediately defining it
+=======================================
+ABSOLUTE RULE: NO FABRICATION (CRITICAL)
+=======================================
 
-SENTENCE STRUCTURE:
-- Mix short sentences (10–15 words) with longer explanatory ones (25–35 words)
-- Average sentence length: ~20 words
-- ACTIVE VOICE strongly preferred — use passive voice sparingly (less than 10% of sentences)
-- Use transitional phrases to connect ideas: "For example,", "More recently,", "Despite this,",
-  "In contrast,", "As a result,", "Building on this,"
+You MUST ONLY include facts, numbers, dates, names, and events that appear in the
+provided RESEARCH SOURCES. This is the single most important rule.
 
-TECHNICAL TERMINOLOGY RULES (CRITICAL):
-- Always spell out acronyms on first use: "Low Earth Orbit (LEO)", "International Space Station (ISS)"
-- Define technical terms in parentheses on first use: "mega-constellations (large fleets of hundreds
-  or thousands of satellites)", "pushbroom sensor (a detector array that scans swaths of terrain
-  as the satellite passes overhead)"
-- After defining, use the short form freely: "LEO", "the ISS", "mega-constellations"
-- Include specific technical details: exact altitudes, masses, dates, counts, velocities
+NEVER:
+- Invent successor systems, missions, or versions (e.g., do NOT invent "FireSat II")
+- Fabricate dollar amounts, thresholds, or statistics not in sources
+- Claim specific dates/numbers unless a source explicitly states them
+- Assume outcomes for events your sources do not cover
+- Fill gaps in source data with plausible-sounding but unverified claims
 
-NUMBERS AND DATA:
-- Always include specific numbers — never say "many" when you can say "5,400"
-- Use dual units for physical measurements: "550 kilometers (342 miles)", "250 kg (550 lb)"
-- Spell out numbers under ten; use numerals for 10 and above: "three satellites", "24 satellites"
-- Include exact dates when known: "launched on September 27, 2021", "as of early 2024"
-- Dollar figures with context: "$10 billion in annual revenue"
+IF SOURCES ARE INSUFFICIENT:
+- Write a narrower but accurate update using only what sources confirm
+- Use phrases like "significant changes have occurred in this area since [year]"
+- It is MUCH better to be vague-but-correct than specific-but-fabricated
+- If sources are too weak to write a meaningful update, return {{"proposals": []}}
 
-STRUCTURE OF AN UPDATE (MANDATORY PATTERN):
-1. CORRECTION FIRST — If the original claim is now false, state the correction in sentence 1.
-   Do NOT bury the correction in the middle of the paragraph.
-2. CONTEXT — Explain what changed and briefly why (1–2 sentences)
-3. SIGNIFICANCE — Explain what this means for the field or the reader (1 sentence)
-4. TECHNICAL DETAIL — Include specific system names, dates, numbers (woven throughout)
+=======================================
+SPECIAL CASES
+=======================================
+
+TEXTBOOK EXAMPLES & HYPOTHETICAL SCENARIOS:
+- If the original text uses a hypothetical example for teaching (e.g., "FireSat",
+  "ExampleSat"), do NOT invent real-world successors or claim the example changed.
+- IMPORTANT: Even if a real-world entity shares the same name as the textbook example
+  (e.g., Muon Space's "FireSat" constellation), do NOT connect them — the textbook's
+  example is FICTIONAL and unrelated to any real company's product.
+- Instead, note whether the UNDERLYING CONCEPTS the example illustrates have evolved.
+- If the example itself is fine as-is for teaching, return {{"proposals": []}}.
+
+GENERAL PRINCIPLES & TIMELESS STATEMENTS:
+- If the original states a general truth that is STILL TRUE (e.g., "Space is expensive"),
+  do NOT rewrite it just because the document is old.
+- Only update if the core claim has materially changed.
+
+=======================================
+UPDATE STRUCTURE (CRITICAL)
+=======================================
+
+YOUR UPDATE MUST DESCRIBE THE CURRENT STATE OF AFFAIRS — NOT HISTORY.
+The reader already knows the old information. They need to know WHAT IS TRUE NOW.
+
+STRUCTURE:
+1. CORRECTION FIRST — State what is different NOW in sentence 1.
+   BAD: "Initiated by DARPA in the mid-1980s, the LightSat initiative aimed to..."
+   GOOD: "Small satellites have become a mainstream capability, with over 2,000 launched annually."
+2. SPECIFIC EVIDENCE — Include exact current data points FROM YOUR SOURCES (names, dates, numbers).
+3. CONTEXT — Briefly explain what changed (1-2 sentences).
+
+WRONG APPROACH (do NOT do this):
+- Do NOT write a HISTORY of the topic — the update should be about THE PRESENT
+- Do NOT explain how things developed over time — jump to the current state
+- Do NOT start with "Initiated by..." or "Originally developed..." or "The development of..."
+
+RIGHT APPROACH:
+- Lead with WHAT IS TRUE TODAY
+- Then optionally add 1-2 sentences of context about what changed
 
 PARAGRAPH LENGTH:
-- Match the original's scope: if original was 1 sentence → write 2–4 sentences
-- If original was a paragraph → write a comparable paragraph (4–7 sentences)
-- Never produce a one-word or one-clause update for a multi-sentence original
+- Match the original's scope: if original was 1 sentence, write 2-3 sentences
+- If original was a paragraph, write a comparable paragraph (4-6 sentences)
 
-WHAT THE ORIGINAL TEXT LOOKS LIKE (EXAMPLES FOR STYLE MATCHING):
+=======================================
+SOURCE USAGE RULES
+=======================================
 
-Example 1 — Active voice, specific data, narrative:
-"SpaceX developed the Falcon 9 (Figure 2-58) in part with financial and technical support from NASA
-as part of a program called Commercial Orbital Transportation Services (COTS) to create systems to
-transport cargo to and from the ISS. Under COTS, SpaceX developed the Falcon 9 rocket and Dragon
-spacecraft, while Orbital Sciences Corporation developed the Antares rocket and Cygnus spacecraft."
+1. ONLY use facts from the provided research sources — never from your training data
+2. Prioritize: government/official sources > academic/industry > general news
+3. If a source is clearly about a DIFFERENT topic than the claim, IGNORE that source
+4. Cross-reference: if only one low-quality source supports a fact, mark confidence "low"
+5. Every specific claim in new_content must be traceable to a provided source
+6. CHECK SOURCE DATES — if a source is from before 2020, its data may be outdated.
+   Prefer facts from the most recent sources. If the only source for a number is
+   from 2010, note the date in your update or skip that fact.
+7. TENSE ACCURACY — if a source says something is "planned", "proposed", "expected",
+   or "under development", do NOT present it as completed or achieved. Use the SAME
+   tense as the source. Getting tense wrong is a FACTUAL ERROR.
 
-Example 2 — Accessible technical depth with definition:
-"Most communications services are provided by satellites in geosynchronous orbit, at an altitude of
-approximately 36,000 kilometers, where orbital velocity matches the speed of the Earth's rotation,
-making the satellite appear stationary as we'll explore in Chapters 4 and 5."
+=======================================
+CONFIDENCE SCORING (STRICT)
+=======================================
 
-Example 3 — Historical narrative style:
-"After the Space Shuttle Columbia was lost on re-entry on February 1, 2003, the U.S. decided to
-retire the Space Shuttle after the ISS was complete; the last Shuttle mission, STS-135, flew in
-July 2011."
+"high" — 2+ authoritative sources (government/academic) directly confirm the update
+"medium" — 1 authoritative source OR 2+ news/commercial sources confirm the update
+"low" — Only indirect/tangential sources available, or sources are about related but
+         different topics. MOST updates should be "medium" or "low".
 
-Example 4 — Company/mission update with context:
-"In the United States, a lack of commercial business caused Boeing and Lockheed Martin to merge
-their Delta and Atlas rocket programs into a joint venture, United Launch Alliance (ULA), which
-sells rockets primarily to U.S. government customers. More recently, SpaceX has entered the
-commercial launch market with its Falcon 9 rocket, launching its first commercial communications
-satellite in late 2013."
+If you are unsure whether sources truly support your update, use "low".
 
-═══════════════════════════════════════════════════
-UPDATE GENERATION RULES
-═══════════════════════════════════════════════════
+=======================================
+WHAT NOT TO DO
+=======================================
 
-1. VERIFY THE CORE CLAIM FIRST:
-   Before writing the update, determine: Is the original claim still true today?
-   - If FALSE → Begin with the correction. Example: "Landsat-9, launched on September 27, 2021,
-     has since joined the fleet as the most recent addition..."
-   - If OUTDATED/INCOMPLETE → Expand with current data while correcting what's stale.
-   - If STILL TRUE but needs detail → Add context and updated numbers.
+- Do NOT use passive voice as the primary voice
+- Do NOT start with "It is worth noting..." or "It should be mentioned..."
+- Do NOT use hedging language when facts are clearly stated in sources
+- Do NOT write in news article style — this is textbook prose
+- Do NOT use bullet points — flowing prose only
+- Do NOT open any sentence with "As of [year]," — put the subject first
+- Do NOT end with editorial commentary ("This highlights...", "This underscores...")
+- Do NOT use participial editorial phrases ANYWHERE:
+  BANNED: "highlighting the...", "underscoring the...", "marking ... as a pivotal...",
+  "thereby addressing...", "reflecting the...", "signaling the..."
+- Do NOT use "significant", "crucial", "important", "pivotal", "notable", "assertive",
+  "bold", "unprecedented", "sweeping" filler adjectives
+- Do NOT use "thereby" — it is always editorial filler
+- Do NOT use vague references like "this trend", "this shift", "this evolution" — name the SPECIFIC thing
+- Do NOT use "exemplifies", "exemplified by", "epitomizes", "embodies" — just state the fact directly
+- Do NOT use clichés: "paving the way", "ushering in a new era", "on the cusp of",
+  "poised to", "a testament to", "a harbinger of", "at the forefront"
+- Do NOT start sentences with "Such innovations..." or "Such advancements..." — name WHAT specifically
+- Do NOT use "highlights the development of" — just describe the development directly
+- Do NOT write about HISTORY — your update must describe WHAT IS TRUE NOW, not how we got here
+- The LAST sentence must state a SPECIFIC FACT (name, date, number) — never an interpretation
 
-2. SYNTHESIZE MULTIPLE SOURCES (MANDATORY — DO NOT SKIP):
-   - Extract KEY FACTS from EVERY provided source, not just Source 1
-   - Cross-reference data points — if two NASA sources agree on a number, use it confidently
-   - Prioritize: NASA/ESA/government sources > academic/industry > general news
-   - If sources tell a chronological story (mission launched → problem occurred → resolution),
-     your new_content MUST cover the FULL ARC, not just the beginning
-   - If a mission had a major anomaly, crew stranding, extended delay, or dramatic outcome,
-     you MUST describe what happened and how it was resolved
-   - If a vehicle returned, was decommissioned, or a program concluded, include the final status
-   - DO NOT write a generic summary when your sources contain specific dramatic events
-
-3. DATE AWARENESS (CRITICAL):
-   - Today's date will be provided in the user prompt as "TODAY'S DATE: YYYY-MM-DD"
-   - If a scheduled/target date in your sources has ALREADY PASSED and no confirmation of
-     the event occurring exists in the sources, you MUST state the event has been delayed
-     and no confirmed date has been announced
-   - NEVER present a past date as an upcoming future target
-   - Example: If today is 2026-03-01 and a source says "Artemis II targets September 2025"
-     but no source confirms it launched → write "Artemis II has been delayed beyond its
-     original September 2025 target, with no confirmed launch date as of early 2026"
-
-5. INCLUDE SPECIFIC TECHNICAL DETAILS:
-   - Mission names and designations (Crew Dragon Endeavour, Soyuz MS-25)
-   - Exact numbers (5,400 satellites, 550 km orbit, $2.7 billion contract)
-   - Dates (launched November 2020, as of February 2024)
-   - System specifications when relevant (pushbroom vs. whiskbroom, LEO vs. GEO)
-
-6. FOR CONSTELLATION / MEGA-CONSTELLATION UPDATES:
-   - State current constellation size with exact number and date
-   - Contrast with what the book said (e.g., "dozens" → now "thousands")
-   - Name the major players: Starlink, OneWeb, Amazon Kuiper, Chinese Guowang
-   - Mention key engineering implications: orbital debris, spectrum coordination,
-     inter-satellite laser links, LEO broadband coverage
-   - Include growth trajectory if relevant
-
-7. FOR COMPANY STATUS UPDATES:
-   - If a company went bankrupt or shut down → STATE THIS IN SENTENCE 1
-   - If leadership changed → mention who leads now and when change occurred
-   - If a program was cancelled → say so explicitly, don't soften with "faced challenges"
-
-8. FIGURE REFERENCES:
-   - Preserve any existing figure references from the original: "(see Figure 2-41)"
-   - If the original referenced a figure, keep that reference in your update
-
-9. WHAT NOT TO DO:
-   - Do NOT use passive voice as the primary voice
-   - Do NOT start updates with "It is worth noting that..." or "It should be mentioned..."
-   - Do NOT use hedging language like "may have" or "could potentially" when facts are known
-   - Do NOT write in a news article style (no inverted pyramid, no "According to...")
-   - Do NOT use bullet points — this is flowing prose
-   - Do NOT plagiarize source snippets — write in the textbook's own voice
-   - Do NOT bury the correction in paragraph 2 after context-setting
-   - Do NOT open any sentence with "As of [year]," — rephrase to put the subject first
-   - Split any sentence over 35 words into two sentences at a natural conjunction or em-dash
-
-═══════════════════════════════════════════════════
-FORBIDDEN ENDING PATTERNS (CRITICAL — YOUR OUTPUT WILL BE REJECTED IF VIOLATED)
-═══════════════════════════════════════════════════
-
-NEVER end your new_content with ANY of these editorial commentary patterns:
-   - "This highlights..."
-   - "This underscores..."
-   - "This demonstrates..."
-   - "This marks a significant..."
-   - "This shift underscores..."
-   - "...highlighting the challenges..."
-   - "...highlighting the complexities..."
-   - "...underscoring the importance..."
-
-These are editorial opinions, NOT factual textbook writing. The textbook NEVER editorializes.
-
-INSTEAD, end on a SPECIFIC FACT — a date, a number, a technical detail, or a concrete outcome.
-
-FORBIDDEN ENDING EXAMPLE:
-  "This highlights the challenges faced by private ventures in executing complex
-   interplanetary missions."
-
-CORRECT ENDING EXAMPLE:
-  "The company's assets were liquidated in early 2019 after a Swiss court ruling."
-
-FORBIDDEN ENDING EXAMPLE:
-  "This shift underscores the challenges of private missions requiring substantial
-   governmental resources."
-
-CORRECT ENDING EXAMPLE:
-  "Tito subsequently booked two seats on SpaceX's planned Starship lunar flyby mission,
-   announced in October 2022."
-
-═══════════════════════════════════════════════════
-MINIMUM QUALITY REQUIREMENTS (CRITICAL — ALL UPDATES MUST MEET THESE)
-═══════════════════════════════════════════════════
-
-Regardless of topic simplicity, EVERY update must be written at college-senior aerospace textbook level.
-Even for simple factual updates (company went bankrupt, mission was canceled), you MUST provide:
-
-1. MINIMUM 3 SENTENCES — Never write fewer than 3 sentences for any update.
-2. TECHNICAL CONTEXT — Include at least one technical detail (vehicle name, orbit type,
-   mission architecture, propulsion system, payload capacity, etc.)
-3. SPECIFIC NUMBERS — At least 2 specific data points (dates, dollar amounts, masses,
-   distances, satellite counts, crew sizes, etc.)
-4. FIELD IMPLICATIONS — One sentence explaining what happened next or what this means
-   for the broader aerospace ecosystem (but state it as FACT, not editorial opinion).
-
-NEVER write in news-brief style. A news brief says:
-  "XCOR filed for bankruptcy in 2017, halting the Lynx project."
-
-A TEXTBOOK says:
-  "XCOR Aerospace ceased operations in 2017 after filing for bankruptcy, ending development
-   of its Lynx suborbital spaceplane before the vehicle completed test flights. The company
-   had made notable technical progress — including successfully testing a liquid-oxygen
-   piston pump capable of supplying the Lynx main engines — but encountered financial
-   difficulties following the departure of key co-founders in 2015. The Lynx's horizontal
-   takeoff and landing design, intended to enable multiple flights per day at low operating
-   cost, represented an innovative approach that other suborbital vehicle developers continue
-   to explore."
-
-═══════════════════════════════════════════════════
+=======================================
 OUTPUT FORMAT
-═══════════════════════════════════════════════════
+=======================================
 
-Return a JSON object with a "proposals" array. Each proposal must include:
+Return JSON:
 {{
   "proposals": [
     {{
       "old_content": "exact original text being replaced",
-      "new_content": "updated replacement text matching book style — MUST end on a specific fact, NOT editorial commentary",
-      "change_type": one of: "tech_update" | "mission_update" | "constellation_update" |
-                    "statistics_update" | "company_update" | "historical_correction" |
-                    "system_update" | "regulation_update" | "business_model_update",
-      "confidence": "high" | "medium" | "low",
-      "core_claim_status": "false" | "outdated" | "incomplete" | "still_true",
-      "reasoning": "One sentence: what changed and which sources confirm it"
+      "new_content": "updated text matching book style — every fact sourced",
+      "change_type": "tech_update"|"mission_update"|"constellation_update"|
+                    "statistics_update"|"company_update"|"historical_correction"|
+                    "system_update"|"regulation_update"|"business_model_update"|
+                    "reference_update"|"methodology_update"|"landscape_update"|"prediction_update",
+      "confidence": "high"|"medium"|"low",
+      "core_claim_status": "false"|"outdated"|"incomplete"|"still_true",
+      "reasoning": "What changed + which specific source(s) confirm it"
     }}
   ]
 }}
 
-If no update is warranted, return {{"proposals": []}}.
-Return ONLY valid JSON — no markdown fences, no extra text outside the JSON.
+If no update is warranted or sources are insufficient, return {{"proposals": []}}.
+Return ONLY valid JSON — no markdown fences, no extra text.
 """
 
 # ------------------------------------------------------------------ #
@@ -356,11 +254,79 @@ _EXAMPLE_TYPE_MAP = {
     "tech_update": "tech_update",
     "statistics_update": "tech_update",
     "system_update": "tech_update",
+    "landscape_update": "tech_update",
+    "reference_update": "tech_update",
+    "methodology_update": "tech_update",
+    "prediction_update": "mission_update",
     "mission_update": "mission_update",
     "constellation_update": "mission_update",
     "regulation_update": "mission_update",
     "regulatory_update": "mission_update",
 }
+
+
+def _build_style_section(style_profile: dict | None) -> str:
+    """
+    Build the DOCUMENT WRITING STYLE section dynamically from the style profile
+    detected during analysis. Falls back to sensible defaults if no profile available.
+    """
+    if not style_profile:
+        style_profile = {}
+
+    grade = style_profile.get("grade_level", "college_senior")
+    depth = style_profile.get("technical_depth", "intermediate")
+    tone = style_profile.get("tone", "formal_academic")
+    complexity = style_profile.get("sentence_complexity", "moderate")
+    terminology = style_profile.get("terminology_level", "technical")
+    avg_length = style_profile.get("avg_sentence_length", 25)
+    passive = style_profile.get("passive_voice_usage", "moderate")
+
+    # Map grade levels to audience descriptions
+    grade_desc = {
+        "college_freshman": "college freshman level — accessible with minimal prerequisites",
+        "college_junior": "college sophomore/junior level — assumes foundational coursework",
+        "college_senior": "college senior level — assumes substantial technical background",
+        "graduate": "graduate level — assumes advanced domain knowledge",
+    }.get(grade, "college level")
+
+    # Map tone to writing guidance
+    tone_desc = {
+        "conversational": "Conversational and engaging — use first person, contractions are acceptable",
+        "formal_academic": "Formal academic — no contractions, precise language, scholarly register",
+        "authoritative": "Authoritative yet accessible — confident without being condescending",
+    }.get(tone, "Formal and precise")
+
+    # Map passive voice
+    voice_guidance = {
+        "rare": "ACTIVE VOICE strongly preferred — use passive voice sparingly (less than 10%)",
+        "moderate": "Mix active and passive voice naturally — prefer active for clarity",
+        "frequent": "Passive voice is acceptable per the document's existing style",
+    }.get(passive, "Prefer active voice")
+
+    return f"""GRADE LEVEL & AUDIENCE:
+- {grade_desc}
+- Technical depth: {depth}
+
+TONE:
+- {tone_desc}
+- Never use jargon without defining it on first use
+
+SENTENCE STRUCTURE:
+- Sentence complexity: {complexity}
+- Average sentence length: ~{avg_length} words
+- {voice_guidance}
+- Use transitional phrases: "For example,", "More recently,", "In contrast,"
+
+TERMINOLOGY:
+- Level: {terminology}
+- Always spell out acronyms on first use
+- Define technical terms in parentheses on first use
+- Include specific technical details: exact numbers, dates, names
+
+NUMBERS AND DATA:
+- Always include specific numbers — never say "many" when you can say an exact count
+- Include exact dates when known
+- Use dual units for measurements when the original does so"""
 
 
 def _get_style_example(claim_type: str) -> str:
@@ -382,23 +348,82 @@ def _get_style_example(claim_type: str) -> str:
 # Each regex matches a final sentence that starts with one of these editorial phrases.
 import re as _re
 
+# Editorial verbs (base forms) that GPT uses for commentary
+_EDITORIAL_VERBS_BASE = (
+    r'(?:highlight|underscore|demonstrate|mark|illustrate|showcase|emphasize|'
+    r'signal|reflect|reveal|underscore|indicate|suggest|point\s+to|show)'
+)
+# -ing forms
+_EDITORIAL_GERUNDS = (
+    r'(?:highlighting|underscoring|demonstrating|marking|illustrating|showcasing|'
+    r'emphasizing|signaling|reflecting|revealing|indicating|suggesting|addressing)'
+)
+
 _FORBIDDEN_ENDING_PATTERNS = [
+    # Pattern 1: Last sentence starting with "This/These/Such" + editorial verb or filler
+    # "This highlights...", "These changes underscore...", "Such innovations are paving..."
     _re.compile(
         r'\.\s+'
         r'(?:This|These|Such|The shift|The change|The move|The transition)'
-        r'\s+'
-        r'(?:highlight|underscore|demonstrate|mark|illustrate|showcase|emphasize|signal|reflect|reveal)'
-        r's?\s+'
+        r'\s+(?:\w+\s+)?'  # optional word like "development" before verb
+        r'(?:'
+        + _EDITORIAL_VERBS_BASE +
+        r's?'
+        r'|(?:are|is|were|was)\s+(?:paving|ushering|driving|fueling|enabling|transforming|reshaping|revolutionizing)'
+        r')\s+'
         r'.{10,}$',
         _re.IGNORECASE,
     ),
+    # Pattern 2: Sentence containing editorial gerund + abstract noun
+    # "...highlighting the challenges/importance/dynamics..."
     _re.compile(
-        r'\.\s+'
-        r'.{0,30}'
-        r'(?:highlighting|underscoring|demonstrating|marking|illustrating|showcasing|emphasizing|signaling)'
+        r'[.,]\s+'
+        r'.{0,40}'
+        + _EDITORIAL_GERUNDS +
         r'\s+(?:the\s+)?'
-        r'(?:challenges|complexities|difficulties|importance|significance|immense|growing)'
-        r'.{5,}$',
+        r'(?:challenges?|complexities|difficulties|importance|significance|immense|'
+        r'growing|urgency|dynamics|shift|need|evolution|transformation|trajectory|'
+        r'pivotal|nature|scope|extent|breadth|depth|scale)'
+        r'.{3,}$',
+        _re.IGNORECASE,
+    ),
+    # Pattern 3: ", [gerund] the [adjective] [noun]..." anywhere near the end
+    # "..., highlighting the urgent need for..."
+    _re.compile(
+        r',\s*'
+        + _EDITORIAL_GERUNDS +
+        r'\s+(?:the\s+)?'
+        r'(?:urgent|growing|increasing|critical|immense|significant|pressing|'
+        r'ongoing|continued|escalating|rapid|unprecedented|profound|broader|'
+        r'evolving|changing|shifting|new|complex|mounting|stark|clear|evident)'
+        r'\s+\w+'
+        r'.{0,80}$',
+        _re.IGNORECASE,
+    ),
+    # Pattern 4: "thereby [gerund]..." — always editorial
+    # "..., thereby addressing these growing challenges"
+    _re.compile(
+        r',?\s*thereby\s+\w+ing\s+.{5,}$',
+        _re.IGNORECASE,
+    ),
+    # Pattern 5: ", marking [X] as a [anything]..." — always editorial
+    # Catches: "marking 2025 as a pivotal year", "marking 2025 as a year for structural changes"
+    _re.compile(
+        r',\s*marking\s+.{0,40}\s+as\s+.{5,}$',
+        _re.IGNORECASE,
+    ),
+    # Pattern 6: Last sentence with editorial verb as main verb
+    # "..., [subject] underscore/highlight/illustrate [the] [abstract noun]..."
+    # Catches: "collaborations underscore the geopolitical dynamics...",
+    #          "highlight ongoing efforts to establish..."
+    _re.compile(
+        r'\.\s+.{0,200}'
+        + _EDITORIAL_VERBS_BASE +
+        r's?\s+(?:the\s+)?'
+        r'(?:geopolitical|broader|growing|shifting|evolving|changing|complex|'
+        r'increasing|ongoing|underlying|profound|stark|critical|urgent)'
+        r'\s+\w+'
+        r'.{0,80}$',
         _re.IGNORECASE,
     ),
 ]
@@ -408,14 +433,161 @@ def _fix_forbidden_endings(text: str) -> str:
     """
     Remove editorial commentary sentences from the end of generated text.
     These sentences add no factual value and violate the textbook style.
+    Handles both full-sentence patterns (remove from the preceding period)
+    and mid-sentence comma patterns (remove from the comma).
+    Applies iteratively — a single proposal may have multiple editorial phrases.
     """
-    for pattern in _FORBIDDEN_ENDING_PATTERNS:
+    changed = True
+    while changed:
+        changed = False
+        for pattern in _FORBIDDEN_ENDING_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                # Determine cut point: if match starts at a period, keep the period;
+                # if it starts at a comma, cut at the comma and add a period instead
+                match_char = text[match.start()]
+                if match_char == ',':
+                    cleaned = text[:match.start()].rstrip() + "."
+                else:
+                    cleaned = text[:match.start() + 1].strip()  # +1 to keep the period
+                if len(cleaned) > 20:  # Safety: don't reduce to near-empty
+                    text = cleaned
+                    changed = True
+                    break  # Restart pattern scan on shortened text
+    return text
+
+
+# ------------------------------------------------------------------ #
+# Post-processing: mid-text editorial cleanup                          #
+# ------------------------------------------------------------------ #
+
+# Filler adjectives/adverbs to strip (GPT adds these despite instructions)
+_FILLER_WORDS = _re.compile(
+    r'\b(significantly|substantial|substantially|crucially|notably|remarkably|'
+    r'dramatically|fundamentally|profoundly|critically|immensely|tremendously|'
+    r'pivotal|pivotally|pioneering)\b\s*',
+    _re.IGNORECASE,
+)
+
+# "significant" before a noun — replace with nothing or a neutral word
+# "a significant growth phase" → "a growth phase"
+_SIGNIFICANT_ADJ = _re.compile(
+    r'\b(significant|crucial|critical|pivotal|notable|remarkable|dramatic|immense|tremendous|'
+    r'assertive|aggressive|bold|unprecedented|sweeping|paradigm)\s+',
+    _re.IGNORECASE,
+)
+
+# Mid-text editorial verb patterns: "underscores the urgent need", "reflects the growing..."
+# These rewrite the clause to remove the editorial framing
+_MIDTEXT_EDITORIAL = [
+    # ", underscores/highlights [adj] need/efforts..." → remove that clause
+    # Catches both "highlight the ongoing need" and "highlight ongoing efforts"
+    _re.compile(
+        r',?\s*'
+        r'(?:underscores?|highlights?|reflects?|illustrates?|demonstrates?|showcases?|emphasizes?|reveals?)'
+        r'\s+(?:the\s+)?'
+        r'(?:urgent|growing|critical|pressing|increasing|escalating|continued|ongoing|clear|stark|evident)'
+        r'\s+'
+        r'(?:need|importance|challenge|threat|risk|demand|concern|requirement|imperative|efforts?|push|drive|trend)'
+        r'(?:\s+(?:for|of|to|toward|towards|in)\s+[^.]{5,80})?'
+        r'\.',
+        _re.IGNORECASE,
+    ),
+    # ", reflecting/indicating a/the [noun phrase]" → replace with period
+    _re.compile(
+        r',\s*(?:reflecting|indicating|suggesting|signaling)\s+(?:a|the|an)\s+[^.]{10,80}\.',
+        _re.IGNORECASE,
+    ),
+    # "exemplifies this trend" — vague editorial reference
+    _re.compile(
+        r'\s+(?:exemplifies?|epitomizes?|typifies?|embodies?)\s+this\s+'
+        r'(?:trend|shift|transition|evolution|movement|development)\b',
+        _re.IGNORECASE,
+    ),
+]
+
+# Cliché phrases to remove entirely (replaced with nothing)
+_CLICHE_PHRASES = _re.compile(
+    r'(?:,?\s*paving the way for [^.]{5,60}\.?'
+    r'|,?\s*ushering in (?:a |an )?[^.]{5,50}\.?'
+    r'|,?\s*on the cusp of [^.]{5,40}\.?'
+    r'|,?\s*poised to [^.]{5,60}\.?'
+    r'|,?\s*a testament to [^.]{5,60}\.?'
+    r'|,?\s*at the forefront of [^.]{5,50}\.?'
+    r'|,?\s*a harbinger of [^.]{5,50}\.?)',
+    _re.IGNORECASE,
+)
+
+# "Such innovations/advancements..." starter — replace with specific subject
+_SUCH_STARTER = _re.compile(
+    r'(?:Such|These)\s+(?:innovations?|advancements?|developments?|efforts?|initiatives?|achievements?)'
+    r'\s+(?:are|is|have|has|were|was)\s+',
+    _re.IGNORECASE,
+)
+
+
+def _clean_midtext_editorial(text: str) -> str:
+    """
+    Remove filler adjectives/adverbs and mid-text editorial phrases.
+    Unlike _fix_forbidden_endings which trims from the end, this cleans
+    editorial language embedded anywhere in the text.
+    """
+    # Step 1: Remove filler adverbs (significantly, substantially, etc.)
+    text = _FILLER_WORDS.sub('', text)
+
+    # Step 2: Remove filler adjectives before nouns (significant growth → growth)
+    text = _SIGNIFICANT_ADJ.sub('', text)
+
+    # Step 2b: Replace editorial verb + "the development/progress of" with neutral "includes"
+    # "highlights the development of X" → "includes the development of X"
+    text = _re.sub(
+        r'\b(?:highlights?|underscores?|showcases?|illustrates?|demonstrates?)\s+'
+        r'(the\s+(?:development|creation|emergence|evolution|rise|growth|expansion|'
+        r'progress|advancement|deployment)\s+of\s+)',
+        r'includes \1',
+        text,
+        flags=_re.IGNORECASE,
+    )
+
+    # Step 2c: Replace "exemplified by" with "such as" (neutral alternative)
+    text = _re.sub(
+        r'\b(?:exemplified|epitomized|typified|embodied)\s+by\b',
+        'such as',
+        text,
+        flags=_re.IGNORECASE,
+    )
+
+    # Step 3: Remove mid-text editorial clauses
+    for pattern in _MIDTEXT_EDITORIAL:
         match = pattern.search(text)
         if match:
-            # Remove the forbidden sentence, keep everything before it
-            cleaned = text[:match.start() + 1].strip()  # +1 to keep the period
-            if len(cleaned) > 20:  # Safety: don't reduce to near-empty
-                return cleaned
+            # Replace the editorial clause with just a period
+            text = text[:match.start()] + "." + text[match.end():]
+
+    # Step 3b: Remove cliché phrases ("paving the way", "ushering in", etc.)
+    text = _CLICHE_PHRASES.sub('.', text)
+
+    # Step 3c: Replace "highlights/demonstrates the potential for" with neutral phrasing
+    text = _re.sub(
+        r'\b(?:highlights?|demonstrates?|showcases?|underscores?)\s+the\s+potential\s+(?:for|of)\b',
+        'shows the feasibility of',
+        text,
+        flags=_re.IGNORECASE,
+    )
+
+    # Step 4: Clean up double spaces and awkward punctuation
+    text = _re.sub(r'\s+,', ',', text)     # extra space before comma ("progressed , particularly")
+    text = _re.sub(r'\s+\.', '.', text)    # extra space before period
+    text = _re.sub(r'\s{2,}', ' ', text)   # double spaces
+    text = _re.sub(r'\.\s*\.', '.', text)  # double periods
+    text = _re.sub(r',\s*\.', '.', text)   # comma before period
+
+    # Step 5: Fix a/an grammar (removing adjectives can leave "a" before vowels)
+    text = _re.sub(r'\ba\s+([aeiouAEIOU])', r'an \1', text)
+    # Also fix "an" before consonants if somehow introduced
+    text = _re.sub(r'\ban\s+([bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ])', r'a \1', text)
+    text = text.strip()
+
     return text
 
 
@@ -436,14 +608,23 @@ def _count_sentences(text: str) -> int:
     """Count approximate number of sentences in text."""
     if not text:
         return 0
-    # Count sentence-ending punctuation followed by space+uppercase or end
-    parts = _SENTENCE_SPLIT.split(text)
-    # The number of sentences = number of splits + 1 (if text ends with punctuation)
+    # Count sentence boundaries: punctuation followed by space+uppercase or end-of-string
+    # The $-alternative already counts the final sentence, so do NOT add +1 again.
     count = len(_SENTENCE_SPLIT.findall(text))
-    # If text ends with sentence-ending punctuation, add 1 for the last sentence
-    if text.rstrip()[-1:] in '.!?':
+    # Only add 1 if text does NOT end with punctuation (trailing sentence without period)
+    if text.rstrip() and text.rstrip()[-1:] not in '.!?':
         count += 1
     return max(count, 1)
+
+
+def _fix_truncated_start(new_content: str) -> str:
+    """
+    Fix proposals that start with lowercase (truncated/malformed GPT output).
+    If the first character is lowercase, capitalize it.
+    """
+    if new_content and new_content[0].islower():
+        new_content = new_content[0].upper() + new_content[1:]
+    return new_content
 
 
 def _passes_quality_check(new_content: str) -> bool:
@@ -499,20 +680,37 @@ FOCUS AREAS FOR THIS ANALYSIS: {focus_areas}
 RESEARCH FINDINGS FROM AUTHORITATIVE SOURCES:
 {research_results}
 
-DOCUMENT STYLE PROFILE SUMMARY:
-- Grade: Undergraduate STEM textbook (sophomore/junior level)
-- Tone: Authoritative yet accessible, narrative, educational
-- Voice: ACTIVE preferred, ~20 words/sentence average
-- Terminology: Define acronyms and jargon on first use
-- Numbers: Always specific — exact dates, dual units, real figures
+{source_quality_note}
+
+DOCUMENT STYLE (from analysis):
+{style_summary}
 {style_example}
 
 TASK:
-1. First, identify the CORE CLAIM in the original text (one sentence).
-2. Determine if that core claim is: false / outdated / incomplete / still_true.
-3. If false or outdated — begin your new_content with the correction.
-4. Write updated replacement text in the EXACT style of the textbook.
-5. Match the original's length (sentence for sentence, paragraph for paragraph).
+1. Identify the CORE CLAIM in the original text.
+2. Determine: is it false / outdated / incomplete / still_true?
+3. Check if this is a textbook EXAMPLE or HYPOTHETICAL — if so, only update if the
+   underlying concept has changed. Do NOT invent successors to fictional examples.
+4. Review each source — does it ACTUALLY relate to this specific claim? Ignore irrelevant sources.
+5. Write the update describing WHAT IS TRUE NOW — not a history lesson.
+   WRONG: "The LightSat concept was initiated by DARPA in the 1980s and led to..."
+   RIGHT: "Small satellites now represent a mainstream capability in the space industry,
+           with commercial operators launching thousands of satellites annually."
+6. Use ONLY facts from the relevant sources. Do NOT add facts from memory.
+7. If sources don't provide enough information to write a meaningful update, return empty proposals.
+
+CRITICAL WRITING CHECK — before finalizing your new_content, verify:
+- Does sentence 1 describe the CURRENT STATE? (Not history, not background)
+- Does every sentence contain at least one specific fact from sources?
+- Is the last sentence a SPECIFIC FACT (name, date, number)?
+- Did you avoid ALL banned phrases (check the WHAT NOT TO DO list)?
+
+MANDATORY SOURCE CHECK:
+Go through every sentence in your new_content and ask:
+- "Which source explicitly states this fact?" If you cannot point to a source → DELETE that sentence.
+- "Did I add any adjective, number, date, or name not in the sources?" If yes → REMOVE it.
+- "Is this claim from my training data rather than the provided sources?" If yes → REMOVE it.
+If after removing unsourced sentences you have fewer than 2 sentences, return empty proposals.
 
 Return valid JSON only.
 """
@@ -532,6 +730,8 @@ class UpdateAgent:
         research: Dict[str, List[ResearchResult]],
         document_id: str,
         paragraphs: Optional[List[str]] = None,
+        style_profile: Optional[dict] = None,
+        document_age: Optional[int] = None,
     ) -> List[ChangeProposal]:
         """
         For each claim that has research results, ask GPT-4o to generate
@@ -542,7 +742,11 @@ class UpdateAgent:
             research: Dict mapping claim_id -> list of research results
             document_id: The document being analyzed
             paragraphs: Full list of document paragraphs for surrounding context
+            style_profile: Document style profile from analysis (grade, tone, etc.)
+            document_age: Estimated document age in years (for context in prompts)
         """
+        self._style_profile = style_profile
+        self._document_age = document_age
         if not settings.OPENAI_API_KEY:
             logger.warning("OpenAI API key not configured — skipping proposal generation")
             return []
@@ -598,9 +802,28 @@ class UpdateAgent:
         # Build surrounding context (±2 paragraphs around the claim)
         context = self._build_context(claim.paragraph_idx, paragraphs)
 
-        # Build research results text — use ALL sources (up to 5) for synthesis
+        # ── Pre-filter sources: remove irrelevant ones before sending to GPT ──
+        # Only keep sources with relevance >= 0.30 (already scored by research_service)
+        MIN_SOURCE_RELEVANCE = 0.30
+        filtered_sources = [s for s in sources if s.relevance_score >= MIN_SOURCE_RELEVANCE]
+        if len(filtered_sources) < len(sources):
+            dropped = len(sources) - len(filtered_sources)
+            logger.info(
+                "Pre-filtered %d/%d low-relevance sources for claim %s",
+                dropped, len(sources), claim.claim_id,
+            )
+
+        # If no sources pass the filter, use the best available (top 2) but mark as weak
+        if not filtered_sources and sources:
+            filtered_sources = sorted(sources, key=lambda s: s.relevance_score, reverse=True)[:2]
+            logger.info(
+                "No high-relevance sources for claim %s — using top %d (best score=%.2f)",
+                claim.claim_id, len(filtered_sources), filtered_sources[0].relevance_score,
+            )
+
+        # Build research results text — use filtered sources (up to 5)
         source_texts = []
-        for i, s in enumerate(sources[:5]):
+        for i, s in enumerate(filtered_sources[:5]):
             source_texts.append(
                 f"Source {i+1} [{s.source_type}, relevance={s.relevance_score:.2f}]: {s.source_title}\n"
                 f"  URL: {s.source_url}\n"
@@ -612,18 +835,55 @@ class UpdateAgent:
         # Get a relevant style example for this claim type
         style_example = _get_style_example(claim.claim_type)
 
+        # Build dynamic style section from profile
+        style_section = _build_style_section(getattr(self, '_style_profile', None))
+
+        # Build the system prompt with dynamic style
+        system_prompt = SYSTEM_PROMPT.format(style_section=style_section)
+
+        # Build style summary for user prompt
+        sp = getattr(self, '_style_profile', None) or {}
+        style_summary = (
+            f"- Grade: {sp.get('grade_level', 'college_senior')}\n"
+            f"- Tone: {sp.get('tone', 'formal_academic')}\n"
+            f"- Voice: {'Active preferred' if sp.get('passive_voice_usage', 'moderate') == 'rare' else 'Mixed active/passive'}, "
+            f"~{sp.get('avg_sentence_length', 25)} words/sentence\n"
+            f"- Terminology: {sp.get('terminology_level', 'technical')}\n"
+            f"- Numbers: Always specific — exact dates, real figures"
+        )
+
+        # Build source quality note — warns GPT when sources are weak
+        if not source_texts:
+            source_quality_note = (
+                "WARNING: No research sources are available for this claim. "
+                "Return {\"proposals\": []} unless you can make a correction based purely "
+                "on the fact that this claim is from a ~{age}-year-old document and is "
+                "clearly outdated on its face (e.g., a prediction whose timeframe has passed)."
+            ).format(age=getattr(self, '_document_age', 'unknown') or 'unknown')
+        elif all(s.relevance_score < 0.40 for s in filtered_sources):
+            source_quality_note = (
+                "NOTE: The available sources have LOW relevance to this specific claim. "
+                "Only use facts that DIRECTLY relate to the claim topic. If none do, "
+                "return {\"proposals\": []} rather than forcing an irrelevant update. "
+                "Set confidence to \"low\" if you proceed."
+            )
+        else:
+            source_quality_note = ""
+
         # Build user prompt from template
         user_prompt = USER_PROMPT_TEMPLATE.format(
             today_date=datetime.now().strftime("%Y-%m-%d"),
             old_content=claim.text,
             context=context,
             focus_areas=claim.focus_area or "general",
-            research_results="\n\n".join(source_texts),
+            research_results="\n\n".join(source_texts) if source_texts else "(No sources available)",
+            source_quality_note=source_quality_note,
+            style_summary=style_summary,
             style_example=style_example,
         )
 
         try:
-            response = await self._call_with_retry(SYSTEM_PROMPT, user_prompt)
+            response = await self._call_with_retry(system_prompt, user_prompt)
             if response is None:
                 return []
 
@@ -653,6 +913,18 @@ class UpdateAgent:
                         "Fixed forbidden ending pattern in proposal for claim %s",
                         claim.claim_id,
                     )
+
+                # ── Post-processing: clean mid-text editorial language ────
+                cleaned = _clean_midtext_editorial(new_content)
+                if cleaned != new_content:
+                    logger.info(
+                        "Cleaned mid-text editorial language in proposal for claim %s",
+                        claim.claim_id,
+                    )
+                    new_content = cleaned
+
+                # ── Post-processing: fix truncated start (lowercase first char) ──
+                new_content = _fix_truncated_start(new_content)
 
                 # ── Post-processing: quality gate (min sentences/length) ──
                 if not _passes_quality_check(new_content):
@@ -696,12 +968,24 @@ class UpdateAgent:
                     "business_model_update": ChangeType.BUSINESS_MODEL_UPDATE,
                     "historical_correction": ChangeType.HISTORICAL_CORRECTION,
                     "data_update": ChangeType.DATA_UPDATE,  # backward compat
+                    "reference_update": ChangeType.REFERENCE_UPDATE,
+                    "methodology_update": ChangeType.METHODOLOGY_UPDATE,
+                    "landscape_update": ChangeType.LANDSCAPE_UPDATE,
+                    "prediction_update": ChangeType.PREDICTION_UPDATE,
                 }.get(change_type_str, ChangeType.TECH_UPDATE)
 
                 # Parse core_claim_status
                 core_status = p.get("core_claim_status", "").lower()
                 if core_status not in ("false", "outdated", "incomplete", "still_true"):
                     core_status = None
+
+                # Downgrade confidence if sources are weak
+                if all(s.relevance_score < 0.40 for s in filtered_sources) and confidence != ConfidenceLevel.LOW:
+                    logger.info(
+                        "Downgrading confidence for claim %s: all sources below 0.40 relevance",
+                        claim.claim_id,
+                    )
+                    confidence = ConfidenceLevel.LOW
 
                 results.append(ChangeProposal(
                     change_id=f"change_{uuid.uuid4().hex[:12]}",
@@ -712,7 +996,7 @@ class UpdateAgent:
                     change_type=change_type,
                     confidence=confidence,
                     core_claim_status=core_status,
-                    sources=sources,
+                    sources=filtered_sources,  # Only include relevant sources
                     paragraph_idx=claim.paragraph_idx,
                     page=claim.page,
                 ))
@@ -743,7 +1027,11 @@ class UpdateAgent:
         combined_prompt = original_user_prompt + "\n\n" + regen_prompt
 
         try:
-            response = await self._call_with_retry(SYSTEM_PROMPT, combined_prompt)
+            # Build dynamic system prompt with style profile
+            style_section = _build_style_section(getattr(self, '_style_profile', None))
+            system_prompt = SYSTEM_PROMPT.format(style_section=style_section)
+
+            response = await self._call_with_retry(system_prompt, combined_prompt)
             if response is None:
                 return None
 
@@ -759,6 +1047,7 @@ class UpdateAgent:
 
             new_content = proposals[0].get("new_content", "")
             new_content = _fix_forbidden_endings(new_content)
+            new_content = _clean_midtext_editorial(new_content)
 
             if _passes_quality_check(new_content):
                 logger.info(
