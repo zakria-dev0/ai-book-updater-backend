@@ -2,12 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, Back
 from typing import List, Optional
 from pydantic import BaseModel, Field
 from datetime import datetime
+import re as _re
+import uuid
 from app.core.security import get_current_user_dep
 from app.database.connection import get_database
 from app.database.repositories.document_repo import DocumentRepository
 from app.database.repositories.change_repo import ChangeRepository
 from app.models.document import DocumentStatus
-from app.models.change import ChangeStatus, ApprovalAction, FocusArea
+from app.models.change import ChangeStatus, ApprovalAction, FocusArea, ChangeType
 from app.agents.orchestrator import run_analysis
 from app.core.logger import get_logger
 from app.core.rate_limit import limiter
@@ -54,6 +56,23 @@ class BatchReviewRequest(BaseModel):
         description="Specific change IDs. If omitted, applies to ALL pending changes.",
     )
     note: str = Field(default="", description="Optional reviewer note")
+
+
+class AiPromptRequest(BaseModel):
+    prompt: str = Field(
+        ...,
+        description="User prompt describing what content to generate (e.g., 'Add a paragraph about Starlink')",
+        min_length=5,
+        max_length=2000,
+    )
+    placement: str = Field(
+        ...,
+        description="Where to place the content: 'after_section', 'at_end', or 'replace_section'",
+    )
+    section_index: Optional[int] = Field(
+        default=None,
+        description="Index of the section for 'after_section' or 'replace_section' placement",
+    )
 
 
 # ------------------------------------------------------------------ #
@@ -645,4 +664,480 @@ async def export_changelog(
             "style_profile": document.get("style_profile"),
         },
         "changelog": changelog,
+    }
+
+
+# ------------------------------------------------------------------ #
+# Section extraction helper                                            #
+# ------------------------------------------------------------------ #
+
+# Patterns that match typical section/chapter headings in textbooks.
+# Ordered from most specific to least specific.
+_HEADING_PATTERNS = [
+    # "Chapter 1: Title" or "Chapter 1 Title" or "Chapter One: Title"
+    _re.compile(r'^(Chapter\s+[\dIVXLCivxlc]+[\.:\s]\s*.+)$', _re.MULTILINE | _re.IGNORECASE),
+    # "Section 1: Title", "Part 1: Title", "Part I: Title"
+    _re.compile(r'^((?:Section|Part|Unit|Module|Lesson|Appendix)\s+[\dIVXLCivxlcA-Z]+[\.:\s]\s*.+)$', _re.MULTILINE | _re.IGNORECASE),
+    # "1.2.3 Title" or "1.2.3: Title" (triple decimal — match before double)
+    _re.compile(r'^(\d+\.\d+\.\d+[\.:\s]\s*.+)$', _re.MULTILINE),
+    # "1.2 Title" or "1.2: Title" or "1.2. Title"
+    _re.compile(r'^(\d+\.\d+[\.:\s]\s*.+)$', _re.MULTILINE),
+    # "1. Title" or "1: Title" or "1 Title" (single number heading)
+    _re.compile(r'^(\d{1,3}[\.:\s]\s*[A-Z].{2,80})$', _re.MULTILINE),
+    # Roman numeral headings: "I. Introduction", "IV Background"
+    _re.compile(r'^([IVXLC]{1,6}[\.:\s]\s*[A-Z].{2,80})$', _re.MULTILINE),
+    # ALL-CAPS headings (allow numbers, hyphens, colons, commas, apostrophes)
+    _re.compile(r'^([A-Z][A-Z0-9\s\-:,\'\.]{3,80})$', _re.MULTILINE),
+    # "Chapter One", "Chapter Two" etc. without colon
+    _re.compile(r'^(Chapter\s+\w+)$', _re.MULTILINE | _re.IGNORECASE),
+]
+
+# Words that are commonly NOT headings (body text fragments, page artifacts)
+_NON_HEADING_WORDS = {
+    "the", "and", "for", "that", "this", "with", "from", "have", "been",
+    "will", "are", "was", "were", "not", "but", "all", "can", "had",
+    "her", "his", "its", "our", "has", "also", "than", "then",
+}
+
+
+def _is_likely_heading(line: str, paragraphs: list, para_idx: int) -> bool:
+    """Additional heuristic checks to confirm a line is a heading, not body text."""
+    # Very short lines that are just common words are not headings
+    words = line.split()
+    if len(words) == 1 and line.lower() in _NON_HEADING_WORDS:
+        return False
+
+    # Lines ending with period are usually sentences, not headings
+    # (Exception: abbreviations like "U.S." or numbered like "1.")
+    if line.endswith('.') and not _re.search(r'\d\.$', line) and len(line) > 30:
+        return False
+
+    # ALL-CAPS check: if the line is all caps but is very long, likely body text
+    if line.isupper() and len(line) > 80:
+        return False
+
+    return True
+
+
+def _normalize_heading(text: str) -> str:
+    """Normalize a heading for dedup: strip numbering prefix, lowercase, collapse spaces."""
+    t = text.strip().lower()
+    # Remove leading numbering like "chapter 1", "1.", "1.2.", "1.2.3"
+    t = _re.sub(r'^(chapter|section|part|unit|module|lesson|appendix)\s+[\divxlc]+[\.:\s]*', '', t)
+    t = _re.sub(r'^\d+(\.\d+)*[\.:\s]*', '', t)
+    t = _re.sub(r'^[ivxlc]+[\.:\s]+', '', t)
+    return _re.sub(r'\s+', ' ', t).strip()
+
+
+def _extract_sections(text_content: str) -> list:
+    """Extract section headings from document text content.
+
+    Uses multiple regex patterns to detect common heading formats,
+    plus heuristic checks to filter out false positives.
+    Deduplicates by normalizing headings (stripping numbering prefixes).
+    """
+    if not text_content:
+        return []
+
+    paragraphs = text_content.split('\n')
+    sections = []
+    seen_lines = set()       # Track original lines to avoid re-processing
+    seen_normalized = set()   # Track normalized titles to catch cross-pattern duplicates
+
+    for para_idx, para in enumerate(paragraphs):
+        line = para.strip()
+        if not line or len(line) > 120 or len(line) < 3:
+            continue
+
+        # Skip if we already processed this exact line
+        if line in seen_lines:
+            continue
+
+        for pattern in _HEADING_PATTERNS:
+            match = pattern.match(line)
+            if match:
+                title = match.group(1).strip()
+                if len(title) <= 3:
+                    break
+                # Heuristic check to filter out body text false positives
+                if not _is_likely_heading(title, paragraphs, para_idx):
+                    break
+                # Dedup: normalize to catch "Chapter 1 Space" vs "1 Space" as same
+                norm = _normalize_heading(title)
+                if norm and norm in seen_normalized:
+                    break
+                seen_lines.add(line)
+                if norm:
+                    seen_normalized.add(norm)
+                sections.append({
+                    "index": len(sections),
+                    "title": title,
+                    "paragraph_idx": para_idx,
+                })
+                break
+
+    # If very few headings found (< 3), also try Title Case heuristic
+    # to catch headings like "The Future of Space", "Understanding Gravity"
+    if len(sections) < 3:
+        for para_idx, para in enumerate(paragraphs):
+            line = para.strip()
+            if not line or len(line) > 80 or len(line) < 5:
+                continue
+            if line in seen_lines:
+                continue
+            # Title Case: most words start uppercase, short line, not a sentence
+            words = line.split()
+            if len(words) < 2 or len(words) > 12:
+                continue
+            # Count capitalized words (skip short prepositions/articles)
+            small_words = {"a", "an", "the", "and", "or", "of", "in", "on", "to", "for", "at", "by", "is", "it"}
+            cap_count = sum(1 for w in words if w[0].isupper() or w.lower() in small_words)
+            if cap_count >= len(words) * 0.7 and not line.endswith('.'):
+                # Check surrounding context — headings usually preceded/followed by empty lines
+                prev_empty = para_idx == 0 or not paragraphs[para_idx - 1].strip()
+                next_empty = para_idx >= len(paragraphs) - 1 or not paragraphs[para_idx + 1].strip()
+                if prev_empty or next_empty:
+                    norm = _normalize_heading(line)
+                    if norm and norm in seen_normalized:
+                        continue
+                    seen_lines.add(line)
+                    if norm:
+                        seen_normalized.add(norm)
+                    sections.append({
+                        "index": len(sections),
+                        "title": line,
+                        "paragraph_idx": para_idx,
+                    })
+
+        # Re-sort by paragraph_idx and re-index
+        sections.sort(key=lambda s: s["paragraph_idx"])
+        for i, s in enumerate(sections):
+            s["index"] = i
+
+    # If still no headings found, fall back to page-range sections
+    if not sections:
+        total_paras = len(paragraphs)
+        chunk_size = max(total_paras // 10, 20)
+        for i in range(0, total_paras, chunk_size):
+            end = min(i + chunk_size, total_paras)
+            preview = ""
+            for j in range(i, min(i + 5, end)):
+                if paragraphs[j].strip():
+                    preview = paragraphs[j].strip()[:60]
+                    break
+            sections.append({
+                "index": len(sections),
+                "title": f"Section {len(sections) + 1} — {preview}..." if preview else f"Section {len(sections) + 1}",
+                "paragraph_idx": i,
+            })
+
+    logger.info("Extracted %d sections from document", len(sections))
+    for s in sections:
+        logger.debug("  Section %d: '%s' (para_idx=%d)", s["index"], s["title"][:60], s["paragraph_idx"])
+
+    return sections
+
+
+# ------------------------------------------------------------------ #
+# GET sections — extract document sections for AI prompt placement     #
+# ------------------------------------------------------------------ #
+
+@router.get(
+    "/{document_id}/sections",
+    summary="Get document sections",
+    responses={
+        200: {"description": "List of detected sections/headings"},
+        403: {"description": "Not authorized"},
+        404: {"description": "Document not found"},
+    },
+)
+async def get_document_sections(
+    document_id: str,
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """Extract and return section headings from the document for AI prompt placement."""
+    doc_repo = DocumentRepository(db)
+    document = await _get_owned_document(document_id, current_user, doc_repo, lightweight=False)
+
+    text_content = document.get("text_content", "")
+    if not text_content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Document has no text content",
+        )
+
+    sections = _extract_sections(text_content)
+    return {"document_id": document_id, "sections": sections, "total": len(sections)}
+
+
+# ------------------------------------------------------------------ #
+# POST AI prompt — generate new content matching document style        #
+# ------------------------------------------------------------------ #
+
+_AI_PROMPT_SYSTEM = """\
+You are an expert editor for a university-level aerospace engineering textbook.
+Your task is to write NEW content for the textbook based on a user prompt.
+
+CRITICAL REQUIREMENT: The new content MUST be INDISTINGUISHABLE from the rest of the textbook.
+You will be given the document's style profile and surrounding context to match.
+
+STYLE RULES:
+- Match the exact tone, grade level, and technical depth of the document
+- Use active voice predominantly (less than 10% passive)
+- Average sentence length ~20 words, mix short (10-15) and long (25-35) sentences
+- Define acronyms on first use: "Low Earth Orbit (LEO)"
+- Include specific numbers with dual units: "550 km (342 mi)"
+- Spell out numbers under ten; use numerals for 10+
+- Include exact dates when known
+- Use transitional phrases to connect ideas naturally
+- Write flowing prose — NO bullet points
+- End on a SPECIFIC FACT, never editorial commentary
+- Never use "This highlights...", "This underscores...", "This demonstrates..."
+- Never use hedging: "may have", "could potentially"
+- Write 3 to 5 sentences MAXIMUM — concise and focused, no padding
+- Include at least 2 specific data points
+
+OUTPUT FORMAT:
+Return a JSON object:
+{{
+  "new_content": "The generated paragraph(s) matching the textbook style",
+  "summary": "One-sentence summary of what was added"
+}}
+
+Return ONLY valid JSON — no markdown fences, no extra text.
+"""
+
+_AI_PROMPT_USER_TEMPLATE = """\
+TODAY'S DATE: {today_date}
+
+DOCUMENT STYLE PROFILE:
+{style_profile}
+
+SURROUNDING CONTEXT (from the document near the target location):
+\"\"\"{context}\"\"\"
+
+USER REQUEST: {prompt}
+
+PLACEMENT: {placement_description}
+
+Write the new content matching the textbook's exact writing style.
+The content should flow naturally with the surrounding text.
+Return valid JSON only.
+"""
+
+
+@router.post(
+    "/{document_id}/ai-prompt",
+    summary="Generate AI content from user prompt",
+    responses={
+        200: {"description": "AI-generated change proposal created"},
+        400: {"description": "Invalid request"},
+        403: {"description": "Not authorized"},
+        404: {"description": "Document not found"},
+    },
+)
+@limiter.limit("5/minute")
+async def generate_ai_prompt(
+    request: Request,
+    document_id: str,
+    body: AiPromptRequest = Body(...),
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """
+    Generate new content for the document based on a user prompt.
+    The AI matches the document's writing style and creates a change proposal
+    that can be reviewed (approved/rejected) like any other change.
+    """
+    from openai import AsyncOpenAI
+    from app.core.config import settings
+    import json
+
+    if not settings.OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="OpenAI API key not configured",
+        )
+
+    if body.placement not in ("after_section", "at_end", "replace_section"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="placement must be 'after_section', 'at_end', or 'replace_section'",
+        )
+
+    if body.placement in ("after_section", "replace_section") and body.section_index is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="section_index is required for 'after_section' and 'replace_section' placement",
+        )
+
+    doc_repo = DocumentRepository(db)
+    document = await _get_owned_document(document_id, current_user, doc_repo, lightweight=False)
+
+    text_content = document.get("text_content", "")
+    if not text_content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Document has no text content",
+        )
+
+    paragraphs = text_content.split('\n')
+    sections = _extract_sections(text_content)
+
+    # Determine context and placement info
+    target_para_idx = len(paragraphs) - 1  # default: end
+    old_content = ""
+    placement_description = ""
+
+    if body.placement == "at_end":
+        target_para_idx = len(paragraphs) - 1
+        placement_description = "Add this content at the END of the document, after all existing content."
+        # Get last few paragraphs as context
+        context_start = max(0, len(paragraphs) - 5)
+        context = "\n".join(p for p in paragraphs[context_start:] if p.strip())
+
+    elif body.placement == "after_section":
+        if body.section_index is not None and body.section_index < len(sections):
+            section = sections[body.section_index]
+            target_para_idx = section["paragraph_idx"]
+            placement_description = f"Add this content AFTER the section: \"{section['title']}\""
+            # Get context around this section
+            ctx_start = max(0, target_para_idx - 2)
+            ctx_end = min(len(paragraphs), target_para_idx + 8)
+            context = "\n".join(p for p in paragraphs[ctx_start:ctx_end] if p.strip())
+        else:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid section_index")
+
+    elif body.placement == "replace_section":
+        if body.section_index is not None and body.section_index < len(sections):
+            section = sections[body.section_index]
+            target_para_idx = section["paragraph_idx"]
+            # Find the content until the next section
+            next_para_idx = len(paragraphs)
+            if body.section_index + 1 < len(sections):
+                next_para_idx = sections[body.section_index + 1]["paragraph_idx"]
+            old_content = "\n".join(
+                p for p in paragraphs[target_para_idx:next_para_idx] if p.strip()
+            )
+            placement_description = f"REPLACE the section: \"{section['title']}\" with updated content."
+            # Context: before and after the section being replaced
+            ctx_before = "\n".join(p for p in paragraphs[max(0, target_para_idx - 3):target_para_idx] if p.strip())
+            ctx_after = "\n".join(p for p in paragraphs[next_para_idx:min(len(paragraphs), next_para_idx + 3)] if p.strip())
+            context = f"BEFORE:\n{ctx_before}\n\nSECTION BEING REPLACED:\n{old_content}\n\nAFTER:\n{ctx_after}"
+        else:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid section_index")
+
+    # Build style profile string
+    style_profile = document.get("style_profile", {})
+    if isinstance(style_profile, dict) and style_profile:
+        style_str = "\n".join(f"- {k}: {v}" for k, v in style_profile.items())
+    else:
+        style_str = "- Grade: Undergraduate STEM textbook\n- Tone: Authoritative yet accessible\n- Voice: Active preferred, ~20 words/sentence"
+
+    # Call GPT-4o
+    user_prompt = _AI_PROMPT_USER_TEMPLATE.format(
+        today_date=datetime.now().strftime("%Y-%m-%d"),
+        style_profile=style_str,
+        context=context[:3000],  # Limit context size
+        prompt=body.prompt,
+        placement_description=placement_description,
+    )
+
+    try:
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        response = await client.chat.completions.create(
+            model=settings.GPT_MODEL,
+            messages=[
+                {"role": "system", "content": _AI_PROMPT_SYSTEM},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"},
+            timeout=120.0,
+        )
+
+        raw = response.choices[0].message.content
+        data = json.loads(raw)
+        new_content = data.get("new_content", "")
+        summary = data.get("summary", "AI-generated content")
+
+        if not new_content or len(new_content) < 20:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="AI failed to generate sufficient content. Please try again.",
+            )
+
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AI returned invalid response. Please try again.",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("AI prompt generation failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"AI generation failed: {str(e)[:200]}",
+        )
+
+    # Create change proposal
+    change_data = {
+        "change_id": f"change_{uuid.uuid4().hex[:12]}",
+        "document_id": document_id,
+        "claim_id": f"ai_prompt_{uuid.uuid4().hex[:8]}",
+        "old_content": old_content if body.placement == "replace_section" else f"[AI Prompt: {body.prompt[:100]}]",
+        "new_content": new_content,
+        "change_type": ChangeType.AI_PROMPT.value,
+        "confidence": "high",
+        "sources": [],
+        "paragraph_idx": target_para_idx,
+        "page": None,
+        "status": ChangeStatus.PENDING.value,
+        "created_at": datetime.utcnow(),
+        "reviewer_note": f"AI Prompt: {body.prompt}",
+        "core_claim_status": None,
+        "approval_action": None,
+        "user_edited_content": None,
+        "ai_prompt_metadata": {
+            "prompt": body.prompt,
+            "placement": body.placement,
+            "section_index": body.section_index,
+            "section_title": section["title"] if body.placement in ("after_section", "replace_section") and body.section_index is not None and body.section_index < len(sections) else None,
+            "summary": summary,
+        },
+    }
+
+    change_repo = ChangeRepository(db)
+    await change_repo.create(change_data)
+
+    logger.info(
+        "AI prompt change created for document %s by user %s: %s",
+        document_id, current_user["email"], body.prompt[:80],
+    )
+
+    # Build a clean response dict (MongoDB insert adds _id ObjectId in-place)
+    response_change = {
+        "change_id": change_data["change_id"],
+        "document_id": change_data["document_id"],
+        "claim_id": change_data["claim_id"],
+        "old_content": change_data["old_content"],
+        "new_content": change_data["new_content"],
+        "change_type": change_data["change_type"],
+        "confidence": change_data["confidence"],
+        "sources": change_data["sources"],
+        "paragraph_idx": change_data["paragraph_idx"],
+        "page": change_data["page"],
+        "status": change_data["status"],
+        "created_at": change_data["created_at"].isoformat(),
+        "reviewer_note": change_data["reviewer_note"],
+        "core_claim_status": change_data["core_claim_status"],
+        "approval_action": change_data["approval_action"],
+        "user_edited_content": change_data["user_edited_content"],
+    }
+
+    return {
+        "change": response_change,
+        "message": f"AI content generated: {summary}",
     }

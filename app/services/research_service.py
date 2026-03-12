@@ -329,6 +329,30 @@ class TavilyResearchService:
 
                 author = _extract_author_from_content(raw_content) if raw_content else None
 
+                # ── Recency penalty: deprioritize very old sources ──
+                # For a textbook updater, recent sources are more valuable.
+                # Penalize sources published before 2015 (10+ years old).
+                recency_penalty = 0.0
+                if pub_date:
+                    year_match = re.search(r'(\d{4})', str(pub_date))
+                    if year_match:
+                        source_year = int(year_match.group(1))
+                        from datetime import datetime
+                        current_year = datetime.now().year
+                        age = current_year - source_year
+                        if age > 20:
+                            recency_penalty = 0.50  # Extreme penalty for 20+ year old sources (e.g., 1988 NASA PDF)
+                        elif age > 10:
+                            recency_penalty = 0.25  # Heavy penalty for 10+ year old sources
+                        elif age > 5:
+                            recency_penalty = 0.10  # Moderate penalty for 5-10 year old sources
+                        if recency_penalty > 0:
+                            relevance = max(0.05, relevance - recency_penalty)
+                            logger.info(
+                                "Recency penalty -%.2f for %d-year-old source: '%s'",
+                                recency_penalty, age, title[:50],
+                            )
+
                 logger.info(
                     "Source '%s' [%s, score=%.2f (domain=%.2f, content=%.2f)]: author=%s, date=%s",
                     title[:50], source_type, relevance, base_relevance,
@@ -347,6 +371,18 @@ class TavilyResearchService:
 
             # Sort by relevance (highest first)
             results.sort(key=lambda r: r.relevance_score, reverse=True)
+
+            # ── Hard filter: drop sources with very low relevance ──────
+            # These are sources that matched the query keywords but have
+            # content unrelated to the claim (e.g., "Brexit" for space topics)
+            MIN_RELEVANCE_THRESHOLD = 0.25
+            before_hard_filter = len(results)
+            results = [r for r in results if r.relevance_score >= MIN_RELEVANCE_THRESHOLD]
+            if before_hard_filter > len(results):
+                logger.info(
+                    "Hard-filtered %d/%d sources below %.2f relevance threshold",
+                    before_hard_filter - len(results), before_hard_filter, MIN_RELEVANCE_THRESHOLD,
+                )
 
             # Trim to requested limit
             max_count = max_results or self.max_results
@@ -371,7 +407,7 @@ class TavilyResearchService:
         for attempt in range(MAX_RETRIES):
             try:
                 return await self.client.search(
-                    search_depth="basic",
+                    search_depth="advanced",
                     **kwargs,
                 )
             except Exception as e:

@@ -151,6 +151,10 @@ class ResearchAgent:
             "constellation": "constellation current status satellites",
             "historical": "current status",
             "business_philosophy": "current industry status",
+            "landscape": "current state of the field industry today",
+            "prediction": "actual outcome what happened status result",
+            "reference": "latest edition current version updated source",
+            "methodology": "current best practices modern approach",
         }
         suffix = type_suffix.get(claim.claim_type, "current status")
 
@@ -176,6 +180,27 @@ class ResearchAgent:
         parts.append(suffix)
 
         query = " ".join(parts)
+
+        # ── Step 5: Add domain context if query lacks specificity ───
+        # Generic claims without entities produce off-topic results.
+        # Detect if query is missing domain keywords and inject them.
+        query_lower = query.lower()
+        space_keywords = {"space", "spacecraft", "satellite", "orbit", "nasa", "launch",
+                          "mission", "aerospace", "rocket", "lunar", "mars", "iss"}
+        has_domain_context = any(kw in query_lower for kw in space_keywords)
+        if not has_domain_context and not entity_str:
+            # This is a generic claim from a space textbook — add domain prefix
+            query = "space missions aerospace " + query
+
+        # ── Step 6: Add recency hint to bias toward current information ───
+        # Append recent years so Tavily prefers up-to-date sources over old archives.
+        # Only add if query doesn't already contain a recent year.
+        from datetime import datetime as _dt
+        current_year = _dt.now().year
+        recent_years = {str(current_year), str(current_year - 1)}
+        if not any(yr in query for yr in recent_years):
+            query = f"{query} {current_year} {current_year - 1}"
+
         return query[:200]  # Tavily query length limit
 
     @staticmethod
