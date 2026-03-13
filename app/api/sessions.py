@@ -31,6 +31,27 @@ def _get_repos(db):
     return SessionRepository(db), DocumentRepository(db)
 
 
+def _resolve_file_path(stored_path: str) -> str:
+    """Resolve a file path from DB, falling back to local UPLOAD_DIR if the stored
+    (production) path doesn't exist. This allows the same MongoDB to work on both
+    the production server and a local dev machine."""
+    if stored_path and os.path.exists(stored_path):
+        return stored_path
+    if stored_path:
+        filename = os.path.basename(stored_path)
+        local_path = os.path.join(settings.UPLOAD_DIR, filename)
+        if os.path.exists(local_path):
+            logger.info("Resolved production path to local: %s -> %s", stored_path, local_path)
+            return local_path
+        # Also try absolute path from UPLOAD_DIR
+        abs_local = os.path.abspath(local_path)
+        if os.path.exists(abs_local):
+            logger.info("Resolved production path to local: %s -> %s", stored_path, abs_local)
+            return abs_local
+        logger.warning("File not found locally either: %s (tried %s)", stored_path, abs_local)
+    return stored_path  # return original (will fail downstream with a clear error)
+
+
 # ── Request / Response Models ────────────────────────────────────────────────
 
 class CreateSessionRequest(BaseModel):
@@ -83,16 +104,20 @@ class DatedStatementResolveRequest(BaseModel):
     resolution: str  # "still_current", "flag_for_patch", "acceptable"
 
 
+class ResetToStepRequest(BaseModel):
+    target_status: str  # e.g. "created", "rules_confirmed", "outline_extracted", etc.
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SESSION CRUD
 # ══════════════════════════════════════════════════════════════════════════════
 
-@router.post("/", response_model=CreateSessionResponse, status_code=201)
+@router.post("/", response_model=CreateSessionResponse)
 async def create_session(
     req: CreateSessionRequest,
     user=Depends(get_current_user_dep),
 ):
-    """Create a new editorial session for a document."""
+    """Find existing active session or create a new one for a document."""
     db = get_database()
     session_repo, doc_repo = _get_repos(db)
 
@@ -103,6 +128,18 @@ async def create_session(
         raise HTTPException(403, "Not authorized")
     if doc.get("status") not in ("completed", "export_ready"):
         raise HTTPException(400, "Document must be processed before creating a session")
+
+    # Req 5: Find existing active session (not exported/error) before creating new
+    existing_sessions = await session_repo.find_sessions_by_document(req.document_id)
+    for s in existing_sessions:
+        if s.get("status") not in ("exported", "error"):
+            logger.info("Resuming existing session %s for document %s", s["id"], req.document_id)
+            return CreateSessionResponse(
+                session_id=s["id"],
+                document_id=req.document_id,
+                status=s["status"],
+                message="Resuming existing session.",
+            )
 
     session_data = {
         "document_id": req.document_id,
@@ -164,6 +201,77 @@ async def delete_session(session_id: str, user=Depends(get_current_user_dep)):
     return {"message": "Session deleted", "session_id": session_id}
 
 
+# ── Pipeline step order for reset logic ──────────────────────────────────────
+_STATUS_ORDER = [
+    SessionStatus.CREATED.value,
+    SessionStatus.RULES_CONFIRMED.value,
+    SessionStatus.OUTLINE_EXTRACTED.value,
+    SessionStatus.DIAGNOSTIC_COMPLETE.value,
+    SessionStatus.OPPORTUNITIES_SELECTED.value,
+    SessionStatus.RESEARCH_PLANNED.value,
+    SessionStatus.RESEARCHING.value,
+    SessionStatus.RESEARCH_DONE.value,
+    SessionStatus.EVIDENCE_REVIEWED.value,
+    SessionStatus.PATCHES_GENERATED.value,
+    SessionStatus.EDITS_APPLIED.value,
+    SessionStatus.EXPORTED.value,
+]
+
+
+@router.post("/{session_id}/reset-to-step")
+async def reset_to_step(
+    session_id: str,
+    req: ResetToStepRequest,
+    user=Depends(get_current_user_dep),
+):
+    """Reset session to a previous step, clearing all downstream data."""
+    db = get_database()
+    session_repo = SessionRepository(db)
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    target = req.target_status
+    if target not in _STATUS_ORDER:
+        raise HTTPException(400, f"Invalid target status: {target}")
+
+    target_idx = _STATUS_ORDER.index(target)
+    current_idx = _STATUS_ORDER.index(session["status"]) if session["status"] in _STATUS_ORDER else 0
+
+    if target_idx > current_idx:
+        raise HTTPException(400, "Cannot reset forward — only backward")
+
+    # Clear downstream data based on target
+    update_fields: dict = {"status": target}
+
+    # If resetting to before diagnostic, clear diagnostic + everything downstream
+    if target_idx < _STATUS_ORDER.index(SessionStatus.DIAGNOSTIC_COMPLETE.value):
+        update_fields["diagnostic"] = None
+        await session_repo.delete_opportunities(session_id)
+
+    # If resetting to before research planning, clear plans + downstream
+    if target_idx < _STATUS_ORDER.index(SessionStatus.RESEARCH_PLANNED.value):
+        await session_repo.delete_research_plans(session_id)
+
+    # If resetting to before evidence, clear evidence + downstream
+    if target_idx < _STATUS_ORDER.index(SessionStatus.EVIDENCE_REVIEWED.value):
+        await session_repo.delete_evidence_items(session_id)
+
+    # If resetting to before patches, clear patches + downstream
+    if target_idx < _STATUS_ORDER.index(SessionStatus.PATCHES_GENERATED.value):
+        await session_repo.delete_patches(session_id)
+
+    # If resetting to before apply, clear working doc
+    if target_idx < _STATUS_ORDER.index(SessionStatus.EDITS_APPLIED.value):
+        update_fields["working_doc_path"] = None
+
+    await session_repo.update_session(session_id, update_fields)
+    logger.info("Session %s reset to step: %s", session_id, target)
+    return {"message": f"Session reset to {target}", "session_id": session_id, "status": target}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 1: RULES CONFIRMATION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -216,7 +324,12 @@ async def extract_outline(
         raise HTTPException(404, "Session not found")
     if session.get("user_id") != user["email"] and user.get("role") != "admin":
         raise HTTPException(403, "Not authorized")
-    if session.get("status") not in (SessionStatus.RULES_CONFIRMED.value, SessionStatus.OUTLINE_EXTRACTED.value):
+    # Allow re-running if session is at or past rules_confirmed
+    current_status = session.get("status")
+    if current_status in _STATUS_ORDER:
+        if _STATUS_ORDER.index(current_status) < _STATUS_ORDER.index(SessionStatus.RULES_CONFIRMED.value):
+            raise HTTPException(400, "Rules must be confirmed first")
+    else:
         raise HTTPException(400, "Rules must be confirmed first")
 
     doc = await doc_repo.find_by_id(session["document_id"])
@@ -224,7 +337,7 @@ async def extract_outline(
         raise HTTPException(404, "Document not found")
 
     # Extract headings from DOCX using python-docx
-    file_path = doc.get("file_path", "")
+    file_path = _resolve_file_path(doc.get("file_path", ""))
     outline_items = []
 
     try:
@@ -355,10 +468,12 @@ async def run_diagnostic(
         raise HTTPException(404, "Session not found")
     if session.get("user_id") != user["email"] and user.get("role") != "admin":
         raise HTTPException(403, "Not authorized")
-    if session.get("status") not in (
-        SessionStatus.OUTLINE_EXTRACTED.value,
-        SessionStatus.DIAGNOSTIC_COMPLETE.value,
-    ):
+    # Allow re-running if session is at or past outline_extracted
+    current_status = session.get("status")
+    if current_status in _STATUS_ORDER:
+        if _STATUS_ORDER.index(current_status) < _STATUS_ORDER.index(SessionStatus.OUTLINE_EXTRACTED.value):
+            raise HTTPException(400, "Outline must be extracted first")
+    else:
         raise HTTPException(400, "Outline must be extracted first")
 
     doc = await doc_repo.find_by_id(session["document_id"], analysis_mode=True)
@@ -624,10 +739,12 @@ async def plan_research(
         raise HTTPException(404, "Session not found")
     if session.get("user_id") != user["email"] and user.get("role") != "admin":
         raise HTTPException(403, "Not authorized")
-    if session.get("status") not in (
-        SessionStatus.OPPORTUNITIES_SELECTED.value,
-        SessionStatus.RESEARCH_PLANNED.value,
-    ):
+    # Allow re-running if session is at or past opportunities_selected
+    current_status = session.get("status")
+    if current_status in _STATUS_ORDER:
+        if _STATUS_ORDER.index(current_status) < _STATUS_ORDER.index(SessionStatus.OPPORTUNITIES_SELECTED.value):
+            raise HTTPException(400, "Opportunities must be selected first")
+    else:
         raise HTTPException(400, "Opportunities must be selected first")
 
     background_tasks.add_task(_plan_research_task, session_id, session)
@@ -1238,7 +1355,7 @@ async def apply_patches(
             "message": "No approved patches to apply. Skipped to next stage.",
         }
 
-    original_path = doc.get("file_path", "")
+    original_path = _resolve_file_path(doc.get("file_path", ""))
     applied = 0
     skipped = 0
     working_path = None
@@ -1532,11 +1649,15 @@ async def export_tracked_docx(session_id: str, user=Depends(get_current_user_dep
     if not doc:
         raise HTTPException(404, "Document not found")
 
-    original_path = doc.get("file_path", "")
+    original_path = _resolve_file_path(doc.get("file_path", ""))
     working_path = session.get("working_doc_path", "")
 
     if not working_path or not os.path.exists(working_path):
-        raise HTTPException(400, "No working document found. Apply patches first.")
+        raise HTTPException(
+            400,
+            "Working document not available. The original file may be on a different server. "
+            "Use the Changelog export instead, which contains all patch details.",
+        )
 
     output_dir = os.path.join(settings.OUTPUT_DIR, session_id)
     os.makedirs(output_dir, exist_ok=True)
@@ -1592,7 +1713,11 @@ async def export_clean_docx(session_id: str, user=Depends(get_current_user_dep))
     working_path = session.get("working_doc_path", "")
 
     if not working_path or not os.path.exists(working_path):
-        raise HTTPException(400, "No working document found. Apply patches first.")
+        raise HTTPException(
+            400,
+            "Working document not available. The original file may be on a different server. "
+            "Use the Changelog export instead, which contains all patch details.",
+        )
 
     return FileResponse(
         working_path,
