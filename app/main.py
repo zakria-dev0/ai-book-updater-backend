@@ -11,7 +11,7 @@ from app.core.rate_limit import limiter
 from app.core.websocket import ws_manager
 from app.database.connection import connect_to_mongo, close_mongo_connection, get_database
 from app.database.repositories.document_repo import DocumentRepository
-from app.api import auth, upload, processing, analysis, admin, export
+from app.api import auth, upload, processing, analysis, admin, export, sessions
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -64,6 +64,7 @@ app.include_router(processing.router, prefix=settings.API_V1_PREFIX)
 app.include_router(analysis.router, prefix=settings.API_V1_PREFIX)
 app.include_router(admin.router, prefix=settings.API_V1_PREFIX)
 app.include_router(export.router, prefix=settings.API_V1_PREFIX)
+app.include_router(sessions.router, prefix=settings.API_V1_PREFIX)
 
 # ── Utility endpoints ─────────────────────────────────────────────────────────
 @app.get("/health", tags=["Health"])
