@@ -37,6 +37,30 @@ async def connect_to_mongo():
     await database.changelogs.create_index("document_id")
     await database.changelogs.create_index([("created_at", -1)])
 
+    # editorial_sessions: pipeline sessions per document
+    await database.editorial_sessions.create_index("document_id")
+    await database.editorial_sessions.create_index("user_id")
+    await database.editorial_sessions.create_index([("created_at", -1)])
+
+    # update_opportunities: issues found per session
+    await database.update_opportunities.create_index("session_id")
+    await database.update_opportunities.create_index([("session_id", 1), ("selected", 1)])
+
+    # research_plans: per opportunity
+    await database.research_plans.create_index("session_id")
+    await database.research_plans.create_index("opportunity_id")
+
+    # evidence_items: per research plan
+    await database.evidence_items.create_index("session_id")
+    await database.evidence_items.create_index("research_plan_id")
+
+    # patches: per opportunity
+    await database.patches.create_index("session_id")
+    await database.patches.create_index([("session_id", 1), ("status", 1)])
+
+    # dated_statements: temporal audit per session
+    await database.dated_statements.create_index("session_id")
+
     print(f"Connected to MongoDB – indexes ensured")
 
 
