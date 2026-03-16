@@ -110,3 +110,24 @@ def make_auth_dependency(check_blacklist: bool = True):
 
 # Default dependency used across all protected routes (blacklist-aware)
 get_current_user_dep = make_auth_dependency(check_blacklist=True)
+
+
+def verify_download_token(token: str) -> dict:
+    """Verify a JWT token passed as query parameter (for file downloads).
+    Returns user dict or raises HTTPException.
+    """
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid download token",
+            )
+        role: str = payload.get("role", "user")
+        return {"email": email, "role": role, "token": token}
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired download token",
+        )

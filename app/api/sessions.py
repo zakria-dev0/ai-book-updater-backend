@@ -2,13 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, 
 from typing import List, Optional, Dict
 from pydantic import BaseModel, Field
 from datetime import datetime
+import asyncio
 import uuid
 import copy
 import shutil
 import os
 import subprocess
 
-from app.core.security import get_current_user_dep
+from app.core.security import get_current_user_dep, verify_download_token, decode_token
 from app.database.connection import get_database
 from app.database.repositories.session_repo import SessionRepository
 from app.database.repositories.document_repo import DocumentRepository
@@ -129,11 +130,12 @@ async def create_session(
     if doc.get("status") not in ("completed", "export_ready"):
         raise HTTPException(400, "Document must be processed before creating a session")
 
-    # Req 5: Find existing active session (not exported/error) before creating new
+    # Req 5: Find existing session (not error) before creating new
+    # Resume even "exported" sessions so user can navigate all completed stages
     existing_sessions = await session_repo.find_sessions_by_document(req.document_id)
     for s in existing_sessions:
-        if s.get("status") not in ("exported", "error"):
-            logger.info("Resuming existing session %s for document %s", s["id"], req.document_id)
+        if s.get("status") != "error":
+            logger.info("Resuming existing session %s for document %s (status=%s)", s["id"], req.document_id, s.get("status"))
             return CreateSessionResponse(
                 session_id=s["id"],
                 document_id=req.document_id,
@@ -185,6 +187,42 @@ async def get_sessions_for_document(document_id: str, user=Depends(get_current_u
     if user.get("role") != "admin":
         sessions = [s for s in sessions if s.get("user_id") == user["email"]]
     return {"document_id": document_id, "sessions": sessions}
+
+
+@router.get("/document/{document_id}/patches")
+async def get_document_patches(document_id: str, user=Depends(get_current_user_dep)):
+    """Get all patches across all sessions for a document, with session dates."""
+    db = get_database()
+    session_repo = SessionRepository(db)
+    doc_repo = DocumentRepository(db)
+
+    doc = await doc_repo.find_by_id(document_id, lightweight=True)
+    if not doc:
+        raise HTTPException(404, "Document not found")
+
+    sessions = await session_repo.find_sessions_by_document(document_id)
+    if user.get("role") != "admin":
+        sessions = [s for s in sessions if s.get("user_id") == user["email"]]
+
+    all_patches = []
+    for sess in sessions:
+        session_id = sess.get("id", "")
+        patches = await session_repo.find_patches(session_id)
+        for p in patches:
+            p["session_created_at"] = sess.get("created_at")
+            p["session_updated_at"] = sess.get("updated_at")
+            p["session_status"] = sess.get("status")
+        all_patches.extend(patches)
+
+    return {
+        "document_id": document_id,
+        "document_title": doc.get("metadata", {}).get("title") or doc.get("original_filename", "Untitled"),
+        "patches": all_patches,
+        "total": len(all_patches),
+        "approved": sum(1 for p in all_patches if p.get("status") in ("approved", "edited")),
+        "rejected": sum(1 for p in all_patches if p.get("status") == "rejected"),
+        "pending": sum(1 for p in all_patches if p.get("status") == "pending"),
+    }
 
 
 @router.delete("/{session_id}")
@@ -1172,13 +1210,30 @@ async def _generate_patches_task(session_id: str, session: dict):
         # Delete old patches for re-run
         await session_repo.delete_patches(session_id)
 
-        patches = []
-        for opp in selected:
+        logger.info("Generating patches for %d selected opportunities (parallel)", len(selected))
+
+        # Note: when diagnostic re-runs, opportunities get new IDs but research plans
+        # still reference old IDs. The fallback pool above handles this gracefully.
+
+        # Pre-fetch ALL accepted evidence for the session as fallback
+        # (needed when diagnostic re-run creates new opportunity IDs that don't match plan IDs)
+        all_session_evidence = await session_repo.find_evidence_items(session_id)
+        all_accepted_evidence = [e for e in all_session_evidence if e.get("accepted") is True]
+        logger.info("Session has %d accepted evidence items (fallback pool)", len(all_accepted_evidence))
+
+        async def _generate_one_patch(opp):
+            """Generate a single patch for one opportunity — runs in parallel."""
             opp_id = opp.get("opportunity_id", opp.get("id", ""))
             accepted_evidence = await session_repo.find_accepted_evidence_for_opportunity(opp_id)
 
+            if not accepted_evidence and all_accepted_evidence:
+                # Fallback: use all accepted session evidence when opp→plan chain is broken
+                accepted_evidence = all_accepted_evidence
+                logger.info("  Patch gen opp %s: using %d session-level accepted evidence (fallback)", opp_id, len(accepted_evidence))
+
             if not accepted_evidence:
-                continue  # skip opportunities with no accepted evidence
+                logger.warning("  Patch gen opp %s: SKIPPED — no accepted evidence", opp_id)
+                return None  # skip opportunities with no accepted evidence
 
             evidence_text = "\n".join(
                 f"- {e.get('source_title', '')}: {e.get('excerpt', '')[:300]}"
@@ -1211,41 +1266,49 @@ Return ONLY valid JSON with:
 
 Return ONLY valid JSON. No other text."""
 
-            response = await client.chat.completions.create(
-                model=settings.GPT_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a precise technical editor. Write concise, accurate replacement sentences that update outdated information while preserving the document's style."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
-                max_tokens=1000,
-            )
+            try:
+                response = await client.chat.completions.create(
+                    model=settings.GPT_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You are a precise technical editor. Write concise, accurate replacement sentences that update outdated information while preserving the document's style."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.3,
+                    max_tokens=1000,
+                )
 
-            raw = response.choices[0].message.content.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
-            patch_data = json.loads(raw)
+                raw = response.choices[0].message.content.strip()
+                if raw.startswith("```"):
+                    raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+                patch_data = json.loads(raw)
 
-            # Enforce max change percentage
-            change_pct = patch_data.get("change_pct", 50)
-            if change_pct > max_change_pct:
-                continue  # skip patches that change too much
+                # Enforce max change percentage
+                change_pct = patch_data.get("change_pct", 50)
+                if change_pct > max_change_pct:
+                    return None  # skip patches that change too much
 
-            patches.append({
-                "patch_id": str(uuid.uuid4())[:8],
-                "opportunity_id": opp_id,
-                "session_id": session_id,
-                "original_sentence": opp.get("original_sentence", ""),
-                "revised_sentence": patch_data.get("revised_sentence", ""),
-                "citation": patch_data.get("citation", ""),
-                "rationale": patch_data.get("rationale", ""),
-                "confidence": patch_data.get("confidence", 0.5),
-                "change_pct": change_pct,
-                "status": PatchStatus.PENDING.value,
-                "editor_revision": None,
-                "reviewed_at": None,
-                "section_ref": opp.get("section_ref", ""),
-            })
+                return {
+                    "patch_id": str(uuid.uuid4())[:8],
+                    "opportunity_id": opp_id,
+                    "session_id": session_id,
+                    "original_sentence": opp.get("original_sentence", ""),
+                    "revised_sentence": patch_data.get("revised_sentence", ""),
+                    "citation": patch_data.get("citation", ""),
+                    "rationale": patch_data.get("rationale", ""),
+                    "confidence": patch_data.get("confidence", 0.5),
+                    "change_pct": change_pct,
+                    "status": PatchStatus.PENDING.value,
+                    "editor_revision": None,
+                    "reviewed_at": None,
+                    "section_ref": opp.get("section_ref", ""),
+                }
+            except Exception as e:
+                logger.warning("Patch generation failed for opp %s: %s", opp_id, e)
+                return None
+
+        # Run all OpenAI calls in parallel
+        results = await asyncio.gather(*[_generate_one_patch(opp) for opp in selected])
+        patches = [p for p in results if p is not None]
 
         await session_repo.create_patches(patches)
         await session_repo.update_session(session_id, {
@@ -1317,6 +1380,126 @@ async def review_patch(
     }
 
 
+class AskAIRequest(BaseModel):
+    prompt: str
+    section_id: str  # outline item id
+    section_text: str = ""  # the heading text of the selected section
+    position: str = "replace"  # "before", "after", "replace"
+
+
+@router.post("/{session_id}/ask-ai")
+async def ask_ai_patch(
+    session_id: str,
+    req: AskAIRequest,
+    user=Depends(get_current_user_dep),
+):
+    """Use AI to generate a new patch based on user prompt, section, and position."""
+    from openai import AsyncOpenAI
+    import json as _json
+
+    if req.position not in ("before", "after", "replace"):
+        raise HTTPException(400, "position must be 'before', 'after', or 'replace'")
+
+    db = get_database()
+    session_repo = SessionRepository(db)
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    rules = session.get("rules", {}) or {}
+    citation_style = rules.get("citation_style", "inline")
+    voice_preservation = rules.get("voice_preservation", True)
+
+    style_instructions = ""
+    if voice_preservation:
+        style_instructions = "Preserve the original author's writing style, tone, and voice. "
+    style_instructions += f"Citation style: {citation_style}. "
+
+    position_label = {
+        "before": "INSERT NEW CONTENT BEFORE",
+        "after": "INSERT NEW CONTENT AFTER",
+        "replace": "REPLACE THE CONTENT OF",
+    }[req.position]
+
+    prompt_text = f"""You are a technical editor. The user wants to {position_label.lower()} the section "{req.section_text}" in a document.
+
+User instruction: "{req.prompt}"
+Target section: "{req.section_text}"
+Position: {position_label} this section
+
+{style_instructions}
+
+IMPORTANT: Keep the generated content concise and accurate — maximum 4 to 5 lines. Be direct and to the point. Do not write lengthy paragraphs.
+
+Return ONLY valid JSON with:
+- "revised_sentence": the generated content (concise, 4-5 lines max)
+- "citation": citation if applicable (empty string if none)
+- "rationale": brief explanation of what was generated and why (1 sentence)
+- "confidence": float 0.0-1.0
+
+Return ONLY valid JSON. No other text."""
+
+    try:
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        response = await client.chat.completions.create(
+            model=settings.GPT_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a precise technical editor. Generate accurate, well-cited content that matches the document's style."},
+                {"role": "user", "content": prompt_text},
+            ],
+            temperature=0.3,
+            max_tokens=500,
+        )
+
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+        ai_data = _json.loads(raw)
+
+        position_labels_short = {"before": "Before", "after": "After", "replace": "Replace"}
+        section_ref = f"{position_labels_short[req.position]}: {req.section_text}"
+
+        original = f"[{position_labels_short[req.position]} section: {req.section_text}]" if req.position != "replace" else req.section_text
+
+        patch = {
+            "patch_id": str(uuid.uuid4())[:8],
+            "opportunity_id": "ask-ai",
+            "session_id": session_id,
+            "original_sentence": original,
+            "revised_sentence": ai_data.get("revised_sentence", ""),
+            "citation": ai_data.get("citation", ""),
+            "rationale": ai_data.get("rationale", ""),
+            "confidence": ai_data.get("confidence", 0.5),
+            "change_pct": 100.0,
+            "status": PatchStatus.PENDING.value,
+            "editor_revision": None,
+            "reviewed_at": None,
+            "section_ref": section_ref,
+            "ask_ai_meta": {
+                "section_id": req.section_id,
+                "section_text": req.section_text,
+                "position": req.position,
+                "user_prompt": req.prompt,
+            },
+        }
+
+        await session_repo.create_patches([patch])
+        # Remove MongoDB _id if present (not JSON-serializable)
+        patch.pop("_id", None)
+        logger.info("Ask AI patch created for session %s: %s (section=%s, position=%s)",
+                     session_id, patch["patch_id"], req.section_text, req.position)
+
+        return {
+            "patch": patch,
+            "message": "AI-generated patch created successfully.",
+        }
+    except Exception as e:
+        logger.error("Ask AI failed for session %s: %s", session_id, str(e))
+        raise HTTPException(500, f"AI generation failed: {str(e)}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 8: APPLY PATCHES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1342,6 +1525,10 @@ async def apply_patches(
         raise HTTPException(404, "Document not found")
 
     approved_patches = await session_repo.find_approved_patches(session_id)
+    ask_ai_count = sum(1 for p in approved_patches if p.get("ask_ai_meta"))
+    logger.info("Session %s: %d approved patches (%d regular, %d ask-ai)",
+                session_id, len(approved_patches), len(approved_patches) - ask_ai_count, ask_ai_count)
+
     if not approved_patches:
         # No approved patches — skip application, just advance the session
         await session_repo.update_session(session_id, {
@@ -1369,13 +1556,57 @@ async def apply_patches(
 
         try:
             from docx import Document as DocxDocument
+            from copy import deepcopy
             docx_doc = DocxDocument(working_path)
 
-            for patch in approved_patches:
-                original_text = patch.get("original_sentence", "")
-                final_text = patch.get("editor_revision") or patch.get("revised_sentence", "")
+            para_count_before = len(docx_doc.paragraphs)
+            logger.info("DOCX loaded: %d paragraphs", para_count_before)
 
-                if not original_text or not final_text:
+            for patch in approved_patches:
+                final_text = patch.get("editor_revision") or patch.get("revised_sentence", "")
+                ask_ai_meta = patch.get("ask_ai_meta")
+
+                if not final_text:
+                    skipped += 1
+                    continue
+
+                # --- Ask AI patches: insert/replace relative to a section heading ---
+                if ask_ai_meta:
+                    section_text = ask_ai_meta.get("section_text", "").strip()
+                    position = ask_ai_meta.get("position", "after")
+
+                    if not section_text:
+                        skipped += 1
+                        continue
+
+                    heading_idx = _find_heading_in_docx(docx_doc, section_text)
+
+                    if heading_idx is None:
+                        logger.warning("Ask AI patch: heading '%s' not found in DOCX (patch_id=%s)",
+                                       section_text, patch.get("patch_id"))
+                        skipped += 1
+                        continue
+
+                    logger.info("Ask AI patch: found heading at paragraph %d for '%s' (position=%s)",
+                                heading_idx, section_text, position)
+
+                    if position == "before":
+                        _insert_text_near_paragraph(docx_doc, heading_idx, final_text, before=True)
+                        applied += 1
+                    elif position == "after":
+                        _insert_text_near_paragraph(docx_doc, heading_idx, final_text, before=False)
+                        applied += 1
+                    elif position == "replace":
+                        _replace_section_content(docx_doc, heading_idx, final_text)
+                        applied += 1
+                    else:
+                        skipped += 1
+                    continue
+
+                # --- Regular patches: find-and-replace ---
+                original_text = patch.get("original_sentence", "")
+
+                if not original_text:
                     skipped += 1
                     continue
 
@@ -1390,7 +1621,23 @@ async def apply_patches(
                 if not found:
                     skipped += 1
 
+            para_count_after = len(docx_doc.paragraphs)
+            logger.info("DOCX after patches: %d paragraphs (was %d, diff=%d)",
+                        para_count_after, para_count_before, para_count_after - para_count_before)
+
             docx_doc.save(working_path)
+            logger.info("DOCX saved to %s", working_path)
+
+            # Verify: reload and check paragraph count
+            verify_doc = DocxDocument(working_path)
+            verify_count = len(verify_doc.paragraphs)
+            logger.info("VERIFY: Reloaded saved DOCX has %d paragraphs (expected %d)",
+                        verify_count, para_count_after)
+            # Log first 5 new paragraphs for debugging
+            if verify_count > para_count_before:
+                for i in range(min(5, verify_count)):
+                    txt = verify_doc.paragraphs[i].text[:80] if verify_doc.paragraphs[i].text else "(empty)"
+                    logger.info("  VERIFY para[%d]: %s", i, txt)
 
         except Exception as e:
             logger.error("Patch application failed for session %s: %s", session_id, e)
@@ -1428,6 +1675,411 @@ def _replace_text_in_paragraph(paragraph, old_text: str, new_text: str):
         paragraph.runs[0].text = new_full
         for run in paragraph.runs[1:]:
             run.text = ""
+
+
+def _normalize_text(text: str) -> str:
+    """Normalize whitespace and case for fuzzy heading matching."""
+    import re
+    return re.sub(r'\s+', ' ', text.strip()).lower()
+
+
+def _find_heading_in_docx(docx_doc, section_text: str):
+    """Find a heading paragraph index using multiple matching strategies."""
+    normalized_target = _normalize_text(section_text)
+
+    # Strategy 1: Exact substring match
+    for idx, para in enumerate(docx_doc.paragraphs):
+        if section_text in para.text:
+            return idx
+
+    # Strategy 2: Normalized (whitespace + case-insensitive) match
+    for idx, para in enumerate(docx_doc.paragraphs):
+        if normalized_target in _normalize_text(para.text):
+            return idx
+
+    # Strategy 3: Match by stripping leading numbers (e.g., "1.2 Title" -> "Title")
+    import re
+    core_text = re.sub(r'^[\d.]+\s*', '', section_text).strip()
+    if core_text and len(core_text) > 3:
+        core_lower = core_text.lower()
+        for idx, para in enumerate(docx_doc.paragraphs):
+            para_core = re.sub(r'^[\d.]+\s*', '', para.text).strip().lower()
+            if core_lower in para_core or para_core in core_lower:
+                return idx
+
+    # Strategy 4: Check if section_text contains most words of any paragraph
+    target_words = set(normalized_target.split())
+    if len(target_words) >= 3:
+        best_idx = None
+        best_overlap = 0
+        for idx, para in enumerate(docx_doc.paragraphs):
+            para_text = para.text.strip()
+            if not para_text:
+                continue
+            para_words = set(_normalize_text(para_text).split())
+            overlap = len(target_words & para_words)
+            ratio = overlap / max(len(target_words), 1)
+            if ratio > 0.7 and overlap > best_overlap:
+                best_overlap = overlap
+                best_idx = idx
+        if best_idx is not None:
+            return best_idx
+
+    return None
+
+
+def _find_reference_body_paragraph(docx_doc, heading_idx: int):
+    """Find the nearest body (non-heading) paragraph after the heading to copy formatting from."""
+    for idx in range(heading_idx + 1, len(docx_doc.paragraphs)):
+        para = docx_doc.paragraphs[idx]
+        style_name = para.style.name if para.style else ""
+        if not style_name.startswith("Heading") and para.text.strip():
+            return para
+    for idx in range(heading_idx - 1, -1, -1):
+        para = docx_doc.paragraphs[idx]
+        style_name = para.style.name if para.style else ""
+        if not style_name.startswith("Heading") and para.text.strip():
+            return para
+    return None
+
+
+def _build_formatted_paragraph(docx_doc, ref_para, text_content: str):
+    """Create a new paragraph that matches the formatting of ref_para using python-docx API."""
+    from copy import deepcopy
+    from docx.oxml.ns import qn
+
+    # Use add_paragraph with the same style
+    style_name = None
+    if ref_para and ref_para.style:
+        style_name = ref_para.style.name
+
+    new_para = docx_doc.add_paragraph("", style=style_name)
+
+    # Copy paragraph-level XML properties (alignment, spacing, indentation)
+    if ref_para:
+        source_pPr = ref_para._element.find(qn("w:pPr"))
+        if source_pPr is not None:
+            existing_pPr = new_para._element.find(qn("w:pPr"))
+            if existing_pPr is not None:
+                new_para._element.remove(existing_pPr)
+            new_para._element.insert(0, deepcopy(source_pPr))
+
+    # Add the text as a run, copying run formatting from reference
+    run = new_para.add_run(text_content)
+
+    if ref_para and ref_para.runs:
+        src_run = ref_para.runs[0]
+        # Copy font properties
+        if src_run.font.name:
+            run.font.name = src_run.font.name
+        if src_run.font.size:
+            run.font.size = src_run.font.size
+        run.font.bold = src_run.font.bold
+        run.font.italic = src_run.font.italic
+        if src_run.font.color and src_run.font.color.rgb:
+            run.font.color.rgb = src_run.font.color.rgb
+
+        # Also copy raw rPr XML for properties not covered by python-docx API
+        source_rPr = src_run._element.find(qn("w:rPr"))
+        if source_rPr is not None:
+            existing_rPr = run._element.find(qn("w:rPr"))
+            if existing_rPr is not None:
+                run._element.remove(existing_rPr)
+            run._element.insert(0, deepcopy(source_rPr))
+
+    # Copy paragraph alignment
+    if ref_para:
+        new_para.alignment = ref_para.alignment
+
+    return new_para
+
+
+def _insert_text_near_paragraph(docx_doc, para_idx: int, text: str, before: bool = False):
+    """Insert text content before or after a paragraph, matching document formatting."""
+    target_para = docx_doc.paragraphs[para_idx]
+    target_element = target_para._element
+
+    ref_para = _find_reference_body_paragraph(docx_doc, para_idx)
+    if ref_para:
+        logger.info("  Using reference style: '%s', font: %s, size: %s",
+                     ref_para.style.name if ref_para.style else "?",
+                     ref_para.runs[0].font.name if ref_para.runs else "?",
+                     ref_para.runs[0].font.size if ref_para.runs else "?")
+
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+
+    if before:
+        for line in reversed(lines):
+            new_para = _build_formatted_paragraph(docx_doc, ref_para, line)
+            target_element.addprevious(new_para._element)
+            logger.info("  Inserted paragraph BEFORE idx %d: '%s...'", para_idx, line[:60])
+    else:
+        insert_after = target_element
+        for line in lines:
+            new_para = _build_formatted_paragraph(docx_doc, ref_para, line)
+            insert_after.addnext(new_para._element)
+            logger.info("  Inserted paragraph AFTER idx %d: '%s...'", para_idx, line[:60])
+            insert_after = new_para._element
+
+
+def _replace_section_content(docx_doc, heading_idx: int, text: str):
+    """Replace content between this heading and the next heading with new text."""
+    heading_para = docx_doc.paragraphs[heading_idx]
+
+    body_indices = []
+    for idx in range(heading_idx + 1, len(docx_doc.paragraphs)):
+        para = docx_doc.paragraphs[idx]
+        style_name = para.style.name if para.style else ""
+        if style_name.startswith("Heading"):
+            break
+        body_indices.append(idx)
+
+    ref_para = _find_reference_body_paragraph(docx_doc, heading_idx)
+
+    for idx in reversed(body_indices):
+        para = docx_doc.paragraphs[idx]
+        para._element.getparent().remove(para._element)
+
+    logger.info("  Removed %d body paragraphs for replace", len(body_indices))
+    _insert_text_near_paragraph(docx_doc, heading_idx, text, before=False)
+
+
+# ── Visual Diff / Tracked Changes Helpers ─────────────────────────────────
+
+def _add_highlight_to_rPr(rPr_element, color: str):
+    """Add highlight color to a run properties element.
+    Colors: yellow, green, red, cyan, magenta, blue, darkYellow, etc.
+    """
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    # Remove existing highlight
+    existing = rPr_element.find(qn("w:highlight"))
+    if existing is not None:
+        rPr_element.remove(existing)
+
+    highlight = OxmlElement("w:highlight")
+    highlight.set(qn("w:val"), color)
+    rPr_element.append(highlight)
+
+
+def _add_strikethrough_to_rPr(rPr_element):
+    """Add strikethrough to a run properties element."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    strike = OxmlElement("w:strike")
+    strike.set(qn("w:val"), "true")
+    rPr_element.append(strike)
+
+
+def _add_font_color_to_rPr(rPr_element, hex_color: str):
+    """Set font color on a run properties element. hex_color like 'FF0000' for red."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    existing = rPr_element.find(qn("w:color"))
+    if existing is not None:
+        rPr_element.remove(existing)
+
+    color_elem = OxmlElement("w:color")
+    color_elem.set(qn("w:val"), hex_color)
+    rPr_element.append(color_elem)
+
+
+def _build_tracked_changes_docx(original_path: str, approved_patches: list, output_path: str):
+    """Build a visual diff DOCX from the original + approved patches.
+
+    Visual format (no Review tab needed — visible immediately):
+    - Regular patches: original text with RED highlight + strikethrough,
+      new replacement text with GREEN highlight, both inline
+    - Ask AI patches (new content): with YELLOW highlight, matching document formatting
+    """
+    from docx import Document as DocxDocument
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from copy import deepcopy
+
+    docx_doc = DocxDocument(original_path)
+    logger.info("TRACKED: building visual diff from %d patches", len(approved_patches))
+
+    regular_applied = 0
+    ai_applied = 0
+
+    for patch in approved_patches:
+        final_text = patch.get("editor_revision") or patch.get("revised_sentence", "")
+        ask_ai_meta = patch.get("ask_ai_meta")
+
+        if not final_text:
+            continue
+
+        try:
+            if ask_ai_meta:
+                section_text = ask_ai_meta.get("section_text", "").strip()
+                position = ask_ai_meta.get("position", "after")
+                if not section_text:
+                    continue
+
+                heading_idx = _find_heading_in_docx(docx_doc, section_text)
+                if heading_idx is None:
+                    logger.warning("TRACKED: heading not found for '%s'", section_text[:50])
+                    continue
+
+                ref_para = _find_reference_body_paragraph(docx_doc, heading_idx)
+                target_element = docx_doc.paragraphs[heading_idx]._element
+
+                lines = [line.strip() for line in final_text.split("\n") if line.strip()]
+
+                if position == "before":
+                    for line in reversed(lines):
+                        new_p = _make_highlighted_paragraph_xml(ref_para, line, "yellow")
+                        target_element.addprevious(new_p)
+                else:
+                    insert_after = target_element
+                    for line in lines:
+                        new_p = _make_highlighted_paragraph_xml(ref_para, line, "yellow")
+                        insert_after.addnext(new_p)
+                        insert_after = new_p
+
+                ai_applied += 1
+                logger.info("TRACKED: AI patch applied (yellow highlight) near '%s'", section_text[:40])
+
+            else:
+                original_text = patch.get("original_sentence", "")
+                if not original_text or not final_text:
+                    continue
+
+                found = False
+                for para in docx_doc.paragraphs:
+                    if original_text in para.text:
+                        _apply_visual_diff_to_paragraph(para, original_text, final_text)
+                        found = True
+                        regular_applied += 1
+                        logger.info("TRACKED: regular patch applied (red/green) for '%s...'", original_text[:40])
+                        break
+
+                if not found:
+                    logger.warning("TRACKED: original text not found: '%s...'", original_text[:50])
+
+        except Exception as e:
+            logger.error("TRACKED: patch failed (patch_id=%s): %s", patch.get("patch_id"), e)
+
+    docx_doc.save(output_path)
+    logger.info("TRACKED: visual diff DOCX saved — %d regular, %d AI patches applied", regular_applied, ai_applied)
+
+
+def _make_highlighted_paragraph_xml(ref_para, text: str, highlight_color: str):
+    """Create a paragraph element with highlighted text, copying formatting from ref_para.
+    Uses pure XML — no docx_doc.add_paragraph() to avoid document corruption.
+    """
+    from copy import deepcopy
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    new_p = OxmlElement("w:p")
+
+    # Copy paragraph properties (alignment, spacing, indentation) from reference
+    if ref_para:
+        source_pPr = ref_para._element.find(qn("w:pPr"))
+        if source_pPr is not None:
+            new_p.append(deepcopy(source_pPr))
+
+    # Build run with text
+    new_r = OxmlElement("w:r")
+
+    # Build run properties: copy from reference + add highlight
+    rPr = OxmlElement("w:rPr")
+    if ref_para:
+        source_runs = ref_para._element.findall(qn("w:r"))
+        if source_runs:
+            source_rPr = source_runs[0].find(qn("w:rPr"))
+            if source_rPr is not None:
+                rPr = deepcopy(source_rPr)
+
+    # Add the highlight color
+    _add_highlight_to_rPr(rPr, highlight_color)
+    new_r.append(rPr)
+
+    # Add text
+    new_t = OxmlElement("w:t")
+    new_t.set(qn("xml:space"), "preserve")
+    new_t.text = text
+    new_r.append(new_t)
+
+    new_p.append(new_r)
+    return new_p
+
+
+def _apply_visual_diff_to_paragraph(para, old_text: str, new_text: str):
+    """Apply visual diff: original in red strikethrough+red highlight, new in green highlight.
+    All visible directly — no Review tab needed.
+    """
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from copy import deepcopy
+
+    full_text = "".join(run.text for run in para.runs)
+    if old_text not in full_text:
+        return
+
+    start_idx = full_text.index(old_text)
+    end_idx = start_idx + len(old_text)
+
+    before_text = full_text[:start_idx]
+    after_text = full_text[end_idx:]
+
+    # Get original run formatting
+    orig_rPr = None
+    if para.runs:
+        orig_rPr_elem = para.runs[0]._element.find(qn("w:rPr"))
+        if orig_rPr_elem is not None:
+            orig_rPr = deepcopy(orig_rPr_elem)
+
+    # Clear all existing runs
+    for run in list(para.runs):
+        run._element.getparent().remove(run._element)
+
+    def make_run_with_text(text, rPr_source=None):
+        r = OxmlElement("w:r")
+        if rPr_source:
+            r.append(deepcopy(rPr_source))
+        else:
+            r.append(OxmlElement("w:rPr"))
+        t = OxmlElement("w:t")
+        t.set(qn("xml:space"), "preserve")
+        t.text = text
+        r.append(t)
+        return r
+
+    # 1. Unchanged text before
+    if before_text:
+        para._element.append(make_run_with_text(before_text, orig_rPr))
+
+    # 2. Original text — strikethrough only (no red color/highlight)
+    old_run = make_run_with_text(old_text, orig_rPr)
+    old_rPr = old_run.find(qn("w:rPr"))
+    if old_rPr is None:
+        old_rPr = OxmlElement("w:rPr")
+        old_run.insert(0, old_rPr)
+    _add_strikethrough_to_rPr(old_rPr)
+    para._element.append(old_run)
+
+    # 3. Space separator between old and new
+    sep_run = make_run_with_text(" ", orig_rPr)
+    para._element.append(sep_run)
+
+    # 4. New text — green highlight, same font
+    new_run = make_run_with_text(new_text, orig_rPr)
+    new_rPr = new_run.find(qn("w:rPr"))
+    if new_rPr is None:
+        new_rPr = OxmlElement("w:rPr")
+        new_run.insert(0, new_rPr)
+    _add_highlight_to_rPr(new_rPr, "green")
+    para._element.append(new_run)
+
+    # 5. Unchanged text after
+    if after_text:
+        para._element.append(make_run_with_text(after_text, orig_rPr))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1622,9 +2274,23 @@ async def resolve_statement(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/{session_id}/export/tracked-docx")
-async def export_tracked_docx(session_id: str, user=Depends(get_current_user_dep)):
-    """Export tracked-changes DOCX using LibreOffice compare."""
+async def export_tracked_docx(session_id: str, token: Optional[str] = None, request: Request = None):
+    """Export tracked-changes DOCX with visual diff (red/green/yellow highlights)."""
     from fastapi.responses import FileResponse
+
+    # Auth: accept either query param token (direct browser download) or Authorization header
+    user = None
+    if token:
+        user = verify_download_token(token)
+    else:
+        # Try Authorization header
+        auth_header = request.headers.get("authorization", "") if request else ""
+        if auth_header.startswith("Bearer "):
+            jwt_token = auth_header[7:]
+            payload = decode_token(jwt_token)
+            user = {"email": payload.get("sub"), "role": payload.get("role", "user"), "token": jwt_token}
+    if not user:
+        raise HTTPException(401, "Authentication required — pass token query param or Authorization header")
 
     db = get_database()
     session_repo = SessionRepository(db)
@@ -1663,25 +2329,20 @@ async def export_tracked_docx(session_id: str, user=Depends(get_current_user_dep
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, f"tracked_{doc.get('original_filename', 'document.docx')}")
 
-    # Try LibreOffice comparison
+    logger.info("EXPORT tracked-docx: building tracked changes from patches")
+
+    # Build tracked changes DOCX using approved patches
+    approved_patches = await session_repo.find_approved_patches(session_id)
     try:
-        compare_script = os.path.join(os.path.dirname(__file__), "..", "utils", "compare_docs.py")
-        result = subprocess.run(
-            [
-                "python", compare_script,
-                "--original", original_path,
-                "--modified", working_path,
-                "--output", output_path,
-                "--author", "AI Book Updater",
-            ],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode != 0:
-            raise Exception(result.stderr)
+        _build_tracked_changes_docx(original_path, approved_patches, output_path)
+        logger.info("EXPORT: tracked changes DOCX built at %s", output_path)
     except Exception as e:
-        logger.warning("LibreOffice compare failed, falling back to modified copy: %s", e)
-        # Fallback: just use the working doc
+        logger.error("EXPORT: tracked changes build failed: %s", e)
+        # Fallback: copy working doc
         shutil.copy2(working_path, output_path)
+
+    output_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+    logger.info("EXPORT: serving %s (%d bytes)", output_path, output_size)
 
     await session_repo.update_session(session_id, {
         "status": SessionStatus.EXPORTED.value,
@@ -1695,9 +2356,22 @@ async def export_tracked_docx(session_id: str, user=Depends(get_current_user_dep
 
 
 @router.get("/{session_id}/export/clean-docx")
-async def export_clean_docx(session_id: str, user=Depends(get_current_user_dep)):
+async def export_clean_docx(session_id: str, token: Optional[str] = None, request: Request = None):
     """Export clean DOCX with all changes accepted."""
     from fastapi.responses import FileResponse
+
+    # Auth: accept either query param token or Authorization header
+    user = None
+    if token:
+        user = verify_download_token(token)
+    else:
+        auth_header = request.headers.get("authorization", "") if request else ""
+        if auth_header.startswith("Bearer "):
+            jwt_token = auth_header[7:]
+            payload = decode_token(jwt_token)
+            user = {"email": payload.get("sub"), "role": payload.get("role", "user"), "token": jwt_token}
+    if not user:
+        raise HTTPException(401, "Authentication required")
 
     db = get_database()
     session_repo = SessionRepository(db)
@@ -1718,6 +2392,9 @@ async def export_clean_docx(session_id: str, user=Depends(get_current_user_dep))
             "Working document not available. The original file may be on a different server. "
             "Use the Changelog export instead, which contains all patch details.",
         )
+
+    logger.info("EXPORT clean-docx: serving working_path=%s (%d bytes)",
+                working_path, os.path.getsize(working_path) if os.path.exists(working_path) else 0)
 
     return FileResponse(
         working_path,
