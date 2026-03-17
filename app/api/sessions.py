@@ -383,6 +383,9 @@ async def extract_outline(
         from docx import Document as DocxDocument
         docx_doc = DocxDocument(file_path)
 
+        # Collect all paragraph texts for duplicate detection
+        seen_heading_texts = set()
+
         for idx, para in enumerate(docx_doc.paragraphs):
             style_name = para.style.name if para.style else ""
             text = para.text.strip()
@@ -394,10 +397,27 @@ async def extract_outline(
             if any(skip in style_lower for skip in ("header", "footer", "caption", "toc")):
                 continue
 
+            # ── Filter: skip page-header section numbers ──────────────
+            # These are short lines that are ONLY a section number (e.g. "2.1" or "3.2.1")
+            # appearing at the top of pages as running headers
+            if _re.match(r"^\d+(\.\d+)*$", text):
+                continue  # bare section number with no title text — skip
+
+            # Also skip very short paragraphs that look like page headers
+            # (just a number followed by a few chars, or chapter/section number repeated)
+            if len(text) < 8 and _re.match(r"^\d+(\.\d+)*\s*$", text):
+                continue
+
             # Detect heading styles: "Heading 1", "Heading #1", "heading1", etc.
             heading_match = _re.match(r"[Hh]eading\s*#?\s*(\d+)", style_name)
             if heading_match:
                 level = int(heading_match.group(1))
+                # Deduplicate: skip if we already saw this exact heading text
+                normalized = _re.sub(r'\s+', ' ', text).strip().lower()
+                if normalized in seen_heading_texts:
+                    logger.debug("Outline: skipping duplicate heading '%s' at para %d", text, idx)
+                    continue
+                seen_heading_texts.add(normalized)
                 outline_items.append({
                     "id": str(uuid.uuid4())[:8],
                     "text": text,
@@ -413,6 +433,12 @@ async def extract_outline(
                 depth = numbered_heading.group(1).count(".") + 1
                 # Only count as heading if the paragraph is short (not a full body paragraph)
                 if len(text) < 80 or all(r.bold for r in para.runs if r.text.strip()):
+                    # Deduplicate: skip if we already saw this heading
+                    normalized = _re.sub(r'\s+', ' ', text).strip().lower()
+                    if normalized in seen_heading_texts:
+                        logger.debug("Outline: skipping duplicate numbered heading '%s' at para %d", text, idx)
+                        continue
+                    seen_heading_texts.add(normalized)
                     outline_items.append({
                         "id": str(uuid.uuid4())[:8],
                         "text": text,
@@ -1380,11 +1406,100 @@ async def review_patch(
     }
 
 
+@router.get("/{session_id}/section-paragraphs")
+async def get_section_paragraphs(
+    session_id: str,
+    section_id: str,
+    user=Depends(get_current_user_dep),
+):
+    """Get all paragraphs within a section (between this heading and the next)."""
+    db = get_database()
+    session_repo = SessionRepository(db)
+    doc_repo = DocumentRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    outline = session.get("outline", [])
+    target = next((item for item in outline if item.get("id") == section_id), None)
+    if not target:
+        raise HTTPException(404, "Section not found in outline")
+
+    # Find the next heading's paragraph_index to bound the section
+    target_para_idx = target.get("paragraph_index", 0)
+    next_para_idx = None
+    found_target = False
+    for item in outline:
+        if found_target:
+            next_para_idx = item.get("paragraph_index")
+            break
+        if item.get("id") == section_id:
+            found_target = True
+
+    # Load the DOCX to extract paragraphs in this range
+    doc = await doc_repo.find_by_id(session["document_id"])
+    if not doc:
+        raise HTTPException(404, "Document not found")
+
+    paragraphs = []
+
+    # Try DOCX first for accurate paragraph extraction
+    file_path = _resolve_file_path(doc.get("file_path", ""))
+    try:
+        from docx import Document as DocxDocument
+        docx_doc = DocxDocument(file_path)
+
+        end_idx = next_para_idx if next_para_idx else len(docx_doc.paragraphs)
+        # Start from the paragraph AFTER the heading itself
+        for idx in range(target_para_idx + 1, end_idx):
+            para = docx_doc.paragraphs[idx]
+            text = para.text.strip()
+            if not text:
+                continue
+            # Stop at next heading style
+            style_name = para.style.name if para.style else ""
+            if style_name.lower().startswith("heading"):
+                break
+            paragraphs.append({
+                "index": idx,
+                "text": text[:200] + ("..." if len(text) > 200 else ""),
+                "full_text": text,
+            })
+    except Exception as e:
+        logger.warning("DOCX paragraph extraction failed, falling back to text_content: %s", e)
+        # Fallback: use text_content split by newlines
+        text_content = doc.get("text_content", "")
+        lines = text_content.split("\n")
+        end_idx = next_para_idx if next_para_idx else len(lines)
+        for idx in range(target_para_idx + 1, min(end_idx, len(lines))):
+            text = lines[idx].strip()
+            if text:
+                paragraphs.append({
+                    "index": idx,
+                    "text": text[:200] + ("..." if len(text) > 200 else ""),
+                    "full_text": text,
+                })
+
+    return {
+        "session_id": session_id,
+        "section_id": section_id,
+        "section_text": target.get("text", ""),
+        "paragraphs": paragraphs,
+        "total": len(paragraphs),
+    }
+
+
 class AskAIRequest(BaseModel):
     prompt: str
     section_id: str  # outline item id
     section_text: str = ""  # the heading text of the selected section
     position: str = "replace"  # "before", "after", "replace"
+    # Paragraph-level targeting (optional — if set, targets a specific paragraph)
+    paragraph_index: int = -1  # -1 means section-level (legacy)
+    paragraph_text: str = ""  # the paragraph text for matching
 
 
 @router.post("/{session_id}/ask-ai")
@@ -1417,17 +1532,27 @@ async def ask_ai_patch(
         style_instructions = "Preserve the original author's writing style, tone, and voice. "
     style_instructions += f"Citation style: {citation_style}. "
 
+    # Determine if this is paragraph-level or section-level targeting
+    is_paragraph_level = req.paragraph_index >= 0 and req.paragraph_text
+
     position_label = {
         "before": "INSERT NEW CONTENT BEFORE",
         "after": "INSERT NEW CONTENT AFTER",
         "replace": "REPLACE THE CONTENT OF",
     }[req.position]
 
-    prompt_text = f"""You are a technical editor. The user wants to {position_label.lower()} the section "{req.section_text}" in a document.
+    if is_paragraph_level:
+        target_desc = f'the paragraph: "{req.paragraph_text[:200]}"'
+        target_context = f'This paragraph is in section "{req.section_text}".'
+    else:
+        target_desc = f'the section "{req.section_text}"'
+        target_context = ""
+
+    prompt_text = f"""You are a technical editor. The user wants to {position_label.lower()} {target_desc} in a document.
+{target_context}
 
 User instruction: "{req.prompt}"
-Target section: "{req.section_text}"
-Position: {position_label} this section
+Position: {position_label} this {"paragraph" if is_paragraph_level else "section"}
 
 {style_instructions}
 
@@ -1459,9 +1584,25 @@ Return ONLY valid JSON. No other text."""
         ai_data = _json.loads(raw)
 
         position_labels_short = {"before": "Before", "after": "After", "replace": "Replace"}
-        section_ref = f"{position_labels_short[req.position]}: {req.section_text}"
 
-        original = f"[{position_labels_short[req.position]} section: {req.section_text}]" if req.position != "replace" else req.section_text
+        if is_paragraph_level:
+            short_para = req.paragraph_text[:60] + ("..." if len(req.paragraph_text) > 60 else "")
+            section_ref = f"{position_labels_short[req.position]} paragraph in: {req.section_text}"
+            original = f"[{position_labels_short[req.position]} paragraph: {short_para}]" if req.position != "replace" else req.paragraph_text
+        else:
+            section_ref = f"{position_labels_short[req.position]}: {req.section_text}"
+            original = f"[{position_labels_short[req.position]} section: {req.section_text}]" if req.position != "replace" else req.section_text
+
+        ask_ai_meta = {
+            "section_id": req.section_id,
+            "section_text": req.section_text,
+            "position": req.position,
+            "user_prompt": req.prompt,
+        }
+        # Add paragraph-level targeting info
+        if is_paragraph_level:
+            ask_ai_meta["paragraph_index"] = req.paragraph_index
+            ask_ai_meta["paragraph_text"] = req.paragraph_text
 
         patch = {
             "patch_id": str(uuid.uuid4())[:8],
@@ -1477,12 +1618,7 @@ Return ONLY valid JSON. No other text."""
             "editor_revision": None,
             "reviewed_at": None,
             "section_ref": section_ref,
-            "ask_ai_meta": {
-                "section_id": req.section_id,
-                "section_text": req.section_text,
-                "position": req.position,
-                "user_prompt": req.prompt,
-            },
+            "ask_ai_meta": ask_ai_meta,
         }
 
         await session_repo.create_patches([patch])
@@ -1570,11 +1706,48 @@ async def apply_patches(
                     skipped += 1
                     continue
 
-                # --- Ask AI patches: insert/replace relative to a section heading ---
+                # --- Ask AI patches: insert/replace relative to a paragraph or section ---
                 if ask_ai_meta:
                     section_text = ask_ai_meta.get("section_text", "").strip()
                     position = ask_ai_meta.get("position", "after")
+                    para_text = ask_ai_meta.get("paragraph_text", "").strip()
+                    para_idx = ask_ai_meta.get("paragraph_index", -1)
 
+                    # Paragraph-level targeting: find the specific paragraph
+                    if para_text and para_idx >= 0:
+                        target_idx = None
+                        # Strategy 1: exact paragraph index if text matches
+                        if para_idx < len(docx_doc.paragraphs):
+                            if para_text[:50] in docx_doc.paragraphs[para_idx].text:
+                                target_idx = para_idx
+                        # Strategy 2: search all paragraphs for matching text
+                        if target_idx is None:
+                            for search_idx, p in enumerate(docx_doc.paragraphs):
+                                if para_text[:50] in p.text:
+                                    target_idx = search_idx
+                                    break
+
+                        if target_idx is not None:
+                            logger.info("Ask AI patch (paragraph-level): found paragraph at idx %d (position=%s)",
+                                        target_idx, position)
+                            if position == "before":
+                                _insert_text_near_paragraph(docx_doc, target_idx, final_text, before=True)
+                                applied += 1
+                            elif position == "after":
+                                _insert_text_near_paragraph(docx_doc, target_idx, final_text, before=False)
+                                applied += 1
+                            elif position == "replace":
+                                _replace_text_in_paragraph(docx_doc.paragraphs[target_idx],
+                                                          docx_doc.paragraphs[target_idx].text, final_text)
+                                applied += 1
+                            else:
+                                skipped += 1
+                            continue
+                        else:
+                            logger.warning("Ask AI patch: paragraph '%s...' not found, falling back to section",
+                                           para_text[:40])
+
+                    # Section-level targeting (fallback or legacy)
                     if not section_text:
                         skipped += 1
                         continue
@@ -1917,16 +2090,36 @@ def _build_tracked_changes_docx(original_path: str, approved_patches: list, outp
             if ask_ai_meta:
                 section_text = ask_ai_meta.get("section_text", "").strip()
                 position = ask_ai_meta.get("position", "after")
-                if not section_text:
-                    continue
+                para_text = ask_ai_meta.get("paragraph_text", "").strip()
+                para_idx = ask_ai_meta.get("paragraph_index", -1)
 
-                heading_idx = _find_heading_in_docx(docx_doc, section_text)
-                if heading_idx is None:
-                    logger.warning("TRACKED: heading not found for '%s'", section_text[:50])
-                    continue
+                # Find target: paragraph-level or section-level
+                target_element = None
+                ref_para = None
 
-                ref_para = _find_reference_body_paragraph(docx_doc, heading_idx)
-                target_element = docx_doc.paragraphs[heading_idx]._element
+                if para_text and para_idx >= 0:
+                    # Try paragraph-level targeting
+                    found_idx = None
+                    if para_idx < len(docx_doc.paragraphs) and para_text[:50] in docx_doc.paragraphs[para_idx].text:
+                        found_idx = para_idx
+                    else:
+                        for si, p in enumerate(docx_doc.paragraphs):
+                            if para_text[:50] in p.text:
+                                found_idx = si
+                                break
+                    if found_idx is not None:
+                        target_element = docx_doc.paragraphs[found_idx]._element
+                        ref_para = docx_doc.paragraphs[found_idx]
+
+                if target_element is None and section_text:
+                    heading_idx = _find_heading_in_docx(docx_doc, section_text)
+                    if heading_idx is not None:
+                        target_element = docx_doc.paragraphs[heading_idx]._element
+                        ref_para = _find_reference_body_paragraph(docx_doc, heading_idx)
+
+                if target_element is None:
+                    logger.warning("TRACKED: target not found for '%s'", section_text[:50])
+                    continue
 
                 lines = [line.strip() for line in final_text.split("\n") if line.strip()]
 
@@ -1942,7 +2135,8 @@ def _build_tracked_changes_docx(original_path: str, approved_patches: list, outp
                         insert_after = new_p
 
                 ai_applied += 1
-                logger.info("TRACKED: AI patch applied (yellow highlight) near '%s'", section_text[:40])
+                logger.info("TRACKED: AI patch applied (yellow highlight) near '%s'",
+                            (para_text or section_text)[:40])
 
             else:
                 original_text = patch.get("original_sentence", "")
