@@ -380,72 +380,269 @@ async def extract_outline(
 
     try:
         import re as _re
+        import json as _json
         from docx import Document as DocxDocument
         docx_doc = DocxDocument(file_path)
 
-        # Collect all paragraph texts for duplicate detection
-        seen_heading_texts = set()
+        def _strip_trailing_page_number(txt: str) -> str:
+            cleaned = _re.sub(r'\s+\d{1,4}\s*$', '', txt)
+            return cleaned if cleaned else txt
+
+        def _normalize_heading(txt: str) -> str:
+            cleaned = _strip_trailing_page_number(txt)
+            return _re.sub(r'\s+', ' ', cleaned).strip().lower()
+
+        # ── Pass 1: Check if document uses Heading styles ─────────────
+        has_heading_styles = False
+        raw_headings = []  # collect all heading-styled paragraphs
 
         for idx, para in enumerate(docx_doc.paragraphs):
             style_name = para.style.name if para.style else ""
             text = para.text.strip()
             if not text:
                 continue
-
-            # Skip headers/footers/captions
-            style_lower = style_name.lower()
-            if any(skip in style_lower for skip in ("header", "footer", "caption", "toc")):
-                continue
-
-            # ── Filter: skip page-header section numbers ──────────────
-            # These are short lines that are ONLY a section number (e.g. "2.1" or "3.2.1")
-            # appearing at the top of pages as running headers
-            if _re.match(r"^\d+(\.\d+)*$", text):
-                continue  # bare section number with no title text — skip
-
-            # Also skip very short paragraphs that look like page headers
-            # (just a number followed by a few chars, or chapter/section number repeated)
-            if len(text) < 8 and _re.match(r"^\d+(\.\d+)*\s*$", text):
-                continue
-
-            # Detect heading styles: "Heading 1", "Heading #1", "heading1", etc.
             heading_match = _re.match(r"[Hh]eading\s*#?\s*(\d+)", style_name)
             if heading_match:
+                has_heading_styles = True
                 level = int(heading_match.group(1))
-                # Deduplicate: skip if we already saw this exact heading text
-                normalized = _re.sub(r'\s+', ' ', text).strip().lower()
-                if normalized in seen_heading_texts:
-                    logger.debug("Outline: skipping duplicate heading '%s' at para %d", text, idx)
-                    continue
-                seen_heading_texts.add(normalized)
-                outline_items.append({
-                    "id": str(uuid.uuid4())[:8],
-                    "text": text,
-                    "level": level,
-                    "in_scope": True,
-                    "paragraph_index": idx,
+                runs = [r for r in para.runs if r.text.strip()]
+                is_bold = all(r.bold for r in runs) if runs else False
+                font_sizes = set()
+                for r in runs:
+                    if r.font and r.font.size:
+                        font_sizes.add(r.font.size.pt)
+                raw_headings.append({
+                    "idx": idx,
+                    "text": text[:200],
+                    "style": style_name,
+                    "heading_level": level,
+                    "bold": is_bold,
+                    "font_sizes": list(font_sizes) if font_sizes else [],
+                    "length": len(text),
                 })
-                continue
 
-            # Detect numbered section headings in body text (e.g. "2.1 Early Space Explorers")
-            numbered_heading = _re.match(r"^(\d+(?:\.\d+)*)\s+[A-Z]", text)
-            if numbered_heading and len(text) < 120:
-                depth = numbered_heading.group(1).count(".") + 1
-                # Only count as heading if the paragraph is short (not a full body paragraph)
-                if len(text) < 80 or all(r.bold for r in para.runs if r.text.strip()):
-                    # Deduplicate: skip if we already saw this heading
-                    normalized = _re.sub(r'\s+', ' ', text).strip().lower()
+        # ── If Heading styles found, use GPT to filter real sections ──
+        if has_heading_styles:
+            logger.info("Outline: Found %d heading-styled paragraphs — sending to GPT for filtering", len(raw_headings))
+
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+            gpt_filter_prompt = (
+                "You are analyzing heading-styled paragraphs from a DOCX document.\n"
+                "Your job is to identify which are REAL content section headings and which are NOT.\n\n"
+                "INCLUDE only real content section headings — these are the main topics/sections of the document.\n"
+                "Examples of real headings: '2.1 Early Space Explorers', 'Astronomy Begins', 'The Age of Rockets'\n\n"
+                "EXCLUDE these types (they are NOT real section headings):\n"
+                "- Book titles, chapter titles that are just a title without section content below\n"
+                "- Instructional/callout boxes: 'In This Section You'll Learn To...', 'You Should Already Know...'\n"
+                "- Review/exercise sections: 'Section Review', 'Mission Problems', 'For Discussion'\n"
+                "- Fun fact/sidebar callouts: 'Astro Fun Fact...', any callout box headings\n"
+                "- Supplementary sections: 'For Further Reading', 'References', 'Contributor'\n"
+                "- Case study/profile meta-headings: 'Mission Overview', 'Mission Data', 'Mission Impact'\n"
+                "- The word 'Outline' by itself\n"
+                "- Any heading that is clearly metadata, not a content section\n\n"
+                "For each heading you keep, assign a level:\n"
+                "- level 1: Major numbered section (e.g. '2.1 Early Space Explorers')\n"
+                "- level 2: Sub-section (e.g. 'Astronomy Begins', 'The Age of Rockets')\n"
+                "- level 3: Sub-sub-section\n"
+                "- If the heading has a section number like X.X, use that for level (X.X = level 1, X.X.X = level 2)\n"
+                "- If no number, determine level from context and heading_level in the data\n\n"
+                "Here are the heading-styled paragraphs:\n\n"
+                f"{_json.dumps(raw_headings, indent=None)}\n\n"
+                "Return ONLY a JSON array of the real section headings, each with:\n"
+                '{"idx": <paragraph_index>, "text": "<heading text>", "level": <1|2|3>}\n\n'
+                "Return ONLY the JSON array, no explanation or markdown. "
+                "If none qualify, return []."
+            )
+
+            try:
+                response = await client.chat.completions.create(
+                    model=settings.GPT_MODEL,
+                    messages=[{"role": "user", "content": gpt_filter_prompt}],
+                    temperature=0.0,
+                    max_tokens=4000,
+                )
+                raw = response.choices[0].message.content.strip()
+                if raw.startswith("```"):
+                    raw = _re.sub(r'^```(?:json)?\s*', '', raw)
+                    raw = _re.sub(r'\s*```$', '', raw)
+
+                gpt_headings = _json.loads(raw)
+                logger.info("GPT filtered to %d real section headings", len(gpt_headings))
+
+                seen_heading_texts = set()
+                for h in gpt_headings:
+                    text = h.get("text", "").strip()
+                    idx = h.get("idx", 0)
+                    level = h.get("level", 1)
+                    if not text:
+                        continue
+                    clean_text = _strip_trailing_page_number(text)
+                    normalized = _normalize_heading(text)
                     if normalized in seen_heading_texts:
-                        logger.debug("Outline: skipping duplicate numbered heading '%s' at para %d", text, idx)
                         continue
                     seen_heading_texts.add(normalized)
                     outline_items.append({
                         "id": str(uuid.uuid4())[:8],
-                        "text": text,
-                        "level": depth,
+                        "text": clean_text,
+                        "level": level,
                         "in_scope": True,
                         "paragraph_index": idx,
                     })
+
+            except Exception as gpt_err:
+                logger.error("GPT heading filter failed: %s — using all headings as fallback", gpt_err)
+                seen_heading_texts = set()
+                for rh in raw_headings:
+                    normalized = _normalize_heading(rh["text"])
+                    if normalized in seen_heading_texts:
+                        continue
+                    seen_heading_texts.add(normalized)
+                    outline_items.append({
+                        "id": str(uuid.uuid4())[:8],
+                        "text": _strip_trailing_page_number(rh["text"]),
+                        "level": rh["heading_level"],
+                        "in_scope": True,
+                        "paragraph_index": rh["idx"],
+                    })
+
+        else:
+            # ── Pass 2: No Heading styles — use GPT to classify ───────
+            logger.info("Outline: No Heading styles found — using GPT-based detection")
+            outline_items = []  # reset
+
+            # Collect paragraph metadata for GPT
+            para_metadata = []
+            for idx, para in enumerate(docx_doc.paragraphs):
+                text = para.text.strip()
+                if not text:
+                    continue
+                style_name = para.style.name if para.style else ""
+                # Skip obvious non-content styles
+                style_lower = style_name.lower()
+                if any(skip in style_lower for skip in ("header", "footer", "caption", "toc")):
+                    continue
+                # Skip bare numbers
+                if _re.match(r'^\d+(\.\d+)*\s*$', text):
+                    continue
+
+                # Determine formatting
+                runs = [r for r in para.runs if r.text.strip()]
+                is_bold = all(r.bold for r in runs) if runs else False
+                font_sizes = set()
+                for r in runs:
+                    if r.font and r.font.size:
+                        font_sizes.add(r.font.size.pt)
+
+                para_metadata.append({
+                    "idx": idx,
+                    "text": text[:200],
+                    "bold": is_bold,
+                    "font_sizes": list(font_sizes) if font_sizes else [],
+                    "style": style_name,
+                    "length": len(text),
+                })
+
+            # Limit to first 300 paragraphs to keep GPT call reasonable
+            para_metadata = para_metadata[:300]
+
+            # Build GPT prompt
+            gpt_prompt = (
+                "You are analyzing a DOCX document to identify NUMBERED section headings.\n"
+                "The document does NOT use Heading styles — all paragraphs are styled 'Normal'.\n"
+                "Your job is to identify which paragraphs are REAL numbered section headings.\n\n"
+                "STRICT RULES — follow these exactly:\n"
+                "1. ONLY include headings that start with a section number like '1.1', '2.3', '1.1.1', etc.\n"
+                "2. DO NOT include:\n"
+                "   - Bare chapter titles without numbers (e.g. 'Chapter', 'The Space Mission Analysis')\n"
+                "   - Author names, book titles, or metadata lines\n"
+                "   - TOC entries (usually clustered at the beginning, often non-bold, with page numbers)\n"
+                "   - Page headers that repeat at intervals (pattern: 'PageNum Title' or 'PageNum Title SectionNum')\n"
+                "   - Body/narrative paragraphs (longer text with explanatory content)\n"
+                "   - Any paragraph that does NOT begin with a numbering pattern like X.X or X.X.X\n"
+                "3. A real numbered heading is: starts with a section number (e.g. '1.1'), followed by a title, "
+                "typically bold, and shorter than 120 characters\n"
+                "4. If the same heading text appears multiple times (TOC + actual heading), only pick the "
+                "actual heading (usually bold, appears after the TOC area)\n\n"
+                "For each heading, assign a level based on numbering depth:\n"
+                "- X.X (e.g. '1.1 Introduction') → level 1\n"
+                "- X.X.X (e.g. '1.1.1 Changes') → level 2\n"
+                "- X.X.X.X (e.g. '1.1.1.1 Details') → level 3\n\n"
+                "Here are the paragraphs (JSON array with idx, text, bold, font_sizes, length):\n\n"
+                f"{_json.dumps(para_metadata, indent=None)}\n\n"
+                "Return ONLY a JSON array of heading objects, each with:\n"
+                '{"idx": <paragraph_index>, "text": "<cleaned heading text without trailing page numbers>", "level": <1|2|3>}\n\n'
+                "Return ONLY the JSON array, no explanation or markdown. "
+                "If no numbered headings are found, return an empty array []."
+            )
+
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            try:
+                response = await client.chat.completions.create(
+                    model=settings.GPT_MODEL,
+                    messages=[{"role": "user", "content": gpt_prompt}],
+                    temperature=0.0,
+                    max_tokens=4000,
+                )
+                raw = response.choices[0].message.content.strip()
+                # Strip markdown fences if GPT wraps them
+                if raw.startswith("```"):
+                    raw = _re.sub(r'^```(?:json)?\s*', '', raw)
+                    raw = _re.sub(r'\s*```$', '', raw)
+
+                gpt_headings = _json.loads(raw)
+                logger.info("GPT identified %d headings", len(gpt_headings))
+
+                seen_heading_texts = set()
+                for h in gpt_headings:
+                    text = h.get("text", "").strip()
+                    idx = h.get("idx", 0)
+                    level = h.get("level", 1)
+                    if not text:
+                        continue
+                    clean_text = _strip_trailing_page_number(text)
+                    normalized = _normalize_heading(text)
+                    if normalized in seen_heading_texts:
+                        continue
+                    seen_heading_texts.add(normalized)
+                    outline_items.append({
+                        "id": str(uuid.uuid4())[:8],
+                        "text": clean_text,
+                        "level": level,
+                        "in_scope": True,
+                        "paragraph_index": idx,
+                    })
+
+            except Exception as gpt_err:
+                logger.error("GPT heading detection failed: %s — falling back to heuristics", gpt_err)
+                # ── Fallback heuristic: bold + short + numbered ───────
+                for pm in para_metadata:
+                    text = pm["text"]
+                    idx = pm["idx"]
+                    numbered = _re.match(r"^(\d+(?:\.\d+)*)\s+[A-Z]", text)
+                    if numbered and pm["bold"] and pm["length"] < 120:
+                        depth = numbered.group(1).count(".")
+                        level = min(depth, 2) + 1  # 0 dots=1, 1 dot=1, 2 dots=2, 3+=3
+                        if depth <= 1:
+                            level = 1
+                        elif depth == 2:
+                            level = 2
+                        else:
+                            level = 3
+                        clean_text = _strip_trailing_page_number(text)
+                        normalized = _normalize_heading(text)
+                        if normalized in seen_heading_texts:
+                            continue
+                        seen_heading_texts.add(normalized)
+                        outline_items.append({
+                            "id": str(uuid.uuid4())[:8],
+                            "text": clean_text,
+                            "level": level,
+                            "in_scope": True,
+                            "paragraph_index": idx,
+                        })
 
     except Exception as e:
         logger.error("Outline extraction failed: %s", e)
@@ -455,7 +652,6 @@ async def extract_outline(
         lines = text_content.split("\n")
         for idx, line in enumerate(lines):
             line_stripped = line.strip()
-            # Detect numbered headings or all-caps lines
             if re.match(r"^\d+(\.\d+)*\s+[A-Z]", line_stripped) or (
                 line_stripped.isupper() and 3 < len(line_stripped) < 100
             ):
@@ -1446,12 +1642,16 @@ async def get_section_paragraphs(
 
     paragraphs = []
 
+    # Build a set of paragraph indices that ARE outline headings, to skip them
+    outline_para_indices = {item.get("paragraph_index") for item in outline if item.get("paragraph_index") is not None}
+
     # Try DOCX first for accurate paragraph extraction
     file_path = _resolve_file_path(doc.get("file_path", ""))
     try:
         from docx import Document as DocxDocument
         docx_doc = DocxDocument(file_path)
 
+        import re as _re
         end_idx = next_para_idx if next_para_idx else len(docx_doc.paragraphs)
         # Start from the paragraph AFTER the heading itself
         for idx in range(target_para_idx + 1, end_idx):
@@ -1463,6 +1663,24 @@ async def get_section_paragraphs(
             style_name = para.style.name if para.style else ""
             if style_name.lower().startswith("heading"):
                 break
+            # Skip paragraphs that are themselves outline headings
+            if idx in outline_para_indices:
+                continue
+            # Skip non-paragraph content:
+            # - bare numbers / page numbers (e.g. "1", "23", "iv")
+            # - section numbers (e.g. "2.1", "3.2.1")
+            # - very short lines (less than 15 chars) that are just numbers/symbols
+            # - header/footer/caption styles
+            if any(skip in style_name.lower() for skip in ("header", "footer", "caption", "toc")):
+                continue
+            if _re.match(r'^\d+(\.\d+)*$', text):
+                continue  # bare section/page number
+            if _re.match(r'^[ivxlcdm]+$', text.lower()):
+                continue  # roman numeral page numbers
+            if len(text) < 15 and _re.match(r'^[\d\s\.\-–—]+$', text):
+                continue  # short numeric-only lines (page numbers, line numbers)
+            if _re.match(r'^[\s_\-–—=~*#\.]{2,}$', text):
+                continue  # horizontal lines / separators / dividers
             paragraphs.append({
                 "index": idx,
                 "text": text[:200] + ("..." if len(text) > 200 else ""),
@@ -1471,17 +1689,25 @@ async def get_section_paragraphs(
     except Exception as e:
         logger.warning("DOCX paragraph extraction failed, falling back to text_content: %s", e)
         # Fallback: use text_content split by newlines
+        import re as _re2
         text_content = doc.get("text_content", "")
         lines = text_content.split("\n")
         end_idx = next_para_idx if next_para_idx else len(lines)
         for idx in range(target_para_idx + 1, min(end_idx, len(lines))):
             text = lines[idx].strip()
-            if text:
-                paragraphs.append({
-                    "index": idx,
-                    "text": text[:200] + ("..." if len(text) > 200 else ""),
-                    "full_text": text,
-                })
+            if not text:
+                continue
+            if _re2.match(r'^\d+(\.\d+)*$', text):
+                continue
+            if _re2.match(r'^[ivxlcdm]+$', text.lower()):
+                continue
+            if len(text) < 15 and _re2.match(r'^[\d\s\.\-–—]+$', text):
+                continue
+            paragraphs.append({
+                "index": idx,
+                "text": text[:200] + ("..." if len(text) > 200 else ""),
+                "full_text": text,
+            })
 
     return {
         "session_id": session_id,
