@@ -2027,6 +2027,72 @@ async def apply_patches(
             docx_doc.save(working_path)
             logger.info("DOCX saved to %s", working_path)
 
+            # ── Apply approved media patches (figures, equations, tables) ────
+            try:
+                approved_media = await db.media_patches.find({
+                    "session_id": session_id,
+                    "status": "approved",
+                }).to_list(length=500)
+
+                if approved_media:
+                    # Reload the saved doc for media edits
+                    docx_doc = DocxDocument(working_path)
+                    media_applied = 0
+
+                    for mp in approved_media:
+                        mp_type = mp.get("type")
+                        try:
+                            if mp_type == "figure":
+                                # Download selected replacement image and swap it in
+                                sel = mp.get("selected_replacement")
+                                if sel and sel.get("url"):
+                                    import httpx as _httpx
+                                    async with _httpx.AsyncClient() as _http:
+                                        img_resp = await _http.get(sel["url"], timeout=30)
+                                        if img_resp.status_code == 200:
+                                            r_embed = mp.get("r_embed")
+                                            if r_embed and r_embed in docx_doc.part.rels:
+                                                rel = docx_doc.part.rels[r_embed]
+                                                rel.target_part._blob = img_resp.content
+                                                media_applied += 1
+                                                logger.info("Replaced figure image (r_embed=%s)", r_embed)
+
+                            elif mp_type == "equation":
+                                suggested = mp.get("suggested_update", "")
+                                if suggested:
+                                    eq_para_idx = mp.get("equation_number", 0) - 1
+                                    # Add annotation paragraph after the equation
+                                    annotation = f"[Equation update suggested: {suggested}]"
+                                    if 0 <= eq_para_idx < len(docx_doc.paragraphs):
+                                        _insert_text_near_paragraph(
+                                            docx_doc, eq_para_idx, annotation, before=False
+                                        )
+                                        media_applied += 1
+                                        logger.info("Added equation annotation at para %d", eq_para_idx)
+
+                            elif mp_type == "table":
+                                cell_updates = mp.get("cell_updates", [])
+                                t_num = mp.get("table_number", 1) - 1
+                                if 0 <= t_num < len(docx_doc.tables):
+                                    tbl = docx_doc.tables[t_num]
+                                    for cu in cell_updates:
+                                        r, c = cu.get("row", -1), cu.get("col", -1)
+                                        new_val = cu.get("new_value", "")
+                                        if 0 <= r < len(tbl.rows) and 0 <= c < len(tbl.rows[r].cells):
+                                            tbl.rows[r].cells[c].text = new_val
+                                    media_applied += 1
+                                    logger.info("Updated table %d with %d cell changes", t_num + 1, len(cell_updates))
+
+                        except Exception as me:
+                            logger.warning("Media patch %s failed: %s", mp.get("patch_id"), me)
+
+                    if media_applied:
+                        docx_doc.save(working_path)
+                        logger.info("Saved DOCX after %d media patches", media_applied)
+
+            except Exception as media_err:
+                logger.warning("Media patch application phase failed: %s", media_err)
+
             # Verify: reload and check paragraph count
             verify_doc = DocxDocument(working_path)
             verify_count = len(verify_doc.paragraphs)
@@ -2839,6 +2905,15 @@ async def export_changelog(session_id: str, user=Depends(get_current_user_dep)):
     dated_statements = await session_repo.find_dated_statements(session_id)
     opportunities = await session_repo.find_opportunities(session_id)
 
+    # Include media patches (figures, equations, tables)
+    media_patches_cursor = db.media_patches.find(
+        {"session_id": session_id},
+        {"original_image_b64": 0},  # exclude large base64 blobs from export
+    )
+    media_patches = await media_patches_cursor.to_list(length=1000)
+    for mp in media_patches:
+        mp["_id"] = str(mp["_id"])
+
     return {
         "session_id": session_id,
         "document_id": session.get("document_id"),
@@ -2847,5 +2922,693 @@ async def export_changelog(session_id: str, user=Depends(get_current_user_dep)):
         "total_opportunities": len(opportunities),
         "patches": patches,
         "dated_statements": dated_statements,
+        "media_patches": media_patches,
         "exported_at": datetime.utcnow().isoformat(),
+    }
+
+
+# ── Media Analysis Endpoints ─────────────────────────────────────────────────
+
+
+@router.get("/{session_id}/figure-analysis")
+async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
+    """Analyze all figures/images in the DOCX. Uses GPT-4o Vision to assess
+    whether each figure is outdated and searches NASA / Wikimedia for replacements."""
+    import httpx
+    import base64
+    from lxml import etree
+    from uuid import uuid4
+
+    db = get_database()
+    session_repo = SessionRepository(db)
+    doc_repo = DocumentRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    # Return cached results if they exist
+    existing = await db.media_patches.find(
+        {"session_id": session_id, "type": "figure"}
+    ).to_list(length=500)
+    if existing:
+        for e in existing:
+            e["_id"] = str(e["_id"])
+        return {"session_id": session_id, "figures": existing, "cached": True}
+
+    doc = await doc_repo.find_by_id(session["document_id"])
+    if not doc:
+        raise HTTPException(404, "Document not found")
+
+    file_path = _resolve_file_path(doc.get("file_path", ""))
+    if not os.path.exists(file_path):
+        raise HTTPException(404, "Document file not found on disk")
+
+    from docx import Document as DocxDocument
+
+    docx_doc = DocxDocument(file_path)
+
+    nsmap = {
+        'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
+        'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
+        'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+        'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+        'pic': 'http://schemas.openxmlformats.org/drawingml/2006/picture',
+    }
+
+    figures = []
+    seen_embeds = set()  # avoid duplicates
+    for idx, para in enumerate(docx_doc.paragraphs):
+        drawings = para._element.findall('.//w:drawing', nsmap)
+        for drawing in drawings:
+            blip = drawing.find('.//a:blip', nsmap)
+            if blip is not None:
+                r_embed = blip.get(
+                    '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed'
+                )
+                if r_embed and r_embed in docx_doc.part.rels and r_embed not in seen_embeds:
+                    seen_embeds.add(r_embed)
+                    rel = docx_doc.part.rels[r_embed]
+                    image_bytes = rel.target_part.blob
+
+                    # Filter out small/decorative images (< 5KB likely icons/backgrounds)
+                    if len(image_bytes) < 5000:
+                        logger.debug("Skipping small image at para %d (%d bytes)", idx, len(image_bytes))
+                        continue
+
+                    # Filter by dimensions from drawing extent
+                    extent = drawing.find('.//wp:extent', nsmap)
+                    if extent is not None:
+                        cx = int(extent.get('cx', '0'))
+                        cy = int(extent.get('cy', '0'))
+                        # EMU to pixels: 1 inch = 914400 EMU, 96 dpi
+                        w_px = cx / 914400 * 96
+                        h_px = cy / 914400 * 96
+                        # Skip very small images (icons, bullets) or very wide+short (decorative bars)
+                        if w_px < 50 or h_px < 50:
+                            logger.debug("Skipping tiny image at para %d (%dx%d px)", idx, w_px, h_px)
+                            continue
+                        if w_px > 500 and h_px < 30:
+                            logger.debug("Skipping decorative bar at para %d (%dx%d px)", idx, w_px, h_px)
+                            continue
+
+                    img_b64 = base64.b64encode(image_bytes).decode()
+                    # Find caption (next paragraph)
+                    caption = ""
+                    if idx + 1 < len(docx_doc.paragraphs):
+                        next_text = docx_doc.paragraphs[idx + 1].text.strip()
+                        if next_text.lower().startswith("figure") or next_text.lower().startswith("fig"):
+                            caption = next_text
+                    figures.append({
+                        "para_idx": idx,
+                        "image_b64": img_b64,
+                        "caption": caption,
+                        "r_embed": r_embed,
+                        "size_bytes": len(image_bytes),
+                    })
+
+    logger.info("Found %d content figures (filtered from %d total drawings)", len(figures), len(seen_embeds))
+
+    if not figures:
+        return {"session_id": session_id, "figures": [], "message": "No figures found in document."}
+
+    # Analyze each figure with GPT-4o Vision and search for replacements
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    result_patches = []
+
+    for fig_num, fig in enumerate(figures, start=1):
+        # Truncate base64 for thumbnail (keep full for storage)
+        thumb_b64 = fig["image_b64"]
+
+        # GPT-4o Vision analysis
+        analysis_text = ""
+        search_query = ""
+        try:
+            gpt_resp = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Analyze this figure from a textbook. "
+                                "Is this figure outdated? What does it show? "
+                                "Suggest a SHORT, simple image search query (2-5 words) "
+                                "for finding an updated or similar image. "
+                                "Use broad terms that would work on image search engines. "
+                                "Example: 'space mission lifecycle diagram', 'rocket launch phases', "
+                                "'satellite orbit types diagram'. "
+                                "Respond in JSON with keys: "
+                                "\"analysis\", \"is_outdated\" (bool), \"search_query\"."
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{thumb_b64}"},
+                        },
+                    ],
+                }],
+                temperature=0.0,
+                max_tokens=1000,
+            )
+            raw = gpt_resp.choices[0].message.content or ""
+            analysis_text = raw
+
+            # Try to parse JSON from response
+            import json as _json
+            try:
+                # Strip markdown code fences if present
+                cleaned = raw.strip()
+                if cleaned.startswith("```"):
+                    cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
+                    cleaned = cleaned.rsplit("```", 1)[0]
+                parsed = _json.loads(cleaned)
+                analysis_text = parsed.get("analysis", raw)
+                search_query = parsed.get("search_query", "")
+            except (_json.JSONDecodeError, Exception):
+                search_query = fig.get("caption", "textbook figure")
+        except Exception as gpt_err:
+            logger.warning("GPT Vision analysis failed for figure %d: %s", fig_num, gpt_err)
+            analysis_text = f"Analysis unavailable: {gpt_err}"
+            search_query = fig.get("caption", "") or "textbook figure"
+
+        logger.info("Figure %d search query: '%s'", fig_num, search_query)
+
+        all_candidates = []
+
+        # Search NASA images API
+        try:
+            params = {"q": search_query, "media_type": "image", "page_size": 5}
+            if settings.NASA_API_KEY:
+                params["api_key"] = settings.NASA_API_KEY
+            async with httpx.AsyncClient() as http:
+                resp = await http.get(
+                    "https://images-api.nasa.gov/search", params=params, timeout=15
+                )
+                items = resp.json().get("collection", {}).get("items", [])
+                for item in items[:3]:
+                    data = item.get("data", [{}])[0]
+                    links = item.get("links", [{}])
+                    thumb = links[0].get("href", "") if links else ""
+                    if thumb:
+                        all_candidates.append({
+                            "url": thumb,
+                            "title": data.get("title", ""),
+                            "source": "NASA",
+                            "thumbnail_url": thumb,
+                        })
+        except Exception as nasa_err:
+            logger.warning("NASA search failed for figure %d: %s", fig_num, nasa_err)
+
+        # Search Wikimedia Commons
+        try:
+            wiki_params = {
+                "action": "query",
+                "format": "json",
+                "generator": "search",
+                "gsrsearch": search_query,
+                "gsrnamespace": "6",
+                "gsrlimit": "5",
+                "prop": "imageinfo",
+                "iiprop": "url|thumburl",
+                "iiurlwidth": "400",
+            }
+            wiki_headers = {"User-Agent": "AIBookUpdater/1.0 (educational; contact@example.com)"}
+            async with httpx.AsyncClient() as http:
+                resp = await http.get(
+                    "https://commons.wikimedia.org/w/api.php",
+                    params=wiki_params, headers=wiki_headers, timeout=15,
+                )
+                resp_json = resp.json()
+                pages = resp_json.get("query", {}).get("pages", {})
+                for page in pages.values():
+                    ii = page.get("imageinfo", [])
+                    if ii:
+                        info = ii[0]
+                        img_url = info.get("thumburl") or info.get("url", "")
+                        if img_url:
+                            all_candidates.append({
+                                "url": info.get("url", img_url),
+                                "title": page.get("title", "").replace("File:", ""),
+                                "source": "Wikimedia Commons",
+                                "thumbnail_url": img_url,
+                            })
+        except Exception as wiki_err:
+            logger.warning("Wikimedia search failed for figure %d: %s", fig_num, wiki_err)
+
+        # Search Wikimedia Commons with broader query (just key terms) if no results
+        if not all_candidates and search_query:
+            try:
+                # Try a simpler query — first 2-3 words only
+                simple_query = " ".join(search_query.split()[:3])
+                wiki_params2 = {
+                    "action": "query",
+                    "format": "json",
+                    "generator": "search",
+                    "gsrsearch": simple_query,
+                    "gsrnamespace": "6",
+                    "gsrlimit": "5",
+                    "prop": "imageinfo",
+                    "iiprop": "url|thumburl",
+                    "iiurlwidth": "400",
+                }
+                wiki_headers2 = {"User-Agent": "AIBookUpdater/1.0 (educational; contact@example.com)"}
+                async with httpx.AsyncClient() as http:
+                    resp = await http.get(
+                        "https://commons.wikimedia.org/w/api.php",
+                        params=wiki_params2, headers=wiki_headers2, timeout=15,
+                    )
+                    resp_json = resp.json()
+                    pages = resp_json.get("query", {}).get("pages", {})
+                    for page in pages.values():
+                        ii = page.get("imageinfo", [])
+                        if ii:
+                            info = ii[0]
+                            img_url = info.get("thumburl") or info.get("url", "")
+                            if img_url:
+                                all_candidates.append({
+                                    "url": info.get("url", img_url),
+                                    "title": page.get("title", "").replace("File:", ""),
+                                    "source": "Wikimedia Commons",
+                                    "thumbnail_url": img_url,
+                                })
+            except Exception:
+                pass
+
+        # Search Tavily for image results as last resort
+        if not all_candidates and settings.TAVILY_API_KEY:
+            try:
+                async with httpx.AsyncClient() as http:
+                    tavily_resp = await http.post(
+                        "https://api.tavily.com/search",
+                        json={
+                            "api_key": settings.TAVILY_API_KEY,
+                            "query": f"{search_query} diagram image",
+                            "search_depth": "basic",
+                            "include_images": True,
+                            "max_results": 5,
+                        },
+                        timeout=15,
+                    )
+                    tavily_data = tavily_resp.json()
+                    for img_url in tavily_data.get("images", [])[:4]:
+                        if isinstance(img_url, str) and img_url.startswith("http"):
+                            all_candidates.append({
+                                "url": img_url,
+                                "title": search_query,
+                                "source": "Web Search",
+                                "thumbnail_url": img_url,
+                            })
+            except Exception as tav_err:
+                logger.warning("Tavily image search failed for figure %d: %s", fig_num, tav_err)
+
+        logger.info("Figure %d: found %d replacement candidates", fig_num, len(all_candidates))
+        replacement_candidates = all_candidates[:6]  # cap at 6 candidates
+
+        patch_doc = {
+            "patch_id": str(uuid4()),
+            "session_id": session_id,
+            "type": "figure",
+            "status": "pending",
+            "figure_number": fig_num,
+            "caption": fig.get("caption", ""),
+            "original_image_b64": thumb_b64,
+            "analysis": analysis_text,
+            "replacement_candidates": replacement_candidates,
+            "selected_replacement": None,
+            "r_embed": fig.get("r_embed", ""),
+            "para_idx": fig.get("para_idx"),
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        result_patches.append(patch_doc)
+
+    # Store in MongoDB
+    if result_patches:
+        await db.media_patches.insert_many(result_patches)
+
+    # Sanitise _id for JSON response
+    for rp in result_patches:
+        if "_id" in rp:
+            rp["_id"] = str(rp["_id"])
+
+    return {"session_id": session_id, "figures": result_patches, "cached": False}
+
+
+@router.get("/{session_id}/equation-analysis")
+async def equation_analysis(session_id: str, user=Depends(get_current_user_dep)):
+    """Analyze all OMML equations in the DOCX for outdated notation."""
+    from lxml import etree
+    from uuid import uuid4
+
+    db = get_database()
+    session_repo = SessionRepository(db)
+    doc_repo = DocumentRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    # Return cached results if they exist
+    existing = await db.media_patches.find(
+        {"session_id": session_id, "type": "equation"}
+    ).to_list(length=500)
+    if existing:
+        for e in existing:
+            e["_id"] = str(e["_id"])
+        return {"session_id": session_id, "equations": existing, "cached": True}
+
+    doc = await doc_repo.find_by_id(session["document_id"])
+    if not doc:
+        raise HTTPException(404, "Document not found")
+
+    file_path = _resolve_file_path(doc.get("file_path", ""))
+    if not os.path.exists(file_path):
+        raise HTTPException(404, "Document file not found on disk")
+
+    from docx import Document as DocxDocument
+
+    docx_doc = DocxDocument(file_path)
+
+    nsmap_m = {'m': 'http://schemas.openxmlformats.org/officeDocument/2006/math'}
+    equations = []
+    for idx, para in enumerate(docx_doc.paragraphs):
+        omaths = para._element.findall('.//m:oMath', nsmap_m)
+        for omath in omaths:
+            omml_xml = etree.tostring(omath, encoding='unicode')
+            texts = omath.findall('.//m:t', nsmap_m)
+            readable = ' '.join(t.text or '' for t in texts)
+            equations.append({
+                "para_idx": idx,
+                "omml_xml": omml_xml,
+                "readable_text": readable,
+            })
+
+    if not equations:
+        return {"session_id": session_id, "equations": [], "message": "No equations found in document."}
+
+    # Send equations to GPT for analysis (batch them to reduce API calls)
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+    # Build a summary of all equations for GPT
+    eq_summary_lines = []
+    for i, eq in enumerate(equations, start=1):
+        eq_summary_lines.append(f"Equation {i}: {eq['readable_text']}")
+    eq_summary = "\n".join(eq_summary_lines)
+
+    gpt_analyses = {}
+    try:
+        gpt_resp = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Below are equations extracted from a textbook. For each one, "
+                    "determine if it uses outdated or deprecated notation, or if the "
+                    "formula itself is outdated. Suggest updates where applicable.\n\n"
+                    "Respond in JSON: a list of objects with keys "
+                    "\"equation_number\" (int), \"is_outdated\" (bool), "
+                    "\"suggested_update\" (str, empty if fine).\n\n"
+                    f"{eq_summary}"
+                ),
+            }],
+            temperature=0.0,
+            max_tokens=2000,
+        )
+        raw = gpt_resp.choices[0].message.content or ""
+        import json as _json
+        try:
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
+                cleaned = cleaned.rsplit("```", 1)[0]
+            parsed_list = _json.loads(cleaned)
+            if isinstance(parsed_list, list):
+                for item in parsed_list:
+                    num = item.get("equation_number", 0)
+                    gpt_analyses[num] = item
+            elif isinstance(parsed_list, dict) and "equations" in parsed_list:
+                for item in parsed_list["equations"]:
+                    num = item.get("equation_number", 0)
+                    gpt_analyses[num] = item
+        except (_json.JSONDecodeError, Exception):
+            logger.warning("Could not parse GPT equation analysis as JSON, storing raw text")
+            # Store raw analysis for all equations
+            for i in range(1, len(equations) + 1):
+                gpt_analyses[i] = {"suggested_update": raw, "is_outdated": False}
+    except Exception as gpt_err:
+        logger.warning("GPT equation analysis failed: %s", gpt_err)
+        for i in range(1, len(equations) + 1):
+            gpt_analyses[i] = {"suggested_update": f"Analysis unavailable: {gpt_err}", "is_outdated": False}
+
+    result_patches = []
+    for eq_num, eq in enumerate(equations, start=1):
+        analysis_item = gpt_analyses.get(eq_num, {})
+        patch_doc = {
+            "patch_id": str(uuid4()),
+            "session_id": session_id,
+            "type": "equation",
+            "status": "pending",
+            "equation_number": eq_num,
+            "original_text": eq["readable_text"],
+            "original_omml": eq["omml_xml"],
+            "suggested_update": analysis_item.get("suggested_update", ""),
+            "is_outdated": analysis_item.get("is_outdated", False),
+            "para_idx": eq["para_idx"],
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        result_patches.append(patch_doc)
+
+    if result_patches:
+        await db.media_patches.insert_many(result_patches)
+
+    for rp in result_patches:
+        if "_id" in rp:
+            rp["_id"] = str(rp["_id"])
+
+    return {"session_id": session_id, "equations": result_patches, "cached": False}
+
+
+@router.get("/{session_id}/table-analysis")
+async def table_analysis(session_id: str, user=Depends(get_current_user_dep)):
+    """Analyze all tables in the DOCX for outdated data."""
+    from uuid import uuid4
+
+    db = get_database()
+    session_repo = SessionRepository(db)
+    doc_repo = DocumentRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    # Return cached results if they exist
+    existing = await db.media_patches.find(
+        {"session_id": session_id, "type": "table"}
+    ).to_list(length=500)
+    if existing:
+        for e in existing:
+            e["_id"] = str(e["_id"])
+        return {"session_id": session_id, "tables": existing, "cached": True}
+
+    doc = await doc_repo.find_by_id(session["document_id"])
+    if not doc:
+        raise HTTPException(404, "Document not found")
+
+    file_path = _resolve_file_path(doc.get("file_path", ""))
+    if not os.path.exists(file_path):
+        raise HTTPException(404, "Document file not found on disk")
+
+    from docx import Document as DocxDocument
+
+    docx_doc = DocxDocument(file_path)
+
+    tables_data = []
+    for t_idx, table in enumerate(docx_doc.tables):
+        rows_data = []
+        for row in table.rows:
+            row_data = [cell.text.strip() for cell in row.cells]
+            rows_data.append(row_data)
+        # Try to find a caption in the paragraph immediately before the table element
+        caption = ""
+        table_element = table._tbl
+        prev = table_element.getprevious()
+        if prev is not None:
+            nsmap_w = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+            runs = prev.findall('.//w:t', nsmap_w)
+            prev_text = ''.join(r.text or '' for r in runs).strip()
+            if prev_text.lower().startswith("table") or prev_text.lower().startswith("tbl"):
+                caption = prev_text
+        tables_data.append({
+            "table_idx": t_idx,
+            "content": rows_data,
+            "caption": caption,
+        })
+
+    if not tables_data:
+        return {"session_id": session_id, "tables": [], "message": "No tables found in document."}
+
+    # Analyze each table with GPT
+    from openai import AsyncOpenAI
+    import json as _json
+
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    result_patches = []
+
+    for t_num, tdata in enumerate(tables_data, start=1):
+        # Format table content for GPT
+        content_str = ""
+        for r_idx, row in enumerate(tdata["content"]):
+            content_str += f"Row {r_idx}: {row}\n"
+
+        analysis_text = ""
+        cell_updates = []
+        try:
+            gpt_resp = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Analyze this table from a textbook (Table {t_num}).\n"
+                        f"Caption: {tdata['caption'] or '(none)'}\n\n"
+                        f"{content_str}\n"
+                        "Is the data in this table outdated? Suggest specific cell "
+                        "updates with row/col coordinates.\n\n"
+                        "Respond in JSON with keys: \"analysis\" (str), "
+                        "\"is_outdated\" (bool), \"cell_updates\" (list of "
+                        "{\"row\": int, \"col\": int, \"old_value\": str, \"new_value\": str})."
+                    ),
+                }],
+                temperature=0.0,
+                max_tokens=2000,
+            )
+            raw = gpt_resp.choices[0].message.content or ""
+            analysis_text = raw
+
+            try:
+                cleaned = raw.strip()
+                if cleaned.startswith("```"):
+                    cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
+                    cleaned = cleaned.rsplit("```", 1)[0]
+                parsed = _json.loads(cleaned)
+                analysis_text = parsed.get("analysis", raw)
+                cell_updates = parsed.get("cell_updates", [])
+            except (_json.JSONDecodeError, Exception):
+                pass
+        except Exception as gpt_err:
+            logger.warning("GPT table analysis failed for table %d: %s", t_num, gpt_err)
+            analysis_text = f"Analysis unavailable: {gpt_err}"
+
+        patch_doc = {
+            "patch_id": str(uuid4()),
+            "session_id": session_id,
+            "type": "table",
+            "status": "pending",
+            "table_number": t_num,
+            "original_content": tdata["content"],
+            "caption": tdata.get("caption", ""),
+            "cell_updates": cell_updates,
+            "analysis": analysis_text,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        result_patches.append(patch_doc)
+
+    if result_patches:
+        await db.media_patches.insert_many(result_patches)
+
+    for rp in result_patches:
+        if "_id" in rp:
+            rp["_id"] = str(rp["_id"])
+
+    return {"session_id": session_id, "tables": result_patches, "cached": False}
+
+
+@router.put("/{session_id}/media-patches/{patch_id}")
+async def review_media_patch(
+    session_id: str,
+    patch_id: str,
+    request: Request,
+    user=Depends(get_current_user_dep),
+):
+    """Approve or reject a media patch (figure / equation / table)."""
+    db = get_database()
+    session_repo = SessionRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    body = await request.json()
+    action = body.get("action", "").lower()
+    if action not in ("approve", "reject"):
+        raise HTTPException(400, "action must be 'approve' or 'reject'")
+
+    existing = await db.media_patches.find_one({
+        "patch_id": patch_id,
+        "session_id": session_id,
+    })
+    if not existing:
+        raise HTTPException(404, "Media patch not found")
+
+    update_fields: Dict = {"status": "approved" if action == "approve" else "rejected"}
+
+    # For figures, allow selecting a replacement candidate
+    selected_replacement = body.get("selected_replacement")
+    if selected_replacement and existing.get("type") == "figure":
+        update_fields["selected_replacement"] = selected_replacement
+
+    await db.media_patches.update_one(
+        {"patch_id": patch_id, "session_id": session_id},
+        {"$set": update_fields},
+    )
+
+    return {
+        "patch_id": patch_id,
+        "session_id": session_id,
+        "status": update_fields["status"],
+        "message": f"Media patch {action}d successfully.",
+    }
+
+
+@router.delete("/{session_id}/media-patches/{media_type}")
+async def clear_media_patches(
+    session_id: str,
+    media_type: str,
+    user=Depends(get_current_user_dep),
+):
+    """Clear cached media patches of a given type (figure/equation/table) to allow re-analysis."""
+    if media_type not in ("figure", "equation", "table"):
+        raise HTTPException(400, "media_type must be 'figure', 'equation', or 'table'")
+
+    db = get_database()
+    session_repo = SessionRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    result = await db.media_patches.delete_many({
+        "session_id": session_id,
+        "type": media_type,
+    })
+
+    return {
+        "session_id": session_id,
+        "type": media_type,
+        "deleted": result.deleted_count,
+        "message": f"Cleared {result.deleted_count} {media_type} patches. Ready for re-analysis.",
     }
