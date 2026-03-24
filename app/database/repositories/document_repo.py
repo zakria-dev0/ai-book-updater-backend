@@ -27,17 +27,38 @@ class DocumentRepository:
     # Heavy fields to exclude for summary/detail views
     _HEAVY_FIELDS_PROJECTION = {
         "text_content": 0,
+        "paragraphs": 0,
         "equations": 0,
         "figures": 0,
         "tables": 0,
         "para_to_page": 0,
     }
 
-    # For analysis pipeline: only exclude binary-heavy fields, keep text_content + para_to_page
+    # For analysis pipeline: only exclude binary-heavy fields, keep text_content + para_to_page + paragraphs
     _ANALYSIS_PROJECTION = {
         "equations": 0,
         "figures": 0,
         "tables": 0,
+    }
+
+    # For outline / section endpoints: only need paragraphs
+    _PARAGRAPHS_PROJECTION = {
+        "paragraphs": 1,
+        "text_content": 1,
+        "para_to_page": 1,
+        "file_path": 1,
+        "user_id": 1,
+        "status": 1,
+    }
+
+    # For media analysis: figures + equations + tables
+    _MEDIA_PROJECTION = {
+        "figures": 1,
+        "equations": 1,
+        "tables": 1,
+        "file_path": 1,
+        "user_id": 1,
+        "status": 1,
     }
 
     async def find_by_id(
@@ -68,6 +89,7 @@ class DocumentRepository:
     # Fields to exclude when listing documents (they can be huge)
     _LIST_PROJECTION = {
         "text_content": 0,
+        "paragraphs": 0,
         "equations": 0,
         "figures": 0,
         "tables": 0,
@@ -125,6 +147,26 @@ class DocumentRepository:
             {"$push": {"processing_history": entry}},
         )
         return result.modified_count > 0
+
+    async def find_with_paragraphs(self, document_id: str) -> Optional[dict]:
+        """Fetch document with only paragraphs + text_content (for outline/section endpoints)."""
+        try:
+            doc = await self.collection.find_one(
+                {"_id": ObjectId(document_id)}, self._PARAGRAPHS_PROJECTION,
+            )
+            return self._serialize(doc) if doc else None
+        except Exception:
+            return None
+
+    async def find_with_media(self, document_id: str) -> Optional[dict]:
+        """Fetch document with figures + equations + tables (for media analysis endpoints)."""
+        try:
+            doc = await self.collection.find_one(
+                {"_id": ObjectId(document_id)}, self._MEDIA_PROJECTION,
+            )
+            return self._serialize(doc) if doc else None
+        except Exception:
+            return None
 
     async def delete(self, document_id: str) -> bool:
         """Delete a document by id. Returns True if deleted."""

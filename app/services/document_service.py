@@ -165,6 +165,71 @@ class DOCXParser:
         for para in self.doc.paragraphs:
             full_text.append(para.text)
         return "\n".join(full_text)
+
+    def _extract_paragraphs(self) -> list:
+        """Extract every paragraph with rich metadata for downstream use.
+
+        Returns a list of dicts, one per paragraph, preserving the original
+        paragraph index so that outline / section-paragraph endpoints can
+        work entirely from the DB without re-reading the DOCX.
+        """
+        import re as _re
+        W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+        A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+        R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+
+        paragraphs = []
+        for idx, para in enumerate(self.doc.paragraphs):
+            text = para.text.strip()
+            style_name = para.style.name if para.style else ""
+
+            # Determine formatting from runs
+            runs = [r for r in para.runs if r.text.strip()]
+            is_bold = all(r.bold for r in runs) if runs else False
+            font_sizes = set()
+            for r in runs:
+                if r.font and r.font.size:
+                    font_sizes.add(r.font.size.pt)
+
+            # Check if paragraph has a drawing/image
+            has_image = bool(para._element.findall(f'.//{{{W_NS}}}drawing'))
+
+            # Collect r:embed IDs for images in this paragraph
+            r_embeds = []
+            for blip in para._element.findall(f'.//{{{A_NS}}}blip'):
+                r_embed = blip.get(f'{{{R_NS}}}embed')
+                if r_embed:
+                    r_embeds.append(r_embed)
+
+            # Get image dimensions from drawing extents
+            image_cx = 0
+            image_cy = 0
+            extent = para._element.find(f'.//{{{WP_NS}}}extent')
+            if extent is not None:
+                image_cx = int(extent.get('cx', '0'))
+                image_cy = int(extent.get('cy', '0'))
+
+            # Check for OMML equations
+            MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+            has_equation = bool(para._element.findall(f'.//{{{MATH_NS}}}oMath'))
+
+            paragraphs.append({
+                "idx": idx,
+                "text": text,
+                "style": style_name,
+                "bold": is_bold,
+                "font_sizes": sorted(font_sizes) if font_sizes else [],
+                "length": len(text),
+                "has_image": has_image,
+                "r_embeds": r_embeds,
+                "image_cx": image_cx,
+                "image_cy": image_cy,
+                "has_equation": has_equation,
+                "page": self._para_to_page.get(idx, 1),
+            })
+
+        return paragraphs
     
     def _extract_equations(self) -> List[Equation]:
         """
@@ -211,39 +276,70 @@ class DOCXParser:
         return equations
     
     def _extract_figures(self) -> List[Figure]:
-        """Extract images/figures from DOCX"""
+        """Extract images/figures from DOCX with full metadata for downstream analysis."""
         figures = []
 
-        # Build relationship ID → paragraph index map
-        # <a:blip r:embed="rIdX"> inside a <w:drawing> tells us which paragraph holds each image
         A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
         R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
-        rel_id_to_para: dict = {}
+        WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+        W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+        # Build r_embed → (para_idx, cx, cy) map from drawings
+        seen_embeds = set()
+        embed_info: dict = {}  # r_embed -> {para_idx, cx, cy}
         for para_idx, para in enumerate(self.doc.paragraphs):
-            for blip in para._element.findall(f'.//{{{A_NS}}}blip'):
-                r_embed = blip.get(f'{{{R_NS}}}embed')
-                if r_embed:
-                    rel_id_to_para[r_embed] = para_idx
+            drawings = para._element.findall(f'.//{{{W_NS}}}drawing')
+            for drawing in drawings:
+                blip = drawing.find(f'.//{{{A_NS}}}blip')
+                if blip is not None:
+                    r_embed = blip.get(f'{{{R_NS}}}embed')
+                    if r_embed and r_embed not in seen_embeds:
+                        seen_embeds.add(r_embed)
+                        cx, cy = 0, 0
+                        extent = drawing.find(f'.//{{{WP_NS}}}extent')
+                        if extent is not None:
+                            cx = int(extent.get('cx', '0'))
+                            cy = int(extent.get('cy', '0'))
+                        embed_info[r_embed] = {"para_idx": para_idx, "cx": cx, "cy": cy}
 
-        for idx, rel in enumerate(self.doc.part.rels.values()):
-            if "image" in rel.target_ref:
-                try:
-                    image_data = rel.target_part.blob
-                    image_base64 = base64.b64encode(image_data).decode('utf-8')
-                    caption = self._find_figure_caption(idx)
-                    para_pos = rel_id_to_para.get(rel.rId)
+        fig_counter = 0
+        for rel in self.doc.part.rels.values():
+            if "image" not in rel.target_ref:
+                continue
+            try:
+                image_data = rel.target_part.blob
+                image_base64 = base64.b64encode(image_data).decode('utf-8')
+                info = embed_info.get(rel.rId, {})
+                para_pos = info.get("para_idx")
+                cx = info.get("cx", 0)
+                cy = info.get("cy", 0)
 
-                    figure = Figure(
-                        figure_id=f"fig_{idx}",
-                        caption=caption,
-                        image_base64=image_base64,
-                        position=Position(page=self._page_for_para(para_pos), paragraph=para_pos),
-                        number=self._extract_figure_number(caption) if caption else None
-                    )
-                    figures.append(figure)
-                except Exception as e:
-                    print(f"Error extracting figure {idx}: {e}")
-                    continue
+                # Find caption from next paragraph
+                caption = None
+                if para_pos is not None and para_pos + 1 < len(self.doc.paragraphs):
+                    next_text = self.doc.paragraphs[para_pos + 1].text.strip()
+                    if next_text.lower().startswith("figure") or next_text.lower().startswith("fig"):
+                        caption = next_text
+                if not caption:
+                    caption = self._find_figure_caption(fig_counter)
+
+                figure = Figure(
+                    figure_id=f"fig_{fig_counter}",
+                    caption=caption,
+                    image_base64=image_base64,
+                    position=Position(page=self._page_for_para(para_pos), paragraph=para_pos),
+                    number=self._extract_figure_number(caption) if caption else None,
+                    r_embed=rel.rId,
+                    size_bytes=len(image_data),
+                    cx=cx,
+                    cy=cy,
+                )
+                figures.append(figure)
+                fig_counter += 1
+            except Exception as e:
+                print(f"Error extracting figure {fig_counter}: {e}")
+                fig_counter += 1
+                continue
 
         return figures
     

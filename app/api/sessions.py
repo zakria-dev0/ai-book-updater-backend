@@ -370,60 +370,159 @@ async def extract_outline(
     else:
         raise HTTPException(400, "Rules must be confirmed first")
 
-    doc = await doc_repo.find_by_id(session["document_id"])
+    # ── Load paragraph metadata from DB (extracted once during POST /process) ──
+    doc = await doc_repo.find_with_paragraphs(session["document_id"])
     if not doc:
         raise HTTPException(404, "Document not found")
 
-    # Extract headings from DOCX using python-docx
-    file_path = _resolve_file_path(doc.get("file_path", ""))
+    db_paragraphs = doc.get("paragraphs", [])
+    if not db_paragraphs:
+        raise HTTPException(400, "Document has not been processed yet. Run POST /process first.")
+
     outline_items = []
 
+    import re as _re
+    import json as _json
+    from collections import Counter, defaultdict
+
+    def _strip_trailing_page_number(txt: str) -> str:
+        cleaned = _re.sub(r'\s+\d{1,4}\s*$', '', txt)
+        return cleaned if cleaned else txt
+
+    def _normalize_heading(txt: str) -> str:
+        cleaned = _strip_trailing_page_number(txt)
+        return _re.sub(r'\s+', ' ', cleaned).strip().lower()
+
+    # ── Detect which approach to use (all from DB paragraphs) ─────
+    has_heading_styles = any(
+        _re.match(r"[Hh]eading\s*#?\s*(\d+)", p.get("style", ""))
+        for p in db_paragraphs if p.get("text")
+    )
+
+    # Collect all paragraphs matching X.X pattern (e.g., "1.1 Introduction")
+    numbered_candidates = []
+    for p in db_paragraphs:
+        text = p.get("text", "")
+        if not text:
+            continue
+        numbered_match = _re.match(r"^(\d+(?:\.\d+)+)\s+\S", text)
+        if numbered_match and p.get("length", 0) < 150:
+            numbered_candidates.append(p)
+
+    has_numbered_headings = len(numbered_candidates) >= 3
+
     try:
-        import re as _re
-        import json as _json
-        from docx import Document as DocxDocument
-        docx_doc = DocxDocument(file_path)
+        # ── APPROACH 1 (Fast path): Regex on numbered X.X patterns ────
+        if has_numbered_headings:
+            logger.info("Outline: Found %d numbered heading candidates — using regex (no GPT)", len(numbered_candidates))
 
-        def _strip_trailing_page_number(txt: str) -> str:
-            cleaned = _re.sub(r'\s+\d{1,4}\s*$', '', txt)
-            return cleaned if cleaned else txt
+            # ── Filter 1: Detect page headers (text with trailing tab/spaces + page number) ──
+            # Pattern: "1.1\tIntroduction and Overview\t5" or "1.2 The Life Cycle 9"
+            # These have a number at the very end separated by whitespace/tab
+            _page_header_re = _re.compile(r'^.+[\t\s]+\d{1,4}\s*$')
 
-        def _normalize_heading(txt: str) -> str:
-            cleaned = _strip_trailing_page_number(txt)
-            return _re.sub(r'\s+', ' ', cleaned).strip().lower()
+            # ── Filter 2: Detect TOC region ──
+            # TOC entries cluster at the start (first ~20 non-empty paragraphs), are non-bold
+            # Find first bold numbered candidate to mark end of TOC region
+            first_bold_numbered_idx = None
+            for p in numbered_candidates:
+                if p.get("bold", False):
+                    first_bold_numbered_idx = p.get("idx", 0)
+                    break
 
-        # ── Pass 1: Check if document uses Heading styles ─────────────
-        has_heading_styles = False
-        raw_headings = []  # collect all heading-styled paragraphs
+            # ── Filter 3: Build normalized text → best candidate map ──
+            # When same heading appears multiple times (TOC + real + page header),
+            # prefer: bold without trailing page number > bold with trailing > non-bold
+            heading_groups = defaultdict(list)  # normalized_text -> [candidate, ...]
+            for p in numbered_candidates:
+                text = p.get("text", "")
+                normalized = _normalize_heading(text)
+                heading_groups[normalized].append(p)
 
-        for idx, para in enumerate(docx_doc.paragraphs):
-            style_name = para.style.name if para.style else ""
-            text = para.text.strip()
-            if not text:
-                continue
-            heading_match = _re.match(r"[Hh]eading\s*#?\s*(\d+)", style_name)
-            if heading_match:
-                has_heading_styles = True
-                level = int(heading_match.group(1))
-                runs = [r for r in para.runs if r.text.strip()]
-                is_bold = all(r.bold for r in runs) if runs else False
-                font_sizes = set()
-                for r in runs:
-                    if r.font and r.font.size:
-                        font_sizes.add(r.font.size.pt)
-                raw_headings.append({
-                    "idx": idx,
-                    "text": text[:200],
-                    "style": style_name,
-                    "heading_level": level,
-                    "bold": is_bold,
-                    "font_sizes": list(font_sizes) if font_sizes else [],
-                    "length": len(text),
+            seen_heading_texts = set()
+            for normalized, group in heading_groups.items():
+                # Pick the BEST candidate from the group
+                # Priority: bold + no page-header pattern + not in TOC region
+                best = None
+                for p in group:
+                    text = p.get("text", "")
+                    idx = p.get("idx", 0)
+                    is_bold = p.get("bold", False)
+                    is_page_header = bool(_page_header_re.match(text))
+                    is_toc = (not is_bold and first_bold_numbered_idx is not None
+                              and idx < first_bold_numbered_idx)
+
+                    # Skip header/footer/caption/toc styles
+                    style_lower = p.get("style", "").lower()
+                    if any(skip in style_lower for skip in ("header", "footer", "caption", "toc")):
+                        continue
+
+                    # Score: higher is better
+                    score = 0
+                    if is_bold:
+                        score += 10
+                    if not is_page_header:
+                        score += 5
+                    if not is_toc:
+                        score += 3
+
+                    if best is None or score > best[0]:
+                        best = (score, p)
+
+                if best is None:
+                    continue
+
+                p = best[1]
+                text = p.get("text", "")
+                idx = p.get("idx", 0)
+
+                # Parse numbering depth for level
+                num_match = _re.match(r"^(\d+(?:\.\d+)+)", text)
+                if not num_match:
+                    continue
+                num_str = num_match.group(1)
+                depth = num_str.count(".")
+                if depth <= 1:
+                    level = 1
+                elif depth == 2:
+                    level = 2
+                else:
+                    level = 3
+
+                seen_heading_texts.add(normalized)
+                clean_text = _strip_trailing_page_number(text)
+                # Also strip trailing tabs/whitespace that may remain
+                clean_text = _re.sub(r'[\t]+', ' ', clean_text).strip()
+                outline_items.append({
+                    "id": str(uuid.uuid4())[:8],
+                    "text": clean_text,
+                    "level": level,
+                    "in_scope": True,
+                    "paragraph_index": idx,
                 })
 
-        # ── If Heading styles found, use GPT to filter real sections ──
-        if has_heading_styles:
-            logger.info("Outline: Found %d heading-styled paragraphs — sending to GPT for filtering", len(raw_headings))
+            # Sort by paragraph index to maintain document order
+            outline_items.sort(key=lambda x: x["paragraph_index"])
+
+        # ── APPROACH 2: Heading styles + GPT filter ───────────────────
+        elif has_heading_styles:
+            logger.info("Outline: Using Heading styles with GPT filter")
+            raw_headings = []
+            for p in db_paragraphs:
+                text = p.get("text", "")
+                if not text:
+                    continue
+                heading_match = _re.match(r"[Hh]eading\s*#?\s*(\d+)", p.get("style", ""))
+                if heading_match:
+                    raw_headings.append({
+                        "idx": p["idx"],
+                        "text": text[:200],
+                        "style": p.get("style", ""),
+                        "heading_level": int(heading_match.group(1)),
+                        "bold": p.get("bold", False),
+                        "font_sizes": p.get("font_sizes", []),
+                        "length": p.get("length", 0),
+                    })
 
             from openai import AsyncOpenAI
             client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
@@ -435,7 +534,7 @@ async def extract_outline(
                 "Examples of real headings: '2.1 Early Space Explorers', 'Astronomy Begins', 'The Age of Rockets'\n\n"
                 "EXCLUDE these types (they are NOT real section headings):\n"
                 "- Book titles, chapter titles that are just a title without section content below\n"
-                "- Instructional/callout boxes: 'In This Section You'll Learn To...', 'You Should Already Know...'\n"
+                "- Instructional/callout boxes: 'In This Section You will Learn To...', 'You Should Already Know...'\n"
                 "- Review/exercise sections: 'Section Review', 'Mission Problems', 'For Discussion'\n"
                 "- Fun fact/sidebar callouts: 'Astro Fun Fact...', any callout box headings\n"
                 "- Supplementary sections: 'For Further Reading', 'References', 'Contributor'\n"
@@ -446,7 +545,7 @@ async def extract_outline(
                 "- level 1: Major numbered section (e.g. '2.1 Early Space Explorers')\n"
                 "- level 2: Sub-section (e.g. 'Astronomy Begins', 'The Age of Rockets')\n"
                 "- level 3: Sub-sub-section\n"
-                "- If the heading has a section number like X.X, use that for level (X.X = level 1, X.X.X = level 2)\n"
+                "- If the heading has a section number like X.X, use that for level\n"
                 "- If no number, determine level from context and heading_level in the data\n\n"
                 "Here are the heading-styled paragraphs:\n\n"
                 f"{_json.dumps(raw_headings, indent=None)}\n\n"
@@ -507,78 +606,49 @@ async def extract_outline(
                         "paragraph_index": rh["idx"],
                     })
 
+        # ── APPROACH 3 (Rare): No numbered headings AND no Heading styles ─
         else:
-            # ── Pass 2: No Heading styles — use GPT to classify ───────
-            logger.info("Outline: No Heading styles found — using GPT-based detection")
-            outline_items = []  # reset
+            logger.info("Outline: No numbered headings and no Heading styles — GPT fallback")
 
-            # Collect paragraph metadata for GPT
             para_metadata = []
-            for idx, para in enumerate(docx_doc.paragraphs):
-                text = para.text.strip()
+            for p in db_paragraphs:
+                text = p.get("text", "")
                 if not text:
                     continue
-                style_name = para.style.name if para.style else ""
-                # Skip obvious non-content styles
-                style_lower = style_name.lower()
+                style_lower = p.get("style", "").lower()
                 if any(skip in style_lower for skip in ("header", "footer", "caption", "toc")):
                     continue
-                # Skip bare numbers
                 if _re.match(r'^\d+(\.\d+)*\s*$', text):
                     continue
-
-                # Determine formatting
-                runs = [r for r in para.runs if r.text.strip()]
-                is_bold = all(r.bold for r in runs) if runs else False
-                font_sizes = set()
-                for r in runs:
-                    if r.font and r.font.size:
-                        font_sizes.add(r.font.size.pt)
-
                 para_metadata.append({
-                    "idx": idx,
+                    "idx": p["idx"],
                     "text": text[:200],
-                    "bold": is_bold,
-                    "font_sizes": list(font_sizes) if font_sizes else [],
-                    "style": style_name,
-                    "length": len(text),
+                    "bold": p.get("bold", False),
+                    "font_sizes": p.get("font_sizes", []),
+                    "style": p.get("style", ""),
+                    "length": p.get("length", 0),
                 })
 
-            # Limit to first 300 paragraphs to keep GPT call reasonable
             para_metadata = para_metadata[:300]
-
-            # Build GPT prompt
-            gpt_prompt = (
-                "You are analyzing a DOCX document to identify NUMBERED section headings.\n"
-                "The document does NOT use Heading styles — all paragraphs are styled 'Normal'.\n"
-                "Your job is to identify which paragraphs are REAL numbered section headings.\n\n"
-                "STRICT RULES — follow these exactly:\n"
-                "1. ONLY include headings that start with a section number like '1.1', '2.3', '1.1.1', etc.\n"
-                "2. DO NOT include:\n"
-                "   - Bare chapter titles without numbers (e.g. 'Chapter', 'The Space Mission Analysis')\n"
-                "   - Author names, book titles, or metadata lines\n"
-                "   - TOC entries (usually clustered at the beginning, often non-bold, with page numbers)\n"
-                "   - Page headers that repeat at intervals (pattern: 'PageNum Title' or 'PageNum Title SectionNum')\n"
-                "   - Body/narrative paragraphs (longer text with explanatory content)\n"
-                "   - Any paragraph that does NOT begin with a numbering pattern like X.X or X.X.X\n"
-                "3. A real numbered heading is: starts with a section number (e.g. '1.1'), followed by a title, "
-                "typically bold, and shorter than 120 characters\n"
-                "4. If the same heading text appears multiple times (TOC + actual heading), only pick the "
-                "actual heading (usually bold, appears after the TOC area)\n\n"
-                "For each heading, assign a level based on numbering depth:\n"
-                "- X.X (e.g. '1.1 Introduction') → level 1\n"
-                "- X.X.X (e.g. '1.1.1 Changes') → level 2\n"
-                "- X.X.X.X (e.g. '1.1.1.1 Details') → level 3\n\n"
-                "Here are the paragraphs (JSON array with idx, text, bold, font_sizes, length):\n\n"
-                f"{_json.dumps(para_metadata, indent=None)}\n\n"
-                "Return ONLY a JSON array of heading objects, each with:\n"
-                '{"idx": <paragraph_index>, "text": "<cleaned heading text without trailing page numbers>", "level": <1|2|3>}\n\n'
-                "Return ONLY the JSON array, no explanation or markdown. "
-                "If no numbered headings are found, return an empty array []."
-            )
 
             from openai import AsyncOpenAI
             client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+            gpt_prompt = (
+                "You are analyzing a DOCX document to identify section headings.\n"
+                "The document has no Heading styles and no numbered headings.\n"
+                "Your job is to identify which paragraphs are REAL section headings.\n\n"
+                "STRICT RULES:\n"
+                "1. Section headings are typically: short (< 100 chars), bold, larger font\n"
+                "2. DO NOT include: body text, TOC entries, page headers, author names\n"
+                "3. Assign levels: level 1 for main sections, level 2 for sub-sections, level 3 for sub-sub\n\n"
+                "Here are the paragraphs:\n\n"
+                f"{_json.dumps(para_metadata, indent=None)}\n\n"
+                "Return ONLY a JSON array of heading objects:\n"
+                '{"idx": <paragraph_index>, "text": "<heading text>", "level": <1|2|3>}\n\n'
+                "Return ONLY the JSON array. If none found, return []."
+            )
+
             try:
                 response = await client.chat.completions.create(
                     model=settings.GPT_MODEL,
@@ -587,13 +657,12 @@ async def extract_outline(
                     max_tokens=4000,
                 )
                 raw = response.choices[0].message.content.strip()
-                # Strip markdown fences if GPT wraps them
                 if raw.startswith("```"):
                     raw = _re.sub(r'^```(?:json)?\s*', '', raw)
                     raw = _re.sub(r'\s*```$', '', raw)
 
                 gpt_headings = _json.loads(raw)
-                logger.info("GPT identified %d headings", len(gpt_headings))
+                logger.info("GPT identified %d headings (rare fallback)", len(gpt_headings))
 
                 seen_heading_texts = set()
                 for h in gpt_headings:
@@ -617,14 +686,13 @@ async def extract_outline(
 
             except Exception as gpt_err:
                 logger.error("GPT heading detection failed: %s — falling back to heuristics", gpt_err)
-                # ── Fallback heuristic: bold + short + numbered ───────
+                seen_heading_texts = set()
                 for pm in para_metadata:
                     text = pm["text"]
                     idx = pm["idx"]
                     numbered = _re.match(r"^(\d+(?:\.\d+)*)\s+[A-Z]", text)
                     if numbered and pm["bold"] and pm["length"] < 120:
                         depth = numbered.group(1).count(".")
-                        level = min(depth, 2) + 1  # 0 dots=1, 1 dot=1, 2 dots=2, 3+=3
                         if depth <= 1:
                             level = 1
                         elif depth == 2:
@@ -646,19 +714,18 @@ async def extract_outline(
 
     except Exception as e:
         logger.error("Outline extraction failed: %s", e)
-        # Fallback: try to parse from text_content using regex
-        import re
+        # Ultimate fallback: regex on text_content
         text_content = doc.get("text_content", "")
         lines = text_content.split("\n")
         for idx, line in enumerate(lines):
             line_stripped = line.strip()
-            if re.match(r"^\d+(\.\d+)*\s+[A-Z]", line_stripped) or (
+            if _re.match(r"^\d+(\.\d+)*\s+[A-Z]", line_stripped) or (
                 line_stripped.isupper() and 3 < len(line_stripped) < 100
             ):
                 outline_items.append({
                     "id": str(uuid.uuid4())[:8],
                     "text": line_stripped,
-                    "level": 1 if re.match(r"^\d+\s", line_stripped) else 2,
+                    "level": 1 if _re.match(r"^\d+\s", line_stripped) else 2,
                     "in_scope": True,
                     "paragraph_index": idx,
                 })
@@ -1635,79 +1702,58 @@ async def get_section_paragraphs(
         if item.get("id") == section_id:
             found_target = True
 
-    # Load the DOCX to extract paragraphs in this range
-    doc = await doc_repo.find_by_id(session["document_id"])
+    # ── Load paragraph metadata from DB (no DOCX re-read) ──────────
+    doc = await doc_repo.find_with_paragraphs(session["document_id"])
     if not doc:
         raise HTTPException(404, "Document not found")
 
+    db_paragraphs = doc.get("paragraphs", [])
     paragraphs = []
 
     # Build a set of paragraph indices that ARE outline headings, to skip them
     outline_para_indices = {item.get("paragraph_index") for item in outline if item.get("paragraph_index") is not None}
 
-    # Try DOCX first for accurate paragraph extraction
-    file_path = _resolve_file_path(doc.get("file_path", ""))
-    try:
-        from docx import Document as DocxDocument
-        docx_doc = DocxDocument(file_path)
+    import re as _re
 
-        import re as _re
-        end_idx = next_para_idx if next_para_idx else len(docx_doc.paragraphs)
-        # Start from the paragraph AFTER the heading itself
-        for idx in range(target_para_idx + 1, end_idx):
-            para = docx_doc.paragraphs[idx]
-            text = para.text.strip()
-            if not text:
-                continue
-            # Stop at next heading style
-            style_name = para.style.name if para.style else ""
-            if style_name.lower().startswith("heading"):
-                break
-            # Skip paragraphs that are themselves outline headings
-            if idx in outline_para_indices:
-                continue
-            # Skip non-paragraph content:
-            # - bare numbers / page numbers (e.g. "1", "23", "iv")
-            # - section numbers (e.g. "2.1", "3.2.1")
-            # - very short lines (less than 15 chars) that are just numbers/symbols
-            # - header/footer/caption styles
-            if any(skip in style_name.lower() for skip in ("header", "footer", "caption", "toc")):
-                continue
-            if _re.match(r'^\d+(\.\d+)*$', text):
-                continue  # bare section/page number
-            if _re.match(r'^[ivxlcdm]+$', text.lower()):
-                continue  # roman numeral page numbers
-            if len(text) < 15 and _re.match(r'^[\d\s\.\-–—]+$', text):
-                continue  # short numeric-only lines (page numbers, line numbers)
-            if _re.match(r'^[\s_\-–—=~*#\.]{2,}$', text):
-                continue  # horizontal lines / separators / dividers
-            paragraphs.append({
-                "index": idx,
-                "text": text[:200] + ("..." if len(text) > 200 else ""),
-                "full_text": text,
-            })
-    except Exception as e:
-        logger.warning("DOCX paragraph extraction failed, falling back to text_content: %s", e)
-        # Fallback: use text_content split by newlines
-        import re as _re2
-        text_content = doc.get("text_content", "")
-        lines = text_content.split("\n")
-        end_idx = next_para_idx if next_para_idx else len(lines)
-        for idx in range(target_para_idx + 1, min(end_idx, len(lines))):
-            text = lines[idx].strip()
-            if not text:
-                continue
-            if _re2.match(r'^\d+(\.\d+)*$', text):
-                continue
-            if _re2.match(r'^[ivxlcdm]+$', text.lower()):
-                continue
-            if len(text) < 15 and _re2.match(r'^[\d\s\.\-–—]+$', text):
-                continue
-            paragraphs.append({
-                "index": idx,
-                "text": text[:200] + ("..." if len(text) > 200 else ""),
-                "full_text": text,
-            })
+    # Build a lookup dict for fast access: idx -> paragraph data
+    para_lookup = {p["idx"]: p for p in db_paragraphs}
+
+    end_idx = next_para_idx if next_para_idx else (max(p["idx"] for p in db_paragraphs) + 1 if db_paragraphs else 0)
+
+    for idx in range(target_para_idx + 1, end_idx):
+        p = para_lookup.get(idx)
+        if not p:
+            continue
+        text = p.get("text", "").strip()
+        if not text:
+            continue
+        style_name = p.get("style", "")
+        # Stop at next heading style
+        if style_name.lower().startswith("heading"):
+            break
+        # Skip outline headings
+        if idx in outline_para_indices:
+            continue
+        # Skip header/footer/caption/toc styles
+        if any(skip in style_name.lower() for skip in ("header", "footer", "caption", "toc")):
+            continue
+        # Skip bare numbers / page numbers
+        if _re.match(r'^\d+(\.\d+)*$', text):
+            continue
+        # Skip roman numeral page numbers
+        if _re.match(r'^[ivxlcdm]+$', text.lower()):
+            continue
+        # Skip short numeric-only lines
+        if len(text) < 15 and _re.match(r'^[\d\s\.\-\u2013\u2014]+$', text):
+            continue
+        # Skip horizontal lines / separators / dividers
+        if _re.match(r'^[\s_\-\u2013\u2014=~*#\.]{2,}$', text):
+            continue
+        paragraphs.append({
+            "index": idx,
+            "text": text[:200] + ("..." if len(text) > 200 else ""),
+            "full_text": text,
+        })
 
     return {
         "session_id": session_id,
@@ -2935,8 +2981,6 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
     """Analyze all figures/images in the DOCX. Uses GPT-4o Vision to assess
     whether each figure is outdated and searches NASA / Wikimedia for replacements."""
     import httpx
-    import base64
-    from lxml import etree
     from uuid import uuid4
 
     db = get_database()
@@ -2958,93 +3002,61 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
             e["_id"] = str(e["_id"])
         return {"session_id": session_id, "figures": existing, "cached": True}
 
-    doc = await doc_repo.find_by_id(session["document_id"])
+    # ── Read figures from DB (extracted once during POST /process) ──
+    doc = await doc_repo.find_with_media(session["document_id"])
     if not doc:
         raise HTTPException(404, "Document not found")
 
-    file_path = _resolve_file_path(doc.get("file_path", ""))
-    if not os.path.exists(file_path):
-        raise HTTPException(404, "Document file not found on disk")
+    db_figures = doc.get("figures", [])
 
-    from docx import Document as DocxDocument
-
-    docx_doc = DocxDocument(file_path)
-
-    nsmap = {
-        'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
-        'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
-        'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
-        'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
-        'pic': 'http://schemas.openxmlformats.org/drawingml/2006/picture',
-    }
-
+    # Filter decorative/small images using stored metadata
     figures = []
-    seen_embeds = set()  # avoid duplicates
-    for idx, para in enumerate(docx_doc.paragraphs):
-        drawings = para._element.findall('.//w:drawing', nsmap)
-        for drawing in drawings:
-            blip = drawing.find('.//a:blip', nsmap)
-            if blip is not None:
-                r_embed = blip.get(
-                    '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed'
-                )
-                if r_embed and r_embed in docx_doc.part.rels and r_embed not in seen_embeds:
-                    seen_embeds.add(r_embed)
-                    rel = docx_doc.part.rels[r_embed]
-                    image_bytes = rel.target_part.blob
+    for fig in db_figures:
+        size_bytes = fig.get("size_bytes") or 0
+        cx = fig.get("cx") or 0
+        cy = fig.get("cy") or 0
+        w_px = cx / 914400 * 96 if cx else 0
+        h_px = cy / 914400 * 96 if cy else 0
 
-                    # Filter out small/decorative images (< 5KB likely icons/backgrounds)
-                    if len(image_bytes) < 5000:
-                        logger.debug("Skipping small image at para %d (%d bytes)", idx, len(image_bytes))
-                        continue
+        # Skip small images (< 5KB)
+        if size_bytes > 0 and size_bytes < 5000:
+            logger.debug("Skipping small image fig_%s (%d bytes)", fig.get("figure_id"), size_bytes)
+            continue
+        # Skip tiny dimensions
+        if w_px > 0 and (w_px < 50 or h_px < 50):
+            logger.debug("Skipping tiny image fig_%s (%dx%d px)", fig.get("figure_id"), w_px, h_px)
+            continue
+        # Skip decorative bars (wide + short)
+        if w_px > 500 and h_px < 30:
+            logger.debug("Skipping decorative bar fig_%s (%dx%d px)", fig.get("figure_id"), w_px, h_px)
+            continue
 
-                    # Filter by dimensions from drawing extent
-                    extent = drawing.find('.//wp:extent', nsmap)
-                    if extent is not None:
-                        cx = int(extent.get('cx', '0'))
-                        cy = int(extent.get('cy', '0'))
-                        # EMU to pixels: 1 inch = 914400 EMU, 96 dpi
-                        w_px = cx / 914400 * 96
-                        h_px = cy / 914400 * 96
-                        # Skip very small images (icons, bullets) or very wide+short (decorative bars)
-                        if w_px < 50 or h_px < 50:
-                            logger.debug("Skipping tiny image at para %d (%dx%d px)", idx, w_px, h_px)
-                            continue
-                        if w_px > 500 and h_px < 30:
-                            logger.debug("Skipping decorative bar at para %d (%dx%d px)", idx, w_px, h_px)
-                            continue
+        pos = fig.get("position") or {}
+        figures.append({
+            "para_idx": pos.get("paragraph"),
+            "image_b64": fig.get("image_base64", ""),
+            "caption": fig.get("caption") or "",
+            "r_embed": fig.get("r_embed") or "",
+            "size_bytes": size_bytes,
+        })
 
-                    img_b64 = base64.b64encode(image_bytes).decode()
-                    # Find caption (next paragraph)
-                    caption = ""
-                    if idx + 1 < len(docx_doc.paragraphs):
-                        next_text = docx_doc.paragraphs[idx + 1].text.strip()
-                        if next_text.lower().startswith("figure") or next_text.lower().startswith("fig"):
-                            caption = next_text
-                    figures.append({
-                        "para_idx": idx,
-                        "image_b64": img_b64,
-                        "caption": caption,
-                        "r_embed": r_embed,
-                        "size_bytes": len(image_bytes),
-                    })
-
-    logger.info("Found %d content figures (filtered from %d total drawings)", len(figures), len(seen_embeds))
+    logger.info("Found %d content figures from DB (filtered from %d total)", len(figures), len(db_figures))
 
     if not figures:
         return {"session_id": session_id, "figures": [], "message": "No figures found in document."}
 
-    # Analyze each figure with GPT-4o Vision and search for replacements
+    # ── Analyze figures in PARALLEL for speed ──────────────────────────────
+    import asyncio
+    import json as _json
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    result_patches = []
 
-    for fig_num, fig in enumerate(figures, start=1):
-        # Truncate base64 for thumbnail (keep full for storage)
+    async def _analyze_single_figure(fig_num: int, fig: dict, http_client: httpx.AsyncClient):
+        """Analyze one figure with GPT-4o Vision + search for replacements concurrently."""
         thumb_b64 = fig["image_b64"]
 
-        # GPT-4o Vision analysis
+        # ── Step 1: GPT-4o Vision analysis ────────────────────────────────
         analysis_text = ""
         search_query = ""
         try:
@@ -3078,11 +3090,7 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
             )
             raw = gpt_resp.choices[0].message.content or ""
             analysis_text = raw
-
-            # Try to parse JSON from response
-            import json as _json
             try:
-                # Strip markdown code fences if present
                 cleaned = raw.strip()
                 if cleaned.startswith("```"):
                     cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
@@ -3099,15 +3107,16 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
 
         logger.info("Figure %d search query: '%s'", fig_num, search_query)
 
+        # ── Step 2: Search for replacements (NASA + Wikimedia in parallel) ─
         all_candidates = []
 
-        # Search NASA images API
-        try:
-            params = {"q": search_query, "media_type": "image", "page_size": 5}
-            if settings.NASA_API_KEY:
-                params["api_key"] = settings.NASA_API_KEY
-            async with httpx.AsyncClient() as http:
-                resp = await http.get(
+        async def _search_nasa():
+            candidates = []
+            try:
+                params = {"q": search_query, "media_type": "image", "page_size": 5}
+                if settings.NASA_API_KEY:
+                    params["api_key"] = settings.NASA_API_KEY
+                resp = await http_client.get(
                     "https://images-api.nasa.gov/search", params=params, timeout=15
                 )
                 items = resp.json().get("collection", {}).get("items", [])
@@ -3116,121 +3125,114 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
                     links = item.get("links", [{}])
                     thumb = links[0].get("href", "") if links else ""
                     if thumb:
-                        all_candidates.append({
+                        candidates.append({
                             "url": thumb,
                             "title": data.get("title", ""),
                             "source": "NASA",
                             "thumbnail_url": thumb,
                         })
-        except Exception as nasa_err:
-            logger.warning("NASA search failed for figure %d: %s", fig_num, nasa_err)
+            except Exception as e:
+                logger.warning("NASA search failed for figure %d: %s", fig_num, e)
+            return candidates
 
-        # Search Wikimedia Commons
-        try:
-            wiki_params = {
-                "action": "query",
-                "format": "json",
-                "generator": "search",
-                "gsrsearch": search_query,
-                "gsrnamespace": "6",
-                "gsrlimit": "5",
-                "prop": "imageinfo",
-                "iiprop": "url|thumburl",
-                "iiurlwidth": "400",
-            }
+        async def _search_wikimedia():
+            candidates = []
             wiki_headers = {"User-Agent": "AIBookUpdater/1.0 (educational; contact@example.com)"}
-            async with httpx.AsyncClient() as http:
-                resp = await http.get(
+            try:
+                wiki_params = {
+                    "action": "query", "format": "json",
+                    "generator": "search", "gsrsearch": search_query,
+                    "gsrnamespace": "6", "gsrlimit": "5",
+                    "prop": "imageinfo", "iiprop": "url|thumburl", "iiurlwidth": "400",
+                }
+                resp = await http_client.get(
                     "https://commons.wikimedia.org/w/api.php",
                     params=wiki_params, headers=wiki_headers, timeout=15,
                 )
-                resp_json = resp.json()
-                pages = resp_json.get("query", {}).get("pages", {})
+                pages = resp.json().get("query", {}).get("pages", {})
                 for page in pages.values():
                     ii = page.get("imageinfo", [])
                     if ii:
                         info = ii[0]
                         img_url = info.get("thumburl") or info.get("url", "")
                         if img_url:
-                            all_candidates.append({
+                            candidates.append({
                                 "url": info.get("url", img_url),
                                 "title": page.get("title", "").replace("File:", ""),
                                 "source": "Wikimedia Commons",
                                 "thumbnail_url": img_url,
                             })
-        except Exception as wiki_err:
-            logger.warning("Wikimedia search failed for figure %d: %s", fig_num, wiki_err)
+            except Exception as e:
+                logger.warning("Wikimedia search failed for figure %d: %s", fig_num, e)
 
-        # Search Wikimedia Commons with broader query (just key terms) if no results
-        if not all_candidates and search_query:
-            try:
-                # Try a simpler query — first 2-3 words only
-                simple_query = " ".join(search_query.split()[:3])
-                wiki_params2 = {
-                    "action": "query",
-                    "format": "json",
-                    "generator": "search",
-                    "gsrsearch": simple_query,
-                    "gsrnamespace": "6",
-                    "gsrlimit": "5",
-                    "prop": "imageinfo",
-                    "iiprop": "url|thumburl",
-                    "iiurlwidth": "400",
-                }
-                wiki_headers2 = {"User-Agent": "AIBookUpdater/1.0 (educational; contact@example.com)"}
-                async with httpx.AsyncClient() as http:
-                    resp = await http.get(
+            # Broader retry if nothing found
+            if not candidates and search_query:
+                try:
+                    simple_query = " ".join(search_query.split()[:3])
+                    wiki_params2 = {
+                        "action": "query", "format": "json",
+                        "generator": "search", "gsrsearch": simple_query,
+                        "gsrnamespace": "6", "gsrlimit": "5",
+                        "prop": "imageinfo", "iiprop": "url|thumburl", "iiurlwidth": "400",
+                    }
+                    resp = await http_client.get(
                         "https://commons.wikimedia.org/w/api.php",
-                        params=wiki_params2, headers=wiki_headers2, timeout=15,
+                        params=wiki_params2, headers=wiki_headers, timeout=15,
                     )
-                    resp_json = resp.json()
-                    pages = resp_json.get("query", {}).get("pages", {})
+                    pages = resp.json().get("query", {}).get("pages", {})
                     for page in pages.values():
                         ii = page.get("imageinfo", [])
                         if ii:
                             info = ii[0]
                             img_url = info.get("thumburl") or info.get("url", "")
                             if img_url:
-                                all_candidates.append({
+                                candidates.append({
                                     "url": info.get("url", img_url),
                                     "title": page.get("title", "").replace("File:", ""),
                                     "source": "Wikimedia Commons",
                                     "thumbnail_url": img_url,
                                 })
-            except Exception:
-                pass
+                except Exception:
+                    pass
+            return candidates
 
-        # Search Tavily for image results as last resort
+        # Run NASA + Wikimedia searches in parallel
+        nasa_results, wiki_results = await asyncio.gather(
+            _search_nasa(), _search_wikimedia()
+        )
+        all_candidates.extend(nasa_results)
+        all_candidates.extend(wiki_results)
+
+        # Tavily fallback only if no candidates found
         if not all_candidates and settings.TAVILY_API_KEY:
             try:
-                async with httpx.AsyncClient() as http:
-                    tavily_resp = await http.post(
-                        "https://api.tavily.com/search",
-                        json={
-                            "api_key": settings.TAVILY_API_KEY,
-                            "query": f"{search_query} diagram image",
-                            "search_depth": "basic",
-                            "include_images": True,
-                            "max_results": 5,
-                        },
-                        timeout=15,
-                    )
-                    tavily_data = tavily_resp.json()
-                    for img_url in tavily_data.get("images", [])[:4]:
-                        if isinstance(img_url, str) and img_url.startswith("http"):
-                            all_candidates.append({
-                                "url": img_url,
-                                "title": search_query,
-                                "source": "Web Search",
-                                "thumbnail_url": img_url,
-                            })
+                tavily_resp = await http_client.post(
+                    "https://api.tavily.com/search",
+                    json={
+                        "api_key": settings.TAVILY_API_KEY,
+                        "query": f"{search_query} diagram image",
+                        "search_depth": "basic",
+                        "include_images": True,
+                        "max_results": 5,
+                    },
+                    timeout=15,
+                )
+                tavily_data = tavily_resp.json()
+                for img_url in tavily_data.get("images", [])[:4]:
+                    if isinstance(img_url, str) and img_url.startswith("http"):
+                        all_candidates.append({
+                            "url": img_url,
+                            "title": search_query,
+                            "source": "Web Search",
+                            "thumbnail_url": img_url,
+                        })
             except Exception as tav_err:
                 logger.warning("Tavily image search failed for figure %d: %s", fig_num, tav_err)
 
         logger.info("Figure %d: found %d replacement candidates", fig_num, len(all_candidates))
-        replacement_candidates = all_candidates[:6]  # cap at 6 candidates
+        replacement_candidates = all_candidates[:6]
 
-        patch_doc = {
+        return {
             "patch_id": str(uuid4()),
             "session_id": session_id,
             "type": "figure",
@@ -3245,7 +3247,23 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
             "para_idx": fig.get("para_idx"),
             "created_at": datetime.utcnow().isoformat(),
         }
-        result_patches.append(patch_doc)
+
+    # Process all figures in parallel (batches of 3 to avoid rate limits)
+    result_patches = []
+    BATCH_SIZE = 3
+    async with httpx.AsyncClient() as shared_http:
+        for batch_start in range(0, len(figures), BATCH_SIZE):
+            batch = figures[batch_start:batch_start + BATCH_SIZE]
+            tasks = [
+                _analyze_single_figure(batch_start + i + 1, fig, shared_http)
+                for i, fig in enumerate(batch)
+            ]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in batch_results:
+                if isinstance(res, Exception):
+                    logger.error("Figure analysis failed: %s", res)
+                else:
+                    result_patches.append(res)
 
     # Store in MongoDB
     if result_patches:
@@ -3262,7 +3280,6 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
 @router.get("/{session_id}/equation-analysis")
 async def equation_analysis(session_id: str, user=Depends(get_current_user_dep)):
     """Analyze all OMML equations in the DOCX for outdated notation."""
-    from lxml import etree
     from uuid import uuid4
 
     db = get_database()
@@ -3284,31 +3301,23 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
             e["_id"] = str(e["_id"])
         return {"session_id": session_id, "equations": existing, "cached": True}
 
-    doc = await doc_repo.find_by_id(session["document_id"])
+    # ── Read equations from DB (extracted once during POST /process) ──
+    doc = await doc_repo.find_with_media(session["document_id"])
     if not doc:
         raise HTTPException(404, "Document not found")
 
-    file_path = _resolve_file_path(doc.get("file_path", ""))
-    if not os.path.exists(file_path):
-        raise HTTPException(404, "Document file not found on disk")
+    db_equations = doc.get("equations", [])
 
-    from docx import Document as DocxDocument
-
-    docx_doc = DocxDocument(file_path)
-
-    nsmap_m = {'m': 'http://schemas.openxmlformats.org/officeDocument/2006/math'}
     equations = []
-    for idx, para in enumerate(docx_doc.paragraphs):
-        omaths = para._element.findall('.//m:oMath', nsmap_m)
-        for omath in omaths:
-            omml_xml = etree.tostring(omath, encoding='unicode')
-            texts = omath.findall('.//m:t', nsmap_m)
-            readable = ' '.join(t.text or '' for t in texts)
-            equations.append({
-                "para_idx": idx,
-                "omml_xml": omml_xml,
-                "readable_text": readable,
-            })
+    for eq in db_equations:
+        pos = eq.get("position") or {}
+        # Build readable text from latex or raw_omml
+        readable = eq.get("latex") or ""
+        equations.append({
+            "para_idx": pos.get("paragraph"),
+            "omml_xml": eq.get("raw_omml") or "",
+            "readable_text": readable,
+        })
 
     if not equations:
         return {"session_id": session_id, "equations": [], "message": "No equations found in document."}
@@ -3421,52 +3430,32 @@ async def table_analysis(session_id: str, user=Depends(get_current_user_dep)):
             e["_id"] = str(e["_id"])
         return {"session_id": session_id, "tables": existing, "cached": True}
 
-    doc = await doc_repo.find_by_id(session["document_id"])
+    # ── Read tables from DB (extracted once during POST /process) ──
+    doc = await doc_repo.find_with_media(session["document_id"])
     if not doc:
         raise HTTPException(404, "Document not found")
 
-    file_path = _resolve_file_path(doc.get("file_path", ""))
-    if not os.path.exists(file_path):
-        raise HTTPException(404, "Document file not found on disk")
-
-    from docx import Document as DocxDocument
-
-    docx_doc = DocxDocument(file_path)
+    db_tables = doc.get("tables", [])
 
     tables_data = []
-    for t_idx, table in enumerate(docx_doc.tables):
-        rows_data = []
-        for row in table.rows:
-            row_data = [cell.text.strip() for cell in row.cells]
-            rows_data.append(row_data)
-        # Try to find a caption in the paragraph immediately before the table element
-        caption = ""
-        table_element = table._tbl
-        prev = table_element.getprevious()
-        if prev is not None:
-            nsmap_w = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
-            runs = prev.findall('.//w:t', nsmap_w)
-            prev_text = ''.join(r.text or '' for r in runs).strip()
-            if prev_text.lower().startswith("table") or prev_text.lower().startswith("tbl"):
-                caption = prev_text
+    for t_idx, tbl in enumerate(db_tables):
         tables_data.append({
             "table_idx": t_idx,
-            "content": rows_data,
-            "caption": caption,
+            "content": tbl.get("content", []),
+            "caption": tbl.get("caption") or "",
         })
 
     if not tables_data:
         return {"session_id": session_id, "tables": [], "message": "No tables found in document."}
 
-    # Analyze each table with GPT
-    from openai import AsyncOpenAI
+    # Analyze tables in PARALLEL for speed
+    import asyncio
     import json as _json
+    from openai import AsyncOpenAI
 
     client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    result_patches = []
 
-    for t_num, tdata in enumerate(tables_data, start=1):
-        # Format table content for GPT
+    async def _analyze_single_table(t_num: int, tdata: dict):
         content_str = ""
         for r_idx, row in enumerate(tdata["content"]):
             content_str += f"Row {r_idx}: {row}\n"
@@ -3494,7 +3483,6 @@ async def table_analysis(session_id: str, user=Depends(get_current_user_dep)):
             )
             raw = gpt_resp.choices[0].message.content or ""
             analysis_text = raw
-
             try:
                 cleaned = raw.strip()
                 if cleaned.startswith("```"):
@@ -3509,7 +3497,7 @@ async def table_analysis(session_id: str, user=Depends(get_current_user_dep)):
             logger.warning("GPT table analysis failed for table %d: %s", t_num, gpt_err)
             analysis_text = f"Analysis unavailable: {gpt_err}"
 
-        patch_doc = {
+        return {
             "patch_id": str(uuid4()),
             "session_id": session_id,
             "type": "table",
@@ -3521,7 +3509,22 @@ async def table_analysis(session_id: str, user=Depends(get_current_user_dep)):
             "analysis": analysis_text,
             "created_at": datetime.utcnow().isoformat(),
         }
-        result_patches.append(patch_doc)
+
+    # Process all tables in parallel (batches of 3 to avoid rate limits)
+    result_patches = []
+    BATCH_SIZE = 3
+    for batch_start in range(0, len(tables_data), BATCH_SIZE):
+        batch = tables_data[batch_start:batch_start + BATCH_SIZE]
+        tasks = [
+            _analyze_single_table(batch_start + i + 1, tdata)
+            for i, tdata in enumerate(batch)
+        ]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in batch_results:
+            if isinstance(res, Exception):
+                logger.error("Table analysis failed: %s", res)
+            else:
+                result_patches.append(res)
 
     if result_patches:
         await db.media_patches.insert_many(result_patches)
