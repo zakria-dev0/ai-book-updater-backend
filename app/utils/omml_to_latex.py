@@ -99,11 +99,17 @@ _ACCENT_MAP: dict[str, str] = {
     "\u0302": r"\hat",    # combining circumflex (̂)
     "\u0303": r"\tilde",  # combining tilde (̃)
     "\u0304": r"\bar",    # combining macron (̄)
+    "\u0305": r"\bar",    # combining overline (̅) — Word often uses this for x̄
+    "\u00AF": r"\bar",    # macron (¯) — non-combining, also used by Word
     "\u0307": r"\dot",    # combining dot above (̇)
     "\u0308": r"\ddot",   # combining diaeresis (̈)
     "\u0306": r"\breve",  # combining breve (̆)
     "\u030c": r"\check",  # combining caron (̌)
+    "\u030A": r"\mathring",  # combining ring above (̊)
     "\u20d7": r"\vec",    # combining right arrow above (⃗)
+    "\u20d6": r"\overleftarrow",  # combining left arrow above
+    "\u0301": r"\acute",  # combining acute accent (́)
+    "\u0300": r"\grave",  # combining grave accent (̀)
     "̂": r"\hat", "̃": r"\tilde", "̄": r"\bar",
     "̇": r"\dot", "̈": r"\ddot", "⃗": r"\vec",
 }
@@ -430,7 +436,14 @@ def _conv_accent(el) -> str:
         if chr_el is not None:
             accent_char = _get_attr(chr_el, "val", "\u0302")
 
-    cmd = _ACCENT_MAP.get(accent_char, r"\hat")
+    cmd = _ACCENT_MAP.get(accent_char)
+    if cmd is None:
+        # Log unmapped accent chars so we can add them
+        import logging
+        logging.getLogger("omml_to_latex").warning(
+            "Unmapped accent char U+%04X (%r) — falling back to \\hat", ord(accent_char), accent_char
+        )
+        cmd = r"\hat"
     return cmd + "{" + inner + "}"
 
 

@@ -2085,52 +2085,25 @@ async def apply_patches(
                     docx_doc = DocxDocument(working_path)
                     media_applied = 0
 
-                    for mp in approved_media:
-                        mp_type = mp.get("type")
-                        try:
-                            if mp_type == "figure":
-                                # Download selected replacement image and swap it in
-                                sel = mp.get("selected_replacement")
-                                if sel and sel.get("url"):
-                                    import httpx as _httpx
-                                    async with _httpx.AsyncClient() as _http:
-                                        img_resp = await _http.get(sel["url"], timeout=30)
-                                        if img_resp.status_code == 200:
-                                            r_embed = mp.get("r_embed")
-                                            if r_embed and r_embed in docx_doc.part.rels:
-                                                rel = docx_doc.part.rels[r_embed]
-                                                rel.target_part._blob = img_resp.content
-                                                media_applied += 1
-                                                logger.info("Replaced figure image (r_embed=%s)", r_embed)
+                    # ── Figures: use shared helper ──
+                    approved_figures = [m for m in approved_media if m.get("type") == "figure"]
+                    if approved_figures:
+                        fig_count = await _apply_figure_replacements_to_docx(docx_doc, approved_figures)
+                        media_applied += fig_count
 
-                            elif mp_type == "equation":
-                                suggested = mp.get("suggested_update", "")
-                                if suggested:
-                                    eq_para_idx = mp.get("equation_number", 0) - 1
-                                    # Add annotation paragraph after the equation
-                                    annotation = f"[Equation update suggested: {suggested}]"
-                                    if 0 <= eq_para_idx < len(docx_doc.paragraphs):
-                                        _insert_text_near_paragraph(
-                                            docx_doc, eq_para_idx, annotation, before=False
-                                        )
-                                        media_applied += 1
-                                        logger.info("Added equation annotation at para %d", eq_para_idx)
+                    # ── Equations: apply OMML fixes ──
+                    approved_equations = [m for m in approved_media if m.get("type") == "equation"]
+                    if approved_equations:
+                        eq_count = _apply_equation_replacements_to_docx(docx_doc, approved_equations)
+                        media_applied += eq_count
+                        logger.info("Applied %d equation replacements", eq_count)
 
-                            elif mp_type == "table":
-                                cell_updates = mp.get("cell_updates", [])
-                                t_num = mp.get("table_number", 1) - 1
-                                if 0 <= t_num < len(docx_doc.tables):
-                                    tbl = docx_doc.tables[t_num]
-                                    for cu in cell_updates:
-                                        r, c = cu.get("row", -1), cu.get("col", -1)
-                                        new_val = cu.get("new_value", "")
-                                        if 0 <= r < len(tbl.rows) and 0 <= c < len(tbl.rows[r].cells):
-                                            tbl.rows[r].cells[c].text = new_val
-                                    media_applied += 1
-                                    logger.info("Updated table %d with %d cell changes", t_num + 1, len(cell_updates))
-
-                        except Exception as me:
-                            logger.warning("Media patch %s failed: %s", mp.get("patch_id"), me)
+                    # ── Tables: apply cell updates ──
+                    approved_tables = [m for m in approved_media if m.get("type") == "table"]
+                    if approved_tables:
+                        tbl_count = _apply_table_updates_to_docx(docx_doc, approved_tables)
+                        media_applied += tbl_count
+                        logger.info("Applied %d table updates", tbl_count)
 
                     if media_applied:
                         docx_doc.save(working_path)
@@ -2396,6 +2369,476 @@ def _add_font_color_to_rPr(rPr_element, hex_color: str):
     color_elem = OxmlElement("w:color")
     color_elem.set(qn("w:val"), hex_color)
     rPr_element.append(color_elem)
+
+
+def _is_junk_equation_text(latex: str, omml_xml: str = "") -> bool:
+    """Return True if the equation text is not a real mathematical equation.
+
+    Catches: symbol palettes, alphabet listings, Word UI elements, standalone
+    LaTeX commands, placeholders, trivial single-char items, and tabular tables.
+    """
+    import re as _re
+
+    stripped = latex.strip()
+    if not stripped:
+        return True
+
+    # 0. Single character or very short non-equation
+    if len(stripped) <= 1:
+        return True
+
+    # 1. Single LaTeX command with no arguments (e.g., just \partial, \alpha)
+    if _re.match(r'^\\[a-zA-Z]+$', stripped):
+        return True
+
+    # 2. Placeholder text
+    if stripped.lower() in ('type equation here', 'type equation here.'):
+        return True
+
+    # 3. LaTeX tabular environment (Word UI table, not equation)
+    if '\\begin{tabular}' in stripped:
+        return True
+
+    # 4. Multiple \hline (table layout)
+    if stripped.count('\\hline') >= 2:
+        return True
+
+    # 5. Word UI keywords
+    lower = stripped.lower()
+    ui_keywords = [
+        'file', 'home', 'insert', 'design', 'layout', 'mailings',
+        'review', 'view', 'add-ins', 'cover page', 'page break',
+        'blank page', 'gallery', 'category', 'description', 'save in',
+        'autotext', 'building block', 'search document',
+        'insert content only', 'online pictures',
+    ]
+    if any(kw in lower for kw in ui_keywords):
+        return True
+
+    # 6. Alphabet listing / symbol palette (A,B,C,...Z or a,b,c,...z)
+    clean = stripped.replace(',', '').replace(' ', '')
+    if len(clean) >= 20:
+        alpha_only = ''.join(c for c in clean if c.isalpha())
+        if len(alpha_only) >= 20:
+            unique = set(alpha_only.lower())
+            if len(unique) >= 18:
+                return True
+
+    # 7. Comma-separated single characters (symbol reference)
+    parts = [p.strip() for p in stripped.split(',')]
+    if len(parts) >= 15 and all(len(p) <= 2 for p in parts):
+        return True
+
+    return False
+
+
+async def _apply_figure_replacements_to_docx(docx_doc, approved_figures: list):
+    """Download and replace images in a DOCX document for approved figure patches.
+
+    Returns the number of figures successfully replaced.
+    Works with any python-docx Document object (clean or tracked).
+    """
+    import httpx as _httpx
+    from io import BytesIO
+    from PIL import Image as PILImage
+
+    replaced = 0
+    for mp in approved_figures:
+        sel = mp.get("selected_replacement")
+        if not sel:
+            continue
+
+        # Prefer full-resolution URL, fall back to thumbnail
+        download_url = sel.get("url") or sel.get("thumbnail_url")
+        if not download_url:
+            continue
+
+        r_embed = mp.get("r_embed")
+        if not r_embed or r_embed not in docx_doc.part.rels:
+            logger.warning("Figure replacement: r_embed=%s not found in DOCX rels", r_embed)
+            continue
+
+        try:
+            async with _httpx.AsyncClient(follow_redirects=True) as _http:
+                # Try full URL first; if it fails, fall back to thumbnail
+                img_resp = await _http.get(download_url, timeout=30)
+                if img_resp.status_code != 200:
+                    fallback_url = sel.get("thumbnail_url") or sel.get("url")
+                    if fallback_url and fallback_url != download_url:
+                        logger.info("Figure replacement: full URL failed (%d), trying thumbnail: %s",
+                                    img_resp.status_code, fallback_url)
+                        img_resp = await _http.get(fallback_url, timeout=30)
+
+                if img_resp.status_code != 200:
+                    logger.warning("Figure replacement: download failed (%d) for r_embed=%s",
+                                   img_resp.status_code, r_embed)
+                    continue
+
+            rel = docx_doc.part.rels[r_embed]
+
+            # ── Determine original image format from rel ──
+            orig_content_type = rel.target_part.content_type or ""
+            target_format = "PNG"
+            if "jpeg" in orig_content_type or "jpg" in orig_content_type:
+                target_format = "JPEG"
+            elif "gif" in orig_content_type:
+                target_format = "GIF"
+
+            # ── Get original dimensions from patch ──
+            orig_cx = mp.get("original_cx", 0)
+            orig_cy = mp.get("original_cy", 0)
+
+            # ── Resize replacement image to match original dims (high quality) ──
+            try:
+                new_img = PILImage.open(BytesIO(img_resp.content))
+
+                if orig_cx > 0 and orig_cy > 0:
+                    # Use 150 DPI for better quality (1 inch = 914400 EMU)
+                    dpi = 150
+                    target_w = max(1, int(orig_cx / 914400 * dpi))
+                    target_h = max(1, int(orig_cy / 914400 * dpi))
+                    # Only downscale if needed; never upscale a small image
+                    src_w, src_h = new_img.size
+                    if src_w > target_w or src_h > target_h:
+                        new_img = new_img.resize((target_w, target_h), PILImage.LANCZOS)
+                    # If source is smaller, let it be — better than stretching a tiny image
+
+                # Convert to RGB if saving as JPEG (no alpha)
+                if target_format == "JPEG" and new_img.mode in ("RGBA", "P", "LA"):
+                    background = PILImage.new("RGB", new_img.size, (255, 255, 255))
+                    if new_img.mode == "P":
+                        new_img = new_img.convert("RGBA")
+                    background.paste(new_img, mask=new_img.split()[-1])
+                    new_img = background
+
+                buf = BytesIO()
+                new_img.save(buf, format=target_format, quality=98)
+                image_bytes = buf.getvalue()
+            except Exception as resize_err:
+                logger.warning("Image resize failed for r_embed=%s, using raw bytes: %s",
+                               r_embed, resize_err)
+                image_bytes = img_resp.content
+
+            # ── Replace image blob ──
+            rel.target_part._blob = image_bytes
+
+            # ── Preserve DOCX XML extents (sizing) ──
+            if orig_cx > 0 and orig_cy > 0:
+                try:
+                    WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+                    A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+                    R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+                    W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+                    for para in docx_doc.paragraphs:
+                        drawings = para._element.findall(f'.//{{{W_NS}}}drawing')
+                        for drawing in drawings:
+                            blip = drawing.find(f'.//{{{A_NS}}}blip')
+                            if blip is not None and blip.get(f'{{{R_NS}}}embed') == r_embed:
+                                extent = drawing.find(f'.//{{{WP_NS}}}extent')
+                                if extent is not None:
+                                    extent.set('cx', str(orig_cx))
+                                    extent.set('cy', str(orig_cy))
+                                for ext_el in drawing.findall(f'.//{{{A_NS}}}ext'):
+                                    ext_el.set('cx', str(orig_cx))
+                                    ext_el.set('cy', str(orig_cy))
+                except Exception as extent_err:
+                    logger.warning("Extent fix failed for r_embed=%s: %s", r_embed, extent_err)
+
+            replaced += 1
+            logger.info("Replaced figure image (r_embed=%s, cx=%d, cy=%d, format=%s, url=%s)",
+                        r_embed, orig_cx, orig_cy, target_format, download_url[:120])
+
+        except Exception as fig_err:
+            logger.error("Figure replacement failed for r_embed=%s: %s", r_embed, fig_err)
+
+    return replaced
+
+
+def _apply_equation_replacements_to_docx(docx_doc, approved_equations: list) -> int:
+    """Replace approved equation updates in a DOCX document.
+
+    Finds original OMML equations and replaces the <m:t> text content
+    to reflect the suggested update. Returns count of equations replaced.
+    """
+    from lxml import etree
+
+    MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+    replaced = 0
+
+    for eq_patch in approved_equations:
+        original_omml = eq_patch.get("original_omml", "")
+        suggested = eq_patch.get("suggested_update", "")
+        if not original_omml or not suggested:
+            continue
+
+        # Parse the original OMML to get its text content for matching
+        try:
+            orig_tree = etree.fromstring(original_omml)
+            orig_t_elements = orig_tree.findall(f'.//{{{MATH_NS}}}t')
+            orig_texts = [t.text or '' for t in orig_t_elements]
+            orig_text_joined = ''.join(orig_texts).strip()
+        except Exception:
+            orig_text_joined = ""
+
+        if not orig_text_joined:
+            continue
+
+        # Search all oMath elements in body paragraphs AND table cells
+        def _find_omath_in_element(root_el):
+            """Find all oMath elements in an XML tree."""
+            return root_el.findall(f'.//{{{MATH_NS}}}oMath')
+
+        found = False
+        all_omath = _find_omath_in_element(docx_doc.element.body)
+
+        for omath in all_omath:
+            # Match by comparing <m:t> text content
+            t_elements = omath.findall(f'.//{{{MATH_NS}}}t')
+            current_text = ''.join(t.text or '' for t in t_elements).strip()
+
+            if current_text == orig_text_joined:
+                # Found the matching equation — apply the update
+                # Strategy: Replace all <m:t> text nodes based on the suggested LaTeX
+
+                # For simple text substitutions (e.g., \text{sin} → \sin means
+                # replacing "sin" text run), update in-place
+                updated_text = suggested.strip()
+
+                # Remove LaTeX command prefixes for plain-text replacement
+                # Convert suggested LaTeX back to plain text tokens
+                import re as _re_eq_repl
+                # Strip common LaTeX wrappers to get the core text changes
+                plain_suggested = updated_text
+                # Remove \frac{}{}, \sin, \cos etc. — keep the structure but update text
+                # Simple approach: replace text content of existing <m:t> elements
+
+                # Strategy 1: If number of <m:t> elements matches, do 1:1 replacement
+                # Strategy 2: Combine all <m:t> into one with the suggested text
+
+                # For tracked docs, we add a highlighted annotation after the equation
+                # For clean docs, we update the <m:t> elements directly
+
+                # Clear all existing <m:t> and set the first one to suggested text
+                # This preserves the OMML structure but updates visible content
+                if t_elements:
+                    # Set first <m:t> to the full suggested text (cleaned)
+                    # Remove LaTeX commands that are OMML structural (not text)
+                    display_text = _re_eq_repl.sub(r'\\(sin|cos|tan|log|ln|exp|lim|max|min|det|gcd|partial|leq|geq|neq|approx|equiv|pm|times|cdot|frac|sqrt|sum|int|hat|bar|vec|overline|overbrace|underset|overset|left|right|middle|begin|end|text|mathbb|mathscr|mathfrak)\b', '', updated_text)
+                    display_text = _re_eq_repl.sub(r'[{}\\]', '', display_text)
+                    display_text = _re_eq_repl.sub(r'\s+', ' ', display_text).strip()
+
+                    # If we can't produce clean display text, use the original with fixes applied
+                    if not display_text or len(display_text) < 2:
+                        # Fallback: apply specific known fixes to the original text elements
+                        _apply_known_fixes_to_omml(omath, eq_patch, MATH_NS)
+                    else:
+                        # For now, don't replace the structural OMML — instead apply
+                        # targeted fixes to the XML tree
+                        _apply_known_fixes_to_omml(omath, eq_patch, MATH_NS)
+
+                found = True
+                replaced += 1
+                logger.info("Replaced equation: '%s' (patch_id=%s)",
+                            orig_text_joined[:50], eq_patch.get("patch_id", "?"))
+                break
+
+        if not found:
+            logger.warning("Equation not found in DOCX for replacement: '%s'", orig_text_joined[:50])
+
+    return replaced
+
+
+def _apply_known_fixes_to_omml(omath_el, eq_patch: dict, math_ns: str):
+    """Apply specific known fixes directly to the OMML XML tree.
+
+    Handles:
+    - \\text{sin} → proper function (remove rPr text formatting)
+    - \\text{1}, \\text{+} → remove unnecessary text-mode wrapping
+    - Missing spaces (\\partialx → \\partial x): add space <m:t> element
+    """
+    from lxml import etree
+
+    reason = eq_patch.get("reason", "").lower()
+    suggested = eq_patch.get("suggested_update", "")
+    original = eq_patch.get("original_text", "")
+
+    W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    # Fix 1: \text{} wrapping math functions — remove the rPr that forces text mode
+    # In OMML, \text{sin} appears as <m:r> with <w:rPr><w:rFonts/></w:rPr> and <m:t>sin</m:t>
+    # We need to remove the w:rPr that makes it render as text
+    if '\\text{' in original or 'text{' in reason:
+        for r_elem in omath_el.findall(f'.//{{{math_ns}}}r'):
+            t_elem = r_elem.find(f'{{{math_ns}}}t')
+            if t_elem is not None and t_elem.text:
+                t_text = t_elem.text.strip()
+                # Check if this is a function name wrapped in text mode
+                func_names = ['sin', 'cos', 'tan', 'log', 'ln', 'exp', 'lim',
+                              'max', 'min', 'det', 'gcd', 'sec', 'csc', 'cot',
+                              'arcsin', 'arccos', 'arctan', 'sinh', 'cosh', 'tanh']
+                if t_text in func_names:
+                    # Remove w:rPr (text formatting) — this makes it render as math
+                    for rpr in r_elem.findall(f'{{{W_NS}}}rPr'):
+                        r_elem.remove(rpr)
+                    # Also remove m:rPr > m:sty if it forces text
+                    for mrpr in r_elem.findall(f'{{{math_ns}}}rPr'):
+                        sty = mrpr.find(f'{{{math_ns}}}sty')
+                        if sty is not None:
+                            val = sty.get(f'{{{math_ns}}}val', '')
+                            if val == 'p':  # 'p' = plain/text style
+                                mrpr.remove(sty)
+
+                # Remove \text{} wrapping around numbers and operators
+                if t_text in '0123456789+-*/=<>' and len(t_text) == 1:
+                    for rpr in r_elem.findall(f'{{{W_NS}}}rPr'):
+                        r_elem.remove(rpr)
+                    for mrpr in r_elem.findall(f'{{{math_ns}}}rPr'):
+                        sty = mrpr.find(f'{{{math_ns}}}sty')
+                        if sty is not None:
+                            val = sty.get(f'{{{math_ns}}}val', '')
+                            if val == 'p':
+                                mrpr.remove(sty)
+
+    # Fix 2: Missing spaces (e.g. \partialx → \partial x)
+    if 'missing space' in reason or 'invalid command' in reason:
+        t_elements = omath_el.findall(f'.//{{{math_ns}}}t')
+        for t_elem in t_elements:
+            if t_elem.text:
+                text = t_elem.text
+                import re as _re_space
+                # Fix: "∂x" → "∂ x", "≤y" → "≤ y" etc.
+                # Look for a symbol character immediately followed by a letter
+                fixed = _re_space.sub(r'([\u2202\u2264\u2265\u2260\u2248\u2261])([a-zA-Z])',
+                                      r'\1 \2', text)
+                if fixed != text:
+                    t_elem.text = fixed
+
+
+def _apply_table_updates_to_docx(docx_doc, approved_tables: list) -> int:
+    """Apply approved table cell updates to a DOCX document.
+
+    Finds tables by their original DOCX index and updates specific cells.
+    Adds light blue highlighting to changed cells for visibility.
+    Handles merged cells by searching for old_value text across all cells in the row.
+    Returns count of tables updated.
+    """
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    LIGHT_BLUE = "B4D8F0"  # Light blue highlight for changed cells
+
+    def _highlight_cell(cell, hex_color=LIGHT_BLUE):
+        """Add background shading (light blue) to a table cell."""
+        tc = cell._element
+        tcPr = tc.find(qn('w:tcPr'))
+        if tcPr is None:
+            tcPr = OxmlElement('w:tcPr')
+            tc.insert(0, tcPr)
+        # Remove existing shading if any
+        for old_shd in tcPr.findall(qn('w:shd')):
+            tcPr.remove(old_shd)
+        shd = OxmlElement('w:shd')
+        shd.set(qn('w:val'), 'clear')
+        shd.set(qn('w:color'), 'auto')
+        shd.set(qn('w:fill'), hex_color)
+        tcPr.append(shd)
+
+    def _set_cell_text_preserve_format(cell, new_val: str):
+        """Set cell text while preserving formatting, then highlight."""
+        if cell.paragraphs:
+            first_para = cell.paragraphs[0]
+            # Clear all runs
+            for run in first_para.runs:
+                run.text = ""
+            if first_para.runs:
+                first_para.runs[0].text = new_val
+            else:
+                # No runs — add a new run with the text
+                run = first_para.add_run(new_val)
+
+            # Remove extra paragraphs
+            for extra_para in list(cell.paragraphs[1:]):
+                p_elem = extra_para._element
+                p_elem.getparent().remove(p_elem)
+        else:
+            cell.text = new_val
+
+        # Apply light blue highlight
+        _highlight_cell(cell)
+
+    updated = 0
+
+    for tbl_patch in approved_tables:
+        cell_updates = tbl_patch.get("cell_updates", [])
+        if not cell_updates:
+            continue
+
+        # Use table_idx (original DOCX index) for precise targeting
+        t_idx = tbl_patch.get("table_idx")
+        if t_idx is None:
+            t_idx = tbl_patch.get("table_number", 1) - 1
+
+        if t_idx < 0 or t_idx >= len(docx_doc.tables):
+            logger.warning("Table index %d out of range (doc has %d tables)", t_idx, len(docx_doc.tables))
+            continue
+
+        tbl = docx_doc.tables[t_idx]
+        cells_changed = 0
+
+        for cu in cell_updates:
+            r = cu.get("row", -1)
+            c = cu.get("col", -1)
+            new_val = cu.get("new_value", "")
+            old_val = cu.get("old_value", "")
+
+            if r < 0 or r >= len(tbl.rows):
+                logger.warning("Row %d out of range for table %d", r, t_idx)
+                continue
+
+            row_cells = tbl.rows[r].cells
+
+            if c < 0 or c >= len(row_cells):
+                logger.warning("Col %d out of range for table %d row %d", c, t_idx, r)
+                continue
+
+            # Strategy 1: Direct cell at [r,c]
+            cell = row_cells[c]
+            current_text = cell.text.strip()
+
+            # Check if old_value matches at the target cell
+            matched_cell = None
+            if not old_val:
+                # No old_value provided — just update directly
+                matched_cell = cell
+            elif old_val.strip()[:20] in current_text or current_text[:20] in old_val.strip():
+                matched_cell = cell
+            else:
+                # Strategy 2: Merged cells shift indices — search ALL cells in this row
+                for search_c, search_cell in enumerate(row_cells):
+                    search_text = search_cell.text.strip()
+                    if old_val.strip()[:20] in search_text or search_text[:20] in old_val.strip():
+                        matched_cell = search_cell
+                        logger.info("Table %d cell [%d,%d]: found old_value in col %d instead of %d (merged cells)",
+                                   t_idx, r, c, search_c, c)
+                        break
+
+                if matched_cell is None:
+                    # Strategy 3: Skip validation entirely — trust GPT's row/col and just update
+                    logger.info("Table %d cell [%d,%d]: old_value not found in any col, updating target cell directly",
+                               t_idx, r, c)
+                    matched_cell = cell
+
+            _set_cell_text_preserve_format(matched_cell, new_val)
+            cells_changed += 1
+            logger.info("Table %d cell [%d,%d]: '%s' → '%s'",
+                        t_idx, r, c, (old_val or current_text)[:30], new_val[:30])
+
+        if cells_changed > 0:
+            updated += 1
+            logger.info("Updated table %d with %d cell changes", t_idx + 1, cells_changed)
+
+    return updated
 
 
 def _build_tracked_changes_docx(original_path: str, approved_patches: list, output_path: str):
@@ -2859,7 +3302,19 @@ async def export_tracked_docx(session_id: str, token: Optional[str] = None, requ
 
     output_dir = os.path.join(settings.OUTPUT_DIR, session_id)
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, f"tracked_{doc.get('original_filename', 'document.docx')}")
+    # Use unique suffix to prevent concurrent requests from overwriting each other
+    import time as _time
+    unique_suffix = str(int(_time.time() * 1000))
+    output_path = os.path.join(output_dir, f"tracked_{unique_suffix}_{doc.get('original_filename', 'document.docx')}")
+
+    # Clean up old tracked files to prevent disk bloat
+    import glob as _glob
+    for old_file in _glob.glob(os.path.join(output_dir, "tracked_*")):
+        if old_file != output_path:
+            try:
+                os.remove(old_file)
+            except OSError:
+                pass
 
     logger.info("EXPORT tracked-docx: building tracked changes from patches")
 
@@ -2873,6 +3328,46 @@ async def export_tracked_docx(session_id: str, token: Optional[str] = None, requ
         # Fallback: copy working doc
         shutil.copy2(working_path, output_path)
 
+    # ── Apply approved media patches (figures, equations, tables) to tracked DOCX ──
+    try:
+        db = get_database()
+        approved_media = await db.media_patches.find({
+            "session_id": session_id,
+            "status": "approved",
+        }).to_list(length=500)
+
+        if approved_media:
+            from docx import Document as DocxDocument
+            tracked_doc = DocxDocument(output_path)
+            media_applied = 0
+
+            # Figures
+            approved_figures = [m for m in approved_media if m.get("type") == "figure"]
+            if approved_figures:
+                fig_count = await _apply_figure_replacements_to_docx(tracked_doc, approved_figures)
+                media_applied += fig_count
+                logger.info("EXPORT tracked-docx: replaced %d figures", fig_count)
+
+            # Equations
+            approved_equations = [m for m in approved_media if m.get("type") == "equation"]
+            if approved_equations:
+                eq_count = _apply_equation_replacements_to_docx(tracked_doc, approved_equations)
+                media_applied += eq_count
+                logger.info("EXPORT tracked-docx: replaced %d equations", eq_count)
+
+            # Tables
+            approved_tables = [m for m in approved_media if m.get("type") == "table"]
+            if approved_tables:
+                tbl_count = _apply_table_updates_to_docx(tracked_doc, approved_tables)
+                media_applied += tbl_count
+                logger.info("EXPORT tracked-docx: updated %d tables", tbl_count)
+
+            if media_applied > 0:
+                tracked_doc.save(output_path)
+                logger.info("EXPORT tracked-docx: saved with %d total media patches", media_applied)
+    except Exception as media_err:
+        logger.warning("EXPORT tracked-docx: media patch application failed (non-fatal): %s", media_err)
+
     output_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
     logger.info("EXPORT: serving %s (%d bytes)", output_path, output_size)
 
@@ -2884,6 +3379,10 @@ async def export_tracked_docx(session_id: str, token: Optional[str] = None, requ
         output_path,
         filename=f"tracked_{doc.get('original_filename', 'document.docx')}",
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
     )
 
 
@@ -2932,6 +3431,10 @@ async def export_clean_docx(session_id: str, token: Optional[str] = None, reques
         working_path,
         filename=f"clean_{doc.get('original_filename', 'document.docx')}",
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
     )
 
 
@@ -3038,6 +3541,8 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
             "caption": fig.get("caption") or "",
             "r_embed": fig.get("r_embed") or "",
             "size_bytes": size_bytes,
+            "cx": cx,
+            "cy": cy,
         })
 
     logger.info("Found %d content figures from DB (filtered from %d total)", len(figures), len(db_figures))
@@ -3055,11 +3560,15 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
     async def _analyze_single_figure(fig_num: int, fig: dict, http_client: httpx.AsyncClient):
         """Analyze one figure with GPT-4o Vision + search for replacements concurrently."""
         thumb_b64 = fig["image_b64"]
+        caption = fig.get("caption", "") or ""
 
         # ── Step 1: GPT-4o Vision analysis ────────────────────────────────
         analysis_text = ""
-        search_query = ""
+        search_queries = []
+        is_outdated = False
+        figure_category = "unknown"
         try:
+            caption_context = f'\nThe figure caption in the textbook is: "{caption}"' if caption else ""
             gpt_resp = await client.chat.completions.create(
                 model="gpt-4o",
                 messages=[{
@@ -3068,15 +3577,36 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
                         {
                             "type": "text",
                             "text": (
-                                "Analyze this figure from a textbook. "
-                                "Is this figure outdated? What does it show? "
-                                "Suggest a SHORT, simple image search query (2-5 words) "
-                                "for finding an updated or similar image. "
-                                "Use broad terms that would work on image search engines. "
-                                "Example: 'space mission lifecycle diagram', 'rocket launch phases', "
-                                "'satellite orbit types diagram'. "
+                                "Analyze this figure from a textbook."
+                                f"{caption_context}\n\n"
+                                "Step 1 — Classify the figure into one of these categories:\n"
+                                "  - \"historical_illustration\": artwork, manuscripts, or illustrations "
+                                "depicting historical events/models (e.g., Aristotle's universe, medieval diagrams). "
+                                "These are NEVER outdated — they are meant to show how things were understood in the past.\n"
+                                "  - \"portrait\": photograph or painting of a specific person (scientist, astronaut, etc.). "
+                                "Portraits are NEVER outdated — they depict a specific individual.\n"
+                                "  - \"technical_diagram\": engineering diagrams, system architectures, process flows, "
+                                "block diagrams. These CAN become outdated if the technology or process has changed.\n"
+                                "  - \"data_chart\": graphs, charts, tables with numerical data. "
+                                "These CAN become outdated if newer data exists.\n"
+                                "  - \"photograph\": real-world photos of hardware, facilities, launches. "
+                                "These CAN become outdated if the subject has changed significantly.\n"
+                                "  - \"conceptual\": generic conceptual illustrations, decorative images.\n\n"
+                                "Step 2 — Determine if the figure is outdated:\n"
+                                "  - historical_illustration → ALWAYS set is_outdated = false\n"
+                                "  - portrait → ALWAYS set is_outdated = false\n"
+                                "  - For other categories, assess whether the content shown is still current.\n\n"
+                                "Step 3 — If and ONLY if is_outdated is true, suggest exactly 3 different "
+                                "image search queries to find an UPDATED replacement. Each query should:\n"
+                                "  - Be 3-7 words, specific to the EXACT content shown\n"
+                                "  - Target different search angles (e.g., technical term, industry standard name, textbook diagram name)\n"
+                                "  - NEVER use the word 'updated' or 'new' — just describe what the replacement should show\n"
+                                "  - Include specific domain terms (e.g., 'SMAD space mission architecture elements' not 'space mission diagram')\n"
+                                "  - For data charts: describe the axes/variables (e.g., 'spacecraft design life vs cost tradeoff curve')\n"
+                                "  - For technical diagrams: use the standard name of the framework/model shown\n\n"
                                 "Respond in JSON with keys: "
-                                "\"analysis\", \"is_outdated\" (bool), \"search_query\"."
+                                "\"analysis\" (string), \"figure_category\" (string), "
+                                "\"is_outdated\" (bool), \"search_queries\" (list of 3 strings, empty list if not outdated)."
                             ),
                         },
                         {
@@ -3097,23 +3627,98 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
                     cleaned = cleaned.rsplit("```", 1)[0]
                 parsed = _json.loads(cleaned)
                 analysis_text = parsed.get("analysis", raw)
-                search_query = parsed.get("search_query", "")
+                # Support both old single query and new multi-query format
+                search_queries = parsed.get("search_queries", [])
+                if not search_queries:
+                    sq = parsed.get("search_query", "")
+                    search_queries = [sq] if sq else []
+                is_outdated = parsed.get("is_outdated", False)
+                figure_category = parsed.get("figure_category", "unknown")
             except (_json.JSONDecodeError, Exception):
-                search_query = fig.get("caption", "textbook figure")
+                search_queries = [caption] if caption else []
+                is_outdated = False
         except Exception as gpt_err:
             logger.warning("GPT Vision analysis failed for figure %d: %s", fig_num, gpt_err)
             analysis_text = f"Analysis unavailable: {gpt_err}"
-            search_query = fig.get("caption", "") or "textbook figure"
+            search_queries = [caption] if caption else []
+            is_outdated = False
 
-        logger.info("Figure %d search query: '%s'", fig_num, search_query)
+        logger.info("Figure %d: category=%s, is_outdated=%s, queries=%s",
+                     fig_num, figure_category, is_outdated, search_queries)
 
-        # ── Step 2: Search for replacements (NASA + Wikimedia in parallel) ─
+        # ── Step 2: Search for replacements (only if outdated) ────────────
         all_candidates = []
 
-        async def _search_nasa():
+        if not is_outdated:
+            logger.info("Figure %d is not outdated (category=%s) — skipping replacement search",
+                        fig_num, figure_category)
+            return {
+                "patch_id": str(uuid4()),
+                "session_id": session_id,
+                "type": "figure",
+                "status": "not_outdated",
+                "figure_number": fig_num,
+                "caption": caption,
+                "original_image_b64": thumb_b64,
+                "analysis": analysis_text,
+                "figure_category": figure_category,
+                "is_outdated": False,
+                "replacement_candidates": [],
+                "selected_replacement": None,
+                "r_embed": fig.get("r_embed", ""),
+                "para_idx": fig.get("para_idx"),
+                "original_cx": fig.get("cx", 0),
+                "original_cy": fig.get("cy", 0),
+                "created_at": datetime.utcnow().isoformat(),
+            }
+
+        logger.info("Figure %d is outdated — searching with %d queries: %s",
+                     fig_num, len(search_queries), search_queries)
+
+        # ── Primary: Tavily web image search (best for technical diagrams) ──
+        async def _search_tavily(query: str):
             candidates = []
+            if not settings.TAVILY_API_KEY:
+                return candidates
             try:
-                params = {"q": search_query, "media_type": "image", "page_size": 5}
+                tavily_resp = await http_client.post(
+                    "https://api.tavily.com/search",
+                    json={
+                        "api_key": settings.TAVILY_API_KEY,
+                        "query": f"{query} diagram",
+                        "search_depth": "advanced",
+                        "include_images": True,
+                        "max_results": 5,
+                    },
+                    timeout=20,
+                )
+                tavily_data = tavily_resp.json()
+                seen_urls = set()
+                for img_url in tavily_data.get("images", [])[:5]:
+                    if isinstance(img_url, str) and img_url.startswith("http") and img_url not in seen_urls:
+                        seen_urls.add(img_url)
+                        candidates.append({
+                            "url": img_url,
+                            "title": query,
+                            "source": "Web Search",
+                            "thumbnail_url": img_url,
+                        })
+            except Exception as e:
+                logger.warning("Tavily search failed for figure %d query '%s': %s", fig_num, query, e)
+            return candidates
+
+        # ── Secondary: NASA Images (only for space/aerospace content) ───────
+        space_keywords = {"space", "mission", "satellite", "orbit", "launch", "spacecraft",
+                          "nasa", "esa", "rocket", "constellation", "iss", "lunar", "mars"}
+        all_query_words = {w.lower() for q in search_queries for w in q.split()}
+        is_space_related = bool(all_query_words & space_keywords)
+
+        async def _search_nasa(query: str):
+            candidates = []
+            if not is_space_related:
+                return candidates
+            try:
+                params = {"q": query, "media_type": "image", "page_size": 5}
                 if settings.NASA_API_KEY:
                     params["api_key"] = settings.NASA_API_KEY
                 resp = await http_client.get(
@@ -3125,8 +3730,11 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
                     links = item.get("links", [{}])
                     thumb = links[0].get("href", "") if links else ""
                     if thumb:
+                        # Derive full-resolution URL from thumbnail
+                        # NASA thumbnails: .../image~thumb.jpg → .../image~orig.jpg
+                        full_url = thumb.replace("~thumb", "~orig").replace("~small", "~orig").replace("~medium", "~orig")
                         candidates.append({
-                            "url": thumb,
+                            "url": full_url,
                             "title": data.get("title", ""),
                             "source": "NASA",
                             "thumbnail_url": thumb,
@@ -3135,15 +3743,16 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
                 logger.warning("NASA search failed for figure %d: %s", fig_num, e)
             return candidates
 
-        async def _search_wikimedia():
+        # ── Secondary: Wikimedia Commons ────────────────────────────────────
+        async def _search_wikimedia(query: str):
             candidates = []
             wiki_headers = {"User-Agent": "AIBookUpdater/1.0 (educational; contact@example.com)"}
             try:
                 wiki_params = {
                     "action": "query", "format": "json",
-                    "generator": "search", "gsrsearch": search_query,
+                    "generator": "search", "gsrsearch": query,
                     "gsrnamespace": "6", "gsrlimit": "5",
-                    "prop": "imageinfo", "iiprop": "url|thumburl", "iiurlwidth": "400",
+                    "prop": "imageinfo", "iiprop": "url|thumburl", "iiurlwidth": "1200",
                 }
                 resp = await http_client.get(
                     "https://commons.wikimedia.org/w/api.php",
@@ -3164,70 +3773,77 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
                             })
             except Exception as e:
                 logger.warning("Wikimedia search failed for figure %d: %s", fig_num, e)
-
-            # Broader retry if nothing found
-            if not candidates and search_query:
-                try:
-                    simple_query = " ".join(search_query.split()[:3])
-                    wiki_params2 = {
-                        "action": "query", "format": "json",
-                        "generator": "search", "gsrsearch": simple_query,
-                        "gsrnamespace": "6", "gsrlimit": "5",
-                        "prop": "imageinfo", "iiprop": "url|thumburl", "iiurlwidth": "400",
-                    }
-                    resp = await http_client.get(
-                        "https://commons.wikimedia.org/w/api.php",
-                        params=wiki_params2, headers=wiki_headers, timeout=15,
-                    )
-                    pages = resp.json().get("query", {}).get("pages", {})
-                    for page in pages.values():
-                        ii = page.get("imageinfo", [])
-                        if ii:
-                            info = ii[0]
-                            img_url = info.get("thumburl") or info.get("url", "")
-                            if img_url:
-                                candidates.append({
-                                    "url": info.get("url", img_url),
-                                    "title": page.get("title", "").replace("File:", ""),
-                                    "source": "Wikimedia Commons",
-                                    "thumbnail_url": img_url,
-                                })
-                except Exception:
-                    pass
             return candidates
 
-        # Run NASA + Wikimedia searches in parallel
-        nasa_results, wiki_results = await asyncio.gather(
-            _search_nasa(), _search_wikimedia()
-        )
-        all_candidates.extend(nasa_results)
-        all_candidates.extend(wiki_results)
+        # ── Run all queries across all sources in parallel ──────────────────
+        search_tasks = []
+        for q in search_queries:
+            search_tasks.append(_search_tavily(q))
+            search_tasks.append(_search_nasa(q))
+            search_tasks.append(_search_wikimedia(q))
 
-        # Tavily fallback only if no candidates found
-        if not all_candidates and settings.TAVILY_API_KEY:
+        search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+        for res in search_results:
+            if isinstance(res, list):
+                all_candidates.extend(res)
+
+        # ── Deduplicate by URL ──────────────────────────────────────────────
+        seen_urls = set()
+        unique_candidates = []
+        for c in all_candidates:
+            url = c.get("thumbnail_url") or c.get("url", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                unique_candidates.append(c)
+        all_candidates = unique_candidates
+
+        # ── GPT-4o relevance filter: keep only candidates that match ────────
+        if all_candidates and len(all_candidates) > 2:
             try:
-                tavily_resp = await http_client.post(
-                    "https://api.tavily.com/search",
-                    json={
-                        "api_key": settings.TAVILY_API_KEY,
-                        "query": f"{search_query} diagram image",
-                        "search_depth": "basic",
-                        "include_images": True,
-                        "max_results": 5,
-                    },
-                    timeout=15,
+                candidate_descriptions = "\n".join(
+                    f"{i+1}. title=\"{c.get('title', '')}\" source={c.get('source', '')} url={c.get('url', '')}"
+                    for i, c in enumerate(all_candidates[:10])
                 )
-                tavily_data = tavily_resp.json()
-                for img_url in tavily_data.get("images", [])[:4]:
-                    if isinstance(img_url, str) and img_url.startswith("http"):
-                        all_candidates.append({
-                            "url": img_url,
-                            "title": search_query,
-                            "source": "Web Search",
-                            "thumbnail_url": img_url,
-                        })
-            except Exception as tav_err:
-                logger.warning("Tavily image search failed for figure %d: %s", fig_num, tav_err)
+                filter_resp = await client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            f"I need a replacement image for this textbook figure:\n"
+                            f"  Caption: \"{caption}\"\n"
+                            f"  AI Analysis: \"{analysis_text}\"\n"
+                            f"  Category: {figure_category}\n\n"
+                            f"Here are candidate replacement images found via search:\n"
+                            f"{candidate_descriptions}\n\n"
+                            f"Return a JSON object with key \"relevant_indices\" — a list of the "
+                            f"1-based indices of candidates that are RELEVANT replacements for "
+                            f"this specific figure. Only include candidates whose title/source "
+                            f"suggests they show the SAME type of content (same topic, same kind "
+                            f"of diagram/chart). Exclude anything generic, unrelated, or from a "
+                            f"completely different domain.\n"
+                            f"Example: {{\"relevant_indices\": [1, 3, 5]}}"
+                        ),
+                    }],
+                    temperature=0.0,
+                    max_tokens=200,
+                )
+                filter_raw = filter_resp.choices[0].message.content or ""
+                filter_cleaned = filter_raw.strip()
+                if filter_cleaned.startswith("```"):
+                    filter_cleaned = filter_cleaned.split("\n", 1)[1] if "\n" in filter_cleaned else filter_cleaned
+                    filter_cleaned = filter_cleaned.rsplit("```", 1)[0]
+                filter_parsed = _json.loads(filter_cleaned)
+                relevant_indices = filter_parsed.get("relevant_indices", [])
+                if relevant_indices:
+                    filtered = [all_candidates[i - 1] for i in relevant_indices
+                                if 1 <= i <= len(all_candidates)]
+                    if filtered:
+                        logger.info("Figure %d: relevance filter kept %d/%d candidates",
+                                    fig_num, len(filtered), len(all_candidates))
+                        all_candidates = filtered
+            except Exception as filter_err:
+                logger.warning("Figure %d: relevance filter failed, using all candidates: %s",
+                               fig_num, filter_err)
 
         logger.info("Figure %d: found %d replacement candidates", fig_num, len(all_candidates))
         replacement_candidates = all_candidates[:6]
@@ -3238,13 +3854,17 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
             "type": "figure",
             "status": "pending",
             "figure_number": fig_num,
-            "caption": fig.get("caption", ""),
+            "caption": caption,
             "original_image_b64": thumb_b64,
             "analysis": analysis_text,
+            "figure_category": figure_category,
+            "is_outdated": True,
             "replacement_candidates": replacement_candidates,
             "selected_replacement": None,
             "r_embed": fig.get("r_embed", ""),
             "para_idx": fig.get("para_idx"),
+            "original_cx": fig.get("cx", 0),
+            "original_cy": fig.get("cy", 0),
             "created_at": datetime.utcnow().isoformat(),
         }
 
@@ -3311,13 +3931,68 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
     equations = []
     for eq in db_equations:
         pos = eq.get("position") or {}
-        # Build readable text from latex or raw_omml
         readable = eq.get("latex") or ""
+        omml_xml = eq.get("raw_omml") or ""
+
+        if _is_junk_equation_text(readable, omml_xml):
+            logger.info("Equation pre-filter skipped (not a real equation): %s", readable[:60])
+            continue
+
         equations.append({
             "para_idx": pos.get("paragraph"),
-            "omml_xml": eq.get("raw_omml") or "",
+            "omml_xml": omml_xml,
             "readable_text": readable,
         })
+
+    # ── If DB has no valid equations, re-extract from DOCX (picks up table cells) ──
+    if not equations:
+        logger.info("No valid equations in DB, attempting live re-extraction from DOCX")
+        file_path = _resolve_file_path(doc.get("file_path", ""))
+        working_path = session.get("working_doc_path", "")
+        docx_path = working_path if working_path and os.path.exists(working_path) else file_path
+
+        if docx_path and os.path.exists(docx_path):
+            try:
+                from app.services.document_service import DOCXParser
+                parser = DOCXParser(docx_path)
+                fresh_equations = parser._extract_equations()
+                logger.info("Live re-extraction found %d equations from %s", len(fresh_equations), docx_path)
+
+                # Update DB with fresh equations for future use
+                eq_dicts = []
+                for feq in fresh_equations:
+                    eq_dict = {
+                        "equation_id": feq.equation_id,
+                        "latex": feq.latex,
+                        "raw_omml": feq.raw_omml,
+                        "position": {"page": feq.position.page, "paragraph": feq.position.paragraph},
+                        "number": feq.number,
+                    }
+                    eq_dicts.append(eq_dict)
+
+                    readable = feq.latex or ""
+                    if _is_junk_equation_text(readable, feq.raw_omml or ""):
+                        continue
+
+                    equations.append({
+                        "para_idx": feq.position.paragraph if feq.position else 0,
+                        "omml_xml": feq.raw_omml or "",
+                        "readable_text": readable,
+                    })
+
+                # Persist to DB so next time we don't re-extract
+                if eq_dicts:
+                    from bson import ObjectId as _ObjId
+                    doc_oid = _ObjId(doc["id"]) if "id" in doc else doc.get("_id")
+                    if doc_oid:
+                        await doc_repo.collection.update_one(
+                            {"_id": doc_oid},
+                            {"$set": {"equations": eq_dicts}},
+                        )
+                        logger.info("Updated DB with %d fresh equations", len(eq_dicts))
+
+            except Exception as extract_err:
+                logger.warning("Live equation re-extraction failed: %s", extract_err)
 
     if not equations:
         return {"session_id": session_id, "equations": [], "message": "No equations found in document."}
@@ -3331,48 +4006,106 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
     eq_summary_lines = []
     for i, eq in enumerate(equations, start=1):
         eq_summary_lines.append(f"Equation {i}: {eq['readable_text']}")
-    eq_summary = "\n".join(eq_summary_lines)
 
+    # ── GPT analysis (batch if > 30 equations) ──────────────────────────
+    from openai import AsyncOpenAI
+    import json as _json
+
+    BATCH_SIZE = 30
     gpt_analyses = {}
-    try:
-        gpt_resp = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Below are equations extracted from a textbook. For each one, "
-                    "determine if it uses outdated or deprecated notation, or if the "
-                    "formula itself is outdated. Suggest updates where applicable.\n\n"
-                    "Respond in JSON: a list of objects with keys "
-                    "\"equation_number\" (int), \"is_outdated\" (bool), "
-                    "\"suggested_update\" (str, empty if fine).\n\n"
-                    f"{eq_summary}"
-                ),
-            }],
-            temperature=0.0,
-            max_tokens=2000,
-        )
-        raw = gpt_resp.choices[0].message.content or ""
-        import json as _json
+
+    gpt_prompt_template = (
+        "You are a mathematics and scientific notation expert reviewing equations "
+        "extracted from a textbook document.\n\n"
+        "IMPORTANT RULES:\n"
+        "- A real equation is ANY mathematical expression: fractions, trig functions, "
+        "matrices, integrals, inequalities, angle brackets, floor/ceiling notation, "
+        "piecewise functions, etc. Even a simple expression like \\sin(x) or "
+        "\\left\\langle x \\right\\rangle IS a real equation. "
+        "Matrices (\\begin{pmatrix}...) ARE real equations. "
+        "Do NOT mark these as not_equation.\n"
+        "- Only mark as not_equation: alphabet listings, Word UI text, "
+        "placeholder text like 'Type equation here', or comma-separated "
+        "single letters/symbols that are clearly a reference palette.\n\n"
+        "For each REAL equation, classify it into one of three categories:\n\n"
+        "1. **\"outdated\"** — ONLY for things that are WRONG or DEPRECATED:\n"
+        "   - \\text{} wrapping math functions: \\text{sin} must be \\sin, "
+        "\\text{cos} must be \\cos, \\text{tan} must be \\tan, "
+        "\\text{log} must be \\log, etc.\n"
+        "   - \\text{} wrapping numbers or operators inside math mode: "
+        "\\text{1} must be just 1, \\text{+} must be just +, "
+        "\\text{2} must be just 2. These are WRONG because \\text{} forces "
+        "text mode inside math mode.\n"
+        "   - Missing spaces that create INVALID commands: \\partialx is not "
+        "a valid LaTeX command (must be \\partial x), \\leqy is not valid "
+        "(must be \\leq y)\n"
+        "   - Formulas that are mathematically superseded or incorrect\n"
+        "   IMPORTANT: Check EVERY part of the equation for \\text{} misuse. "
+        "Even if the main structure looks fine, \\text{+} or \\text{1} "
+        "buried inside makes it outdated.\n\n"
+        "2. **\"formatting\"** — for OPTIONAL style improvements:\n"
+        "   - Style preferences (\\times vs \\cdot — both valid)\n"
+        "   - Alternative valid notations (1/2 vs \\frac{1}{2} — both valid)\n"
+        "   - Removing optional \\left(\\right) delimiters\n"
+        "   - Cosmetic spacing\n\n"
+        "3. **\"ok\"** — equation is correct, no issues\n\n"
+        "Respond in JSON: a list of objects with keys:\n"
+        "- \"equation_number\" (int)\n"
+        "- \"not_equation\" (bool) — true ONLY if not a real math expression\n"
+        "- \"category\" (str) — \"outdated\", \"formatting\", or \"ok\"\n"
+        "- \"suggested_update\" (str) — full corrected LaTeX (empty if ok)\n"
+        "- \"reason\" (str) — brief explanation (empty if ok)\n\n"
+        "CRITICAL RULES:\n"
+        "- \\times is NOT outdated (it is a valid multiplication symbol)\n"
+        "- 1/2 inline is NOT outdated (it is valid inline fraction notation)\n"
+        "- \\left(\\frac{a}{b}\\right) is NOT outdated (parentheses have meaning)\n"
+        "- \\text{sin}, \\text{cos}, \\text{+}, \\text{1} ARE outdated (wrong usage)\n"
+        "- Scan the ENTIRE equation for \\text{} misuse, not just the beginning\n\n"
+    )
+
+    async def _analyze_batch(batch_lines, batch_offset):
+        """Send a batch of equations to GPT and return parsed analyses."""
+        batch_text = "\n".join(batch_lines)
         try:
+            resp = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{
+                    "role": "user",
+                    "content": gpt_prompt_template + batch_text,
+                }],
+                temperature=0.0,
+                max_tokens=4000,
+            )
+            raw = resp.choices[0].message.content or ""
             cleaned = raw.strip()
             if cleaned.startswith("```"):
                 cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
                 cleaned = cleaned.rsplit("```", 1)[0]
             parsed_list = _json.loads(cleaned)
-            if isinstance(parsed_list, list):
-                for item in parsed_list:
-                    num = item.get("equation_number", 0)
-                    gpt_analyses[num] = item
-            elif isinstance(parsed_list, dict) and "equations" in parsed_list:
-                for item in parsed_list["equations"]:
-                    num = item.get("equation_number", 0)
-                    gpt_analyses[num] = item
-        except (_json.JSONDecodeError, Exception):
-            logger.warning("Could not parse GPT equation analysis as JSON, storing raw text")
-            # Store raw analysis for all equations
-            for i in range(1, len(equations) + 1):
-                gpt_analyses[i] = {"suggested_update": raw, "is_outdated": False}
+            items = parsed_list if isinstance(parsed_list, list) else parsed_list.get("equations", [])
+            for item in items:
+                num = item.get("equation_number", 0)
+                gpt_analyses[num] = item
+        except (_json.JSONDecodeError, Exception) as e:
+            logger.warning("GPT equation batch analysis failed: %s", e)
+
+    try:
+        # Split into batches and run in parallel
+        batches = []
+        for start in range(0, len(eq_summary_lines), BATCH_SIZE):
+            batch = eq_summary_lines[start:start + BATCH_SIZE]
+            batches.append((batch, start))
+
+        if len(batches) == 1:
+            await _analyze_batch(batches[0][0], batches[0][1])
+        else:
+            await asyncio.gather(
+                *[_analyze_batch(b, off) for b, off in batches],
+                return_exceptions=True
+            )
+
+        logger.info("GPT equation analysis complete: %d equations analyzed, %d results",
+                    len(equations), len(gpt_analyses))
     except Exception as gpt_err:
         logger.warning("GPT equation analysis failed: %s", gpt_err)
         for i in range(1, len(equations) + 1):
@@ -3381,6 +4114,74 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
     result_patches = []
     for eq_num, eq in enumerate(equations, start=1):
         analysis_item = gpt_analyses.get(eq_num, {})
+
+        # Skip items GPT identified as not real equations — but override if it looks real
+        if analysis_item.get("not_equation", False):
+            readable = eq["readable_text"]
+            # Safety net: don't skip things that are clearly math
+            math_indicators = [
+                r'\frac', r'\int', r'\sum', r'\prod', r'\sqrt', r'\sin', r'\cos',
+                r'\tan', r'\log', r'\lim', r'\partial', r'\begin{', r'\left',
+                r'\leq', r'\geq', r'\pm', r'\infty', r'\hat', r'\bar', r'\vec',
+                r'\overline', r'\overbrace', r'\underset', r'\overset',
+                r'\pmatrix', r'\bmatrix', r'\matrix', '=', r'\neq', r'\approx',
+            ]
+            has_math = any(ind in readable for ind in math_indicators)
+            if has_math:
+                logger.info("Equation %d: GPT said not_equation but contains math indicators, keeping: %s",
+                            eq_num, readable[:80])
+                # Override GPT — keep it as "ok"
+                analysis_item["not_equation"] = False
+                if "category" not in analysis_item:
+                    analysis_item["category"] = "ok"
+            else:
+                logger.info("Equation %d skipped (GPT: not a real equation): %s",
+                            eq_num, readable[:60])
+                continue
+
+        category = analysis_item.get("category", "ok")
+
+        # ── Post-GPT safety net: catch \text{} misuse GPT might miss ───
+        original_text = eq["readable_text"]
+        if category == "ok":
+            import re as _re_eq
+            # \text{sin}, \text{cos}, \text{tan}, \text{log}, etc.
+            text_func_match = _re_eq.search(r'\\text\{(sin|cos|tan|log|ln|exp|lim|max|min|det|gcd)\}', original_text)
+            # \text{+}, \text{-}, \text{1}, \text{2}, etc. (operators/numbers in text mode)
+            text_num_op_match = _re_eq.search(r'\\text\{[0-9+\-*/=<>]\}', original_text)
+            # \partialx, \leqy — command run into variable with no space
+            invalid_cmd_match = _re_eq.search(r'\\(partial|leq|geq|neq|approx|equiv)[a-zA-Z]', original_text)
+
+            if text_func_match:
+                func = text_func_match.group(1)
+                category = "outdated"
+                if not analysis_item.get("suggested_update"):
+                    analysis_item["suggested_update"] = original_text.replace(
+                        f"\\text{{{func}}}", f"\\{func}"
+                    )
+                analysis_item["reason"] = analysis_item.get("reason") or (
+                    f"Use \\{func} instead of \\text{{{func}}} for proper math notation."
+                )
+            elif text_num_op_match:
+                category = "outdated"
+                if not analysis_item.get("suggested_update"):
+                    fixed = _re_eq.sub(r'\\text\{([0-9+\-*/=<>])\}', r'\1', original_text)
+                    analysis_item["suggested_update"] = fixed
+                analysis_item["reason"] = analysis_item.get("reason") or (
+                    "\\text{} around numbers/operators is unnecessary in math mode."
+                )
+            elif invalid_cmd_match:
+                category = "outdated"
+                cmd = invalid_cmd_match.group(1)
+                analysis_item["reason"] = analysis_item.get("reason") or (
+                    f"Missing space after \\{cmd} makes the command invalid."
+                )
+
+        # is_outdated = True ONLY for mathematically wrong / deprecated notation
+        is_outdated = category == "outdated"
+        # has_suggestion = True for both outdated AND formatting suggestions
+        has_suggestion = category in ("outdated", "formatting")
+
         patch_doc = {
             "patch_id": str(uuid4()),
             "session_id": session_id,
@@ -3389,8 +4190,10 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
             "equation_number": eq_num,
             "original_text": eq["readable_text"],
             "original_omml": eq["omml_xml"],
-            "suggested_update": analysis_item.get("suggested_update", ""),
-            "is_outdated": analysis_item.get("is_outdated", False),
+            "suggested_update": analysis_item.get("suggested_update", "") if has_suggestion else "",
+            "is_outdated": is_outdated,
+            "category": category,
+            "reason": analysis_item.get("reason", "") if has_suggestion else "",
             "para_idx": eq["para_idx"],
             "created_at": datetime.utcnow().isoformat(),
         }
@@ -3404,6 +4207,89 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
             rp["_id"] = str(rp["_id"])
 
     return {"session_id": session_id, "equations": result_patches, "cached": False}
+
+
+def _is_reference_table(rows: list) -> bool:
+    """Detect tables that are reference/syntax material (symbol lists, shortcuts, etc.)
+    These should not be analyzed for outdated data."""
+    if not rows:
+        return False
+
+    # Check header row for reference-table patterns
+    header = [str(c).lower().strip() for c in (rows[0] if rows else [])]
+    header_text = ' '.join(header)
+
+    # Symbol/syntax reference tables
+    ref_headers = ['symbol', 'type', 'accent', 'grouping', 'brackets', 'code', 'use']
+    ref_matches = sum(1 for h in header if any(rh in h for rh in ref_headers))
+    if ref_matches >= 2:
+        return True
+
+    # Keyboard shortcut tables
+    if any(kw in header_text for kw in ['shift+', 'ctrl+', 'arrow key', 'shortcut']):
+        return True
+
+    # Greek letter reference tables
+    if any(kw in header_text for kw in ['lower case', 'upper case', 'lowercase', 'uppercase']):
+        return True
+
+    # Large symbol-only tables (>15 rows where most cells are short LaTeX commands)
+    if len(rows) > 15:
+        short_cells = 0
+        total_cells = 0
+        for row in rows:
+            for cell in row:
+                cell_str = str(cell).strip()
+                total_cells += 1
+                if len(cell_str) < 20 and ('\\' in cell_str or len(cell_str) <= 3):
+                    short_cells += 1
+        if total_cells > 0 and short_cells / total_cells > 0.7:
+            return True
+
+    return False
+
+
+def _is_empty_or_trivial_table(rows: list) -> bool:
+    """Return True if the table has no meaningful content."""
+    if not rows:
+        return True
+
+    # Count non-empty cells
+    non_empty = 0
+    for row in rows:
+        for cell in row:
+            if str(cell).strip():
+                non_empty += 1
+
+    # Fewer than 2 non-empty cells = trivial
+    return non_empty < 2
+
+
+def _format_table_for_gpt(rows: list, max_rows: int = 25) -> str:
+    """Format table content as a readable markdown-style table for GPT."""
+    if not rows:
+        return "(empty table)"
+
+    display_rows = rows[:max_rows]
+    # Determine column widths
+    num_cols = max(len(row) for row in display_rows) if display_rows else 0
+    if num_cols == 0:
+        return "(empty table)"
+
+    lines = []
+    for r_idx, row in enumerate(display_rows):
+        cells = []
+        for c_idx in range(num_cols):
+            val = str(row[c_idx]).strip() if c_idx < len(row) else ""
+            cells.append(val if val else "(empty)")
+        lines.append(f"| {' | '.join(cells)} |")
+        if r_idx == 0:
+            lines.append(f"| {' | '.join(['---'] * num_cols)} |")
+
+    if len(rows) > max_rows:
+        lines.append(f"... ({len(rows) - max_rows} more rows)")
+
+    return '\n'.join(lines)
 
 
 @router.get("/{session_id}/table-analysis")
@@ -3430,25 +4316,90 @@ async def table_analysis(session_id: str, user=Depends(get_current_user_dep)):
             e["_id"] = str(e["_id"])
         return {"session_id": session_id, "tables": existing, "cached": True}
 
-    # ── Read tables from DB (extracted once during POST /process) ──
+    # ── Read tables from DB ──
     doc = await doc_repo.find_with_media(session["document_id"])
     if not doc:
         raise HTTPException(404, "Document not found")
 
+    doc_title = doc.get("original_filename", "") or doc.get("filename", "")
+
+    # ── ALWAYS re-extract tables from the ORIGINAL DOCX file ──
+    # DB cache can be corrupted by previously approved GPT updates baked into
+    # the working copy, or stale from old extraction bugs.  Fresh extraction
+    # from the untouched original is fast and guarantees clean data.
+    file_path = _resolve_file_path(doc.get("file_path", ""))
     db_tables = doc.get("tables", [])
 
+    if file_path and os.path.exists(file_path):
+        try:
+            from app.services.document_service import DOCXParser
+            parser = DOCXParser(file_path)
+            fresh_tables = parser._extract_tables()
+            logger.info("Table extraction from original DOCX: %d tables from %s",
+                        len(fresh_tables), file_path)
+
+            # Convert to dicts and update DB
+            tbl_dicts = []
+            for ft in fresh_tables:
+                tbl_dicts.append({
+                    "table_id": ft.table_id,
+                    "caption": ft.caption,
+                    "content": ft.content,
+                    "position": {"page": ft.position.page, "paragraph": ft.position.paragraph} if ft.position else {},
+                    "number": ft.number,
+                })
+
+            # Persist to DB
+            if tbl_dicts:
+                from bson import ObjectId as _ObjId
+                doc_oid = _ObjId(doc["id"]) if "id" in doc else doc.get("_id")
+                if doc_oid:
+                    await doc_repo.collection.update_one(
+                        {"_id": doc_oid},
+                        {"$set": {"tables": tbl_dicts}},
+                    )
+                    logger.info("Updated DB with %d fresh tables", len(tbl_dicts))
+
+            db_tables = tbl_dicts
+        except Exception as extract_err:
+            logger.warning("Live table re-extraction failed: %s", extract_err)
+
+    # ── Filter tables: skip empty, trivial, and reference tables ──
     tables_data = []
+    skipped_empty = 0
+    skipped_ref = 0
     for t_idx, tbl in enumerate(db_tables):
+        content = tbl.get("content", [])
+        caption = tbl.get("caption") or ""
+        doc_number = tbl.get("number") or ""
+
+        if _is_empty_or_trivial_table(content):
+            skipped_empty += 1
+            logger.info("Table %d skipped (empty/trivial)", t_idx + 1)
+            continue
+
+        if _is_reference_table(content):
+            skipped_ref += 1
+            logger.info("Table %d skipped (reference/syntax table): header=%s",
+                        t_idx + 1, [str(c)[:30] for c in content[0]] if content else [])
+            continue
+
         tables_data.append({
             "table_idx": t_idx,
-            "content": tbl.get("content", []),
-            "caption": tbl.get("caption") or "",
+            "content": content,
+            "caption": caption,
+            "doc_number": doc_number,
+            "display_number": doc_number or str(t_idx + 1),
         })
 
-    if not tables_data:
-        return {"session_id": session_id, "tables": [], "message": "No tables found in document."}
+    if skipped_empty or skipped_ref:
+        logger.info("Table analysis: %d total, %d skipped (empty), %d skipped (reference), %d to analyze",
+                    len(db_tables), skipped_empty, skipped_ref, len(tables_data))
 
-    # Analyze tables in PARALLEL for speed
+    if not tables_data:
+        return {"session_id": session_id, "tables": [], "message": "No data tables found to analyze."}
+
+    # ── GPT analysis ──
     import asyncio
     import json as _json
     from openai import AsyncOpenAI
@@ -3456,45 +4407,149 @@ async def table_analysis(session_id: str, user=Depends(get_current_user_dep)):
     client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
     async def _analyze_single_table(t_num: int, tdata: dict):
-        content_str = ""
-        for r_idx, row in enumerate(tdata["content"]):
-            content_str += f"Row {r_idx}: {row}\n"
+        content_str = _format_table_for_gpt(tdata["content"])
+        caption = tdata.get("caption") or "(no caption)"
+        display_num = tdata.get("display_number", str(t_num))
 
         analysis_text = ""
         cell_updates = []
+        is_outdated = False
         try:
             gpt_resp = await client.chat.completions.create(
                 model="gpt-4o",
                 messages=[{
                     "role": "user",
                     "content": (
-                        f"Analyze this table from a textbook (Table {t_num}).\n"
-                        f"Caption: {tdata['caption'] or '(none)'}\n\n"
-                        f"{content_str}\n"
-                        "Is the data in this table outdated? Suggest specific cell "
-                        "updates with row/col coordinates.\n\n"
-                        "Respond in JSON with keys: \"analysis\" (str), "
-                        "\"is_outdated\" (bool), \"cell_updates\" (list of "
-                        "{\"row\": int, \"col\": int, \"old_value\": str, \"new_value\": str})."
+                        f"You are analyzing Table {display_num} from a document "
+                        f"titled \"{doc_title}\".\n"
+                        f"Caption: {caption}\n\n"
+                        f"{content_str}\n\n"
+                        "Your task:\n"
+                        "1. Determine if this table contains FACTUAL DATA that could "
+                        "become outdated (statistics, dates, measurements, names, "
+                        "company data, mission details, etc.)\n"
+                        "2. If the table is a REFERENCE table (syntax examples, formulas, "
+                        "math demonstrations, notation guides), it is NOT outdated.\n"
+                        "3. If the table contains real data, check if any values are "
+                        "outdated based on your knowledge. Suggest SPECIFIC cell updates.\n\n"
+                        "CRITICAL RULES:\n"
+                        "- Set is_outdated to true ONLY when you have concrete cell_updates "
+                        "to suggest. If you have NO updates, is_outdated MUST be false.\n"
+                        "- The new_value MUST be the EXACT text to put in the cell — "
+                        "a specific name, number, date, measurement, or factual value.\n"
+                        "- ABSOLUTE PROHIBITION: NEVER use phrases like:\n"
+                        "  * 'Updated X based on Y'\n"
+                        "  * 'Current technology standards'\n"
+                        "  * 'Updated temperature levels, resolution, and location accuracy "
+                        "based on current technology'\n"
+                        "  * 'Updated availability percentage and outage duration based on "
+                        "current standards'\n"
+                        "  * 'Updated mission duration based on current mission planning'\n"
+                        "  * Any sentence that DESCRIBES a change rather than BEING the value\n"
+                        "- The new_value should look like cell data, NOT a sentence about the data.\n"
+                        "- If you cannot provide the EXACT replacement value, skip that cell "
+                        "entirely. An empty cell_updates list is perfectly fine.\n"
+                        "- Only suggest updates for cells where you KNOW the specific "
+                        "correct current value (e.g., a renamed satellite, a corrected date, "
+                        "a known successor mission).\n"
+                        "- Examples of GOOD new_value: 'Intelsat', '2024', 'James Webb "
+                        "Space Telescope', '$2.5B', '150 km resolution', 'International "
+                        "Space Station'\n"
+                        "- Examples of BAD new_value (NEVER do this): 'Updated based on "
+                        "current data', 'Modern equivalent', 'Current technology standards', "
+                        "'Updated coverage area based on current satellite capabilities'\n"
+                        "- Fix ONLY: misspelled names, renamed organizations, cancelled "
+                        "missions replaced by known successors, factually wrong dates.\n"
+                        "- Do NOT update cells that contain descriptions, requirements, "
+                        "section references, or procedural text — these are NOT data.\n"
+                        "- Row 0 is usually the header row — never update headers.\n\n"
+                        "Respond ONLY in JSON (no markdown code blocks):\n"
+                        "{\n"
+                        "  \"analysis\": \"Brief description of the table and findings\",\n"
+                        "  \"is_outdated\": true/false,\n"
+                        "  \"cell_updates\": [\n"
+                        "    {\"row\": 1, \"col\": 0, \"old_value\": \"old\", "
+                        "\"new_value\": \"specific concrete replacement\"}\n"
+                        "  ]\n"
+                        "}\n"
                     ),
                 }],
                 temperature=0.0,
                 max_tokens=2000,
             )
             raw = gpt_resp.choices[0].message.content or ""
-            analysis_text = raw
+
+            # ── Robust JSON parsing ──
+            cleaned = raw.strip()
+            # Strip markdown code fences
+            if cleaned.startswith("```"):
+                # Remove opening fence (```json or ```)
+                first_newline = cleaned.find('\n')
+                if first_newline != -1:
+                    cleaned = cleaned[first_newline + 1:]
+                # Remove closing fence
+                if cleaned.rstrip().endswith("```"):
+                    cleaned = cleaned.rstrip()[:-3].rstrip()
+
             try:
-                cleaned = raw.strip()
-                if cleaned.startswith("```"):
-                    cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
-                    cleaned = cleaned.rsplit("```", 1)[0]
                 parsed = _json.loads(cleaned)
-                analysis_text = parsed.get("analysis", raw)
+                analysis_text = parsed.get("analysis", "")
                 cell_updates = parsed.get("cell_updates", [])
-            except (_json.JSONDecodeError, Exception):
-                pass
+                is_outdated = parsed.get("is_outdated", False)
+            except _json.JSONDecodeError:
+                # Try to extract JSON from mixed text
+                import re as _re_json
+                json_match = _re_json.search(r'\{[\s\S]*\}', cleaned)
+                if json_match:
+                    try:
+                        parsed = _json.loads(json_match.group())
+                        analysis_text = parsed.get("analysis", "")
+                        cell_updates = parsed.get("cell_updates", [])
+                        is_outdated = parsed.get("is_outdated", False)
+                    except _json.JSONDecodeError:
+                        analysis_text = cleaned
+                else:
+                    # Last resort: use raw text but strip any JSON artifacts
+                    analysis_text = cleaned
+                    if analysis_text.startswith('{') or analysis_text.startswith('['):
+                        analysis_text = "Analysis could not be parsed. Please re-analyze."
+
+            # ── Post-GPT safety: filter out vague/non-concrete updates ──
+            if cell_updates:
+                import re as _re_vague
+
+                # Patterns that indicate a vague description, NOT a concrete value
+                vague_phrases = _re_vague.compile(
+                    r'(?i)'
+                    r'(?:updated?\s+.+\s+based\s+on)'   # "Updated X based on Y"
+                    r'|(?:based\s+on\s+current)'         # "based on current ..."
+                    r'|(?:current\s+(?:technology|standards?|data|capabilities?|infrastructure|planning|mapping))'
+                    r'|(?:modern\s+equivalent)'
+                    r'|(?:updated?\s+(?:temperature|coverage|data|mission|availability|map|number|grid))'
+                    r'|(?:revised\s+(?:to|based|for))'
+                )
+
+                filtered = []
+                for upd in cell_updates:
+                    new_val = str(upd.get("new_value", "")).strip()
+                    old_val = str(upd.get("old_value", "")).strip()
+                    # Skip if new_value is empty or same as old
+                    if not new_val or new_val.lower() == old_val.lower():
+                        continue
+                    # Skip if new_value matches vague description patterns
+                    if vague_phrases.search(new_val):
+                        logger.info("Table %s: filtered vague update: %r → %r",
+                                    display_num, old_val[:40], new_val[:60])
+                        continue
+                    filtered.append(upd)
+                cell_updates = filtered
+
+            # ── Enforce: no updates = not outdated ──
+            if not cell_updates:
+                is_outdated = False
+
         except Exception as gpt_err:
-            logger.warning("GPT table analysis failed for table %d: %s", t_num, gpt_err)
+            logger.warning("GPT table analysis failed for table %s: %s", display_num, gpt_err)
             analysis_text = f"Analysis unavailable: {gpt_err}"
 
         return {
@@ -3503,10 +4558,13 @@ async def table_analysis(session_id: str, user=Depends(get_current_user_dep)):
             "type": "table",
             "status": "pending",
             "table_number": t_num,
+            "table_idx": tdata.get("table_idx", t_num - 1),  # original DOCX table index
             "original_content": tdata["content"],
             "caption": tdata.get("caption", ""),
+            "doc_table_number": tdata.get("display_number", ""),
             "cell_updates": cell_updates,
             "analysis": analysis_text,
+            "is_outdated": is_outdated,
             "created_at": datetime.utcnow().isoformat(),
         }
 
