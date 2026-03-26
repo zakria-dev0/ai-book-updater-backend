@@ -165,99 +165,301 @@ class DOCXParser:
         for para in self.doc.paragraphs:
             full_text.append(para.text)
         return "\n".join(full_text)
+
+    def _extract_paragraphs(self) -> list:
+        """Extract every paragraph with rich metadata for downstream use.
+
+        Returns a list of dicts, one per paragraph, preserving the original
+        paragraph index so that outline / section-paragraph endpoints can
+        work entirely from the DB without re-reading the DOCX.
+        """
+        import re as _re
+        W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+        A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+        R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+
+        paragraphs = []
+        for idx, para in enumerate(self.doc.paragraphs):
+            text = para.text.strip()
+            style_name = para.style.name if para.style else ""
+
+            # Determine formatting from runs
+            runs = [r for r in para.runs if r.text.strip()]
+            is_bold = all(r.bold for r in runs) if runs else False
+            font_sizes = set()
+            for r in runs:
+                if r.font and r.font.size:
+                    font_sizes.add(r.font.size.pt)
+
+            # Check if paragraph has a drawing/image
+            has_image = bool(para._element.findall(f'.//{{{W_NS}}}drawing'))
+
+            # Collect r:embed IDs for images in this paragraph
+            r_embeds = []
+            for blip in para._element.findall(f'.//{{{A_NS}}}blip'):
+                r_embed = blip.get(f'{{{R_NS}}}embed')
+                if r_embed:
+                    r_embeds.append(r_embed)
+
+            # Get image dimensions from drawing extents
+            image_cx = 0
+            image_cy = 0
+            extent = para._element.find(f'.//{{{WP_NS}}}extent')
+            if extent is not None:
+                image_cx = int(extent.get('cx', '0'))
+                image_cy = int(extent.get('cy', '0'))
+
+            # Check for OMML equations
+            MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+            has_equation = bool(para._element.findall(f'.//{{{MATH_NS}}}oMath'))
+
+            paragraphs.append({
+                "idx": idx,
+                "text": text,
+                "style": style_name,
+                "bold": is_bold,
+                "font_sizes": sorted(font_sizes) if font_sizes else [],
+                "length": len(text),
+                "has_image": has_image,
+                "r_embeds": r_embeds,
+                "image_cx": image_cx,
+                "image_cy": image_cy,
+                "has_equation": has_equation,
+                "page": self._para_to_page.get(idx, 1),
+            })
+
+        return paragraphs
     
     def _extract_equations(self) -> List[Equation]:
         """
         Extract equations from DOCX by parsing OMML (Office Math Markup Language) XML.
-        Finds all <m:oMath> elements which is where Word stores real equations.
+        Finds all <m:oMath> elements in both body paragraphs AND table cells.
         raw_omml is stored so it can later be converted to LaTeX via Mathpix or omml2latex.
         """
         from lxml import etree
 
         equations = []
+        seen_omml = set()  # deduplicate by OMML XML content
+        seen_latex = set()  # also deduplicate by final LaTeX text
         MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
-        # Matches: (1), (6-4), (3.1), (A-2), (2.3.1), (iv), etc.
         equation_number_pattern = r'\((\d+(?:[.\-]\d+)*|[A-Z](?:[.\-]\d+)+|[ivxlc]+)\)'
 
-        for para_idx, para in enumerate(self.doc.paragraphs):
-            # Find every <m:oMath> block inside this paragraph
-            # Covers both display equations (<m:oMathPara><m:oMath>)
-            # and inline equations (<m:oMath> directly in a run)
+        def _process_paragraph(para, para_idx: int, source: str = "body"):
+            """Extract equations from a single paragraph element."""
             omath_elements = para._element.findall(f'.//{{{MATH_NS}}}oMath')
 
             for eq_idx, omath in enumerate(omath_elements):
-                # Store raw OMML XML — ready for Mathpix or omml2latex conversion later
                 omml_xml = etree.tostring(omath, encoding='unicode')
 
-                # Build a best-effort plain-text representation from <m:t> leaf nodes
+                # Deduplicate: skip if we've already seen this exact OMML
+                omml_hash = hash(omml_xml)
+                if omml_hash in seen_omml:
+                    continue
+                seen_omml.add(omml_hash)
+
+                # Plain-text from <m:t> leaf nodes
                 t_elements = omath.findall(f'.//{{{MATH_NS}}}t')
                 eq_text = ''.join(t.text or '' for t in t_elements).strip()
 
-                # Look for an equation number like (6-4) in the surrounding paragraph text
-                eq_number_match = re.search(equation_number_pattern, para.text)
-                eq_number = eq_number_match.group(0) if eq_number_match else None
+                # Filter junk (symbol palettes, UI tables, alphabet listings)
+                if self._is_junk_equation(eq_text, omml_xml):
+                    continue
 
-                # Convert OMML → LaTeX; fall back to plain text if conversion fails
+                # Convert OMML → LaTeX
                 latex = omml_to_latex(omml_xml) or eq_text
 
+                if self._is_junk_latex(latex):
+                    continue
+
+                # Deduplicate by normalized LaTeX text (catches near-identical table cell copies)
+                latex_key = latex.strip().replace(' ', '')
+                if latex_key in seen_latex:
+                    continue
+                seen_latex.add(latex_key)
+
+                # Look for equation number in surrounding text
+                para_text = para.text or ""
+                eq_number_match = re.search(equation_number_pattern, para_text)
+                eq_number = eq_number_match.group(0) if eq_number_match else None
+
+                eq_id = f"eq_{source}_{para_idx}_{eq_idx}"
                 equations.append(Equation(
-                    equation_id=f"eq_{para_idx}_{eq_idx}",
+                    equation_id=eq_id,
                     latex=latex,
                     raw_omml=omml_xml,
                     position=Position(page=self._page_for_para(para_idx), paragraph=para_idx),
                     number=eq_number
                 ))
 
+        # ── 1. Body paragraphs ──
+        for para_idx, para in enumerate(self.doc.paragraphs):
+            _process_paragraph(para, para_idx, "body")
+
+        # ── 2. Table cells — many documents embed equations inside tables ──
+        for t_idx, table in enumerate(self.doc.tables):
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        _process_paragraph(para, t_idx + 10000, f"tbl{t_idx}")
+
         return equations
+
+    @staticmethod
+    def _is_junk_equation(eq_text: str, omml_xml: str) -> bool:
+        """Return True if the OMML content is not a real math equation."""
+        text_lower = eq_text.lower().strip()
+
+        # 1. Empty
+        if len(eq_text.strip()) == 0:
+            return True
+
+        # 2. Single character (just a lone symbol/letter, not an equation)
+        if len(eq_text.strip()) == 1:
+            return True
+
+        # 3. Placeholder text from Word equation templates
+        if text_lower in ('type equation here', 'type equation here.'):
+            return True
+
+        # 4. Alphabet listing / symbol palette (A,B,C,...Z or a,b,c,...z)
+        stripped = eq_text.replace(',', '').replace(' ', '')
+        if len(stripped) >= 20:
+            unique_chars = set(stripped)
+            alpha_chars = {c for c in unique_chars if c.isalpha()}
+            if len(alpha_chars) >= 20 and all(c.isalpha() or c in ',. ' for c in eq_text):
+                return True
+
+        # 5. Contains Word UI / toolbar keywords
+        ui_keywords = [
+            'file', 'home', 'insert', 'design', 'layout', 'mailings',
+            'review', 'view', 'add-ins', 'cover page', 'page break',
+            'blank page', 'gallery', 'category', 'description', 'save in',
+            'options', 'autotext', 'building block', 'search document',
+            'normal', 'insert content only', 'online pictures',
+        ]
+        if any(kw in text_lower for kw in ui_keywords):
+            return True
+
+        # 6. Too many \\hline or tabular markers (formatting table, not equation)
+        if text_lower.count('\\hline') >= 2 or '\\begin{tabular}' in text_lower:
+            return True
+
+        # 7. Mostly comma-separated single characters (symbol reference)
+        parts = [p.strip() for p in eq_text.split(',')]
+        if len(parts) >= 15 and all(len(p) <= 2 for p in parts):
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_junk_latex(latex: str) -> bool:
+        """Return True if the converted LaTeX is not a real equation."""
+        stripped = latex.strip()
+
+        # Single LaTeX command with no arguments (e.g., just \\partial)
+        if re.match(r'^\\[a-zA-Z]+$', stripped) and len(stripped) < 20:
+            return True
+
+        # Just a single letter or digit
+        if len(stripped) <= 1:
+            return True
+
+        # LaTeX tabular environment (Word UI table, not equation)
+        if '\\begin{tabular}' in stripped:
+            return True
+
+        # Alphabet runs
+        clean = stripped.replace(',', '').replace(' ', '')
+        if len(clean) >= 20:
+            alpha_only = ''.join(c for c in clean if c.isalpha())
+            if len(alpha_only) >= 20:
+                unique = set(alpha_only.lower())
+                if len(unique) >= 18:
+                    return True
+
+        return False
     
     def _extract_figures(self) -> List[Figure]:
-        """Extract images/figures from DOCX"""
+        """Extract images/figures from DOCX with full metadata for downstream analysis."""
         figures = []
 
-        # Build relationship ID → paragraph index map
-        # <a:blip r:embed="rIdX"> inside a <w:drawing> tells us which paragraph holds each image
         A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
         R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
-        rel_id_to_para: dict = {}
+        WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+        W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+        # Build r_embed → (para_idx, cx, cy) map from drawings
+        seen_embeds = set()
+        embed_info: dict = {}  # r_embed -> {para_idx, cx, cy}
         for para_idx, para in enumerate(self.doc.paragraphs):
-            for blip in para._element.findall(f'.//{{{A_NS}}}blip'):
-                r_embed = blip.get(f'{{{R_NS}}}embed')
-                if r_embed:
-                    rel_id_to_para[r_embed] = para_idx
+            drawings = para._element.findall(f'.//{{{W_NS}}}drawing')
+            for drawing in drawings:
+                blip = drawing.find(f'.//{{{A_NS}}}blip')
+                if blip is not None:
+                    r_embed = blip.get(f'{{{R_NS}}}embed')
+                    if r_embed and r_embed not in seen_embeds:
+                        seen_embeds.add(r_embed)
+                        cx, cy = 0, 0
+                        extent = drawing.find(f'.//{{{WP_NS}}}extent')
+                        if extent is not None:
+                            cx = int(extent.get('cx', '0'))
+                            cy = int(extent.get('cy', '0'))
+                        embed_info[r_embed] = {"para_idx": para_idx, "cx": cx, "cy": cy}
 
-        for idx, rel in enumerate(self.doc.part.rels.values()):
-            if "image" in rel.target_ref:
-                try:
-                    image_data = rel.target_part.blob
-                    image_base64 = base64.b64encode(image_data).decode('utf-8')
-                    caption = self._find_figure_caption(idx)
-                    para_pos = rel_id_to_para.get(rel.rId)
+        fig_counter = 0
+        for rel in self.doc.part.rels.values():
+            if "image" not in rel.target_ref:
+                continue
+            try:
+                image_data = rel.target_part.blob
+                image_base64 = base64.b64encode(image_data).decode('utf-8')
+                info = embed_info.get(rel.rId, {})
+                para_pos = info.get("para_idx")
+                cx = info.get("cx", 0)
+                cy = info.get("cy", 0)
 
-                    figure = Figure(
-                        figure_id=f"fig_{idx}",
-                        caption=caption,
-                        image_base64=image_base64,
-                        position=Position(page=self._page_for_para(para_pos), paragraph=para_pos),
-                        number=self._extract_figure_number(caption) if caption else None
-                    )
-                    figures.append(figure)
-                except Exception as e:
-                    print(f"Error extracting figure {idx}: {e}")
-                    continue
+                # Find caption from next paragraph
+                caption = None
+                if para_pos is not None and para_pos + 1 < len(self.doc.paragraphs):
+                    next_text = self.doc.paragraphs[para_pos + 1].text.strip()
+                    if next_text.lower().startswith("figure") or next_text.lower().startswith("fig"):
+                        caption = next_text
+                if not caption:
+                    caption = self._find_figure_caption(fig_counter)
+
+                figure = Figure(
+                    figure_id=f"fig_{fig_counter}",
+                    caption=caption,
+                    image_base64=image_base64,
+                    position=Position(page=self._page_for_para(para_pos), paragraph=para_pos),
+                    number=self._extract_figure_number(caption) if caption else None,
+                    r_embed=rel.rId,
+                    size_bytes=len(image_data),
+                    cx=cx,
+                    cy=cy,
+                )
+                figures.append(figure)
+                fig_counter += 1
+            except Exception as e:
+                print(f"Error extracting figure {fig_counter}: {e}")
+                fig_counter += 1
+                continue
 
         return figures
     
     def _extract_tables(self) -> List[Table]:
-        """Extract tables from DOCX"""
+        """Extract tables from DOCX with equation-aware cell text extraction."""
+        from lxml import etree
+
         tables = []
+        MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
 
         # Walk ALL XML elements iteratively (avoids Python recursion limit on large docs).
         # Collect tables in document order alongside their para count.
-        # Uses a list (not a dict with element keys) to avoid lxml proxy identity issues.
         tables_in_order = []   # list of (lxml_tbl_element, para_count) in document order
         para_count = 0
 
-        # Iterative pre-order DFS: push children in reverse so left siblings pop first
         stack = list(reversed(list(self.doc.element.body)))
         while stack:
             element = stack.pop()
@@ -266,19 +468,71 @@ class DOCXParser:
                 para_count += 1
             elif local_tag == 'tbl':
                 tables_in_order.append((element, para_count))
-            # Always recurse so nested tables inside cells are found too
             stack.extend(reversed(list(element)))
 
-        # self.doc.tables returns tables in the same document (DFS) order,
-        # so index i here matches index i in tables_in_order.
+        def _cell_text_with_equations(cell) -> str:
+            """Extract cell text, converting embedded OMML equations to LaTeX."""
+            parts = []
+            for para in cell.paragraphs:
+                # Check for OMML equations in the paragraph
+                omath_elements = para._element.findall(f'.//{{{MATH_NS}}}oMath')
+                if omath_elements:
+                    for omath in omath_elements:
+                        omml_xml = etree.tostring(omath, encoding='unicode')
+                        latex = omml_to_latex(omml_xml)
+                        if latex and latex.strip():
+                            parts.append(latex.strip())
+                        else:
+                            # Fallback: plain text from <m:t> nodes
+                            t_els = omath.findall(f'.//{{{MATH_NS}}}t')
+                            eq_text = ''.join(t.text or '' for t in t_els).strip()
+                            if eq_text:
+                                parts.append(eq_text)
+                else:
+                    # No equations — use plain text
+                    text = para.text or ""
+                    if text.strip():
+                        parts.append(text.strip())
+            return ' '.join(parts) if parts else ""
+
+        # ── Collect ALL "Table X-Y" caption paragraphs in document order ──
+        # Use the body-level children to find caption paragraphs by their position
+        # relative to table elements in the same walk.
+        table_caption_pat = re.compile(r'(?:TABLE|Table)\s+\d+[\-\.]\d+', re.IGNORECASE)
+        WPC_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+        # Walk body children in order — track caption paragraphs and table elements
+        caption_queue = []     # captions seen so far, waiting to be assigned
+        table_captions = {}    # table_element_id -> caption text
+        last_caption = None    # most recent caption paragraph text
+
+        for child in self.doc.element.body:
+            tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+            if tag == 'p':
+                # Extract text from paragraph
+                texts = []
+                for t_el in child.iter(f'{{{WPC_NS}}}t'):
+                    if t_el.text:
+                        texts.append(t_el.text)
+                para_text = ''.join(texts).strip()
+                if para_text and table_caption_pat.search(para_text):
+                    last_caption = para_text
+            elif tag == 'tbl':
+                # Assign the most recent caption to this table
+                if last_caption:
+                    table_captions[id(child)] = last_caption
+                    last_caption = None  # consume — don't reuse for next table
+
         for idx, table in enumerate(self.doc.tables):
             table_data = []
             for row in table.rows:
-                row_data = [cell.text for cell in row.cells]
+                row_data = [_cell_text_with_equations(cell) for cell in row.cells]
                 table_data.append(row_data)
 
-            caption = self._find_table_caption(idx)
             para_pos = tables_in_order[idx][1] if idx < len(tables_in_order) else None
+
+            # Look up caption by the table's underlying XML element
+            caption = table_captions.get(id(table._tbl))
 
             table_obj = Table(
                 table_id=f"tbl_{idx}",

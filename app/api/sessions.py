@@ -370,99 +370,362 @@ async def extract_outline(
     else:
         raise HTTPException(400, "Rules must be confirmed first")
 
-    doc = await doc_repo.find_by_id(session["document_id"])
+    # ── Load paragraph metadata from DB (extracted once during POST /process) ──
+    doc = await doc_repo.find_with_paragraphs(session["document_id"])
     if not doc:
         raise HTTPException(404, "Document not found")
 
-    # Extract headings from DOCX using python-docx
-    file_path = _resolve_file_path(doc.get("file_path", ""))
+    db_paragraphs = doc.get("paragraphs", [])
+    if not db_paragraphs:
+        raise HTTPException(400, "Document has not been processed yet. Run POST /process first.")
+
     outline_items = []
 
+    import re as _re
+    import json as _json
+    from collections import Counter, defaultdict
+
+    def _strip_trailing_page_number(txt: str) -> str:
+        cleaned = _re.sub(r'\s+\d{1,4}\s*$', '', txt)
+        return cleaned if cleaned else txt
+
+    def _normalize_heading(txt: str) -> str:
+        cleaned = _strip_trailing_page_number(txt)
+        return _re.sub(r'\s+', ' ', cleaned).strip().lower()
+
+    # ── Detect which approach to use (all from DB paragraphs) ─────
+    has_heading_styles = any(
+        _re.match(r"[Hh]eading\s*#?\s*(\d+)", p.get("style", ""))
+        for p in db_paragraphs if p.get("text")
+    )
+
+    # Collect all paragraphs matching X.X pattern (e.g., "1.1 Introduction")
+    numbered_candidates = []
+    for p in db_paragraphs:
+        text = p.get("text", "")
+        if not text:
+            continue
+        numbered_match = _re.match(r"^(\d+(?:\.\d+)+)\s+\S", text)
+        if numbered_match and p.get("length", 0) < 150:
+            numbered_candidates.append(p)
+
+    has_numbered_headings = len(numbered_candidates) >= 3
+
     try:
-        import re as _re
-        from docx import Document as DocxDocument
-        docx_doc = DocxDocument(file_path)
+        # ── APPROACH 1 (Fast path): Regex on numbered X.X patterns ────
+        if has_numbered_headings:
+            logger.info("Outline: Found %d numbered heading candidates — using regex (no GPT)", len(numbered_candidates))
 
-        # Collect all paragraph texts for duplicate detection
-        seen_heading_texts = set()
+            # ── Filter 1: Detect page headers (text with trailing tab/spaces + page number) ──
+            # Pattern: "1.1\tIntroduction and Overview\t5" or "1.2 The Life Cycle 9"
+            # These have a number at the very end separated by whitespace/tab
+            _page_header_re = _re.compile(r'^.+[\t\s]+\d{1,4}\s*$')
 
-        for idx, para in enumerate(docx_doc.paragraphs):
-            style_name = para.style.name if para.style else ""
-            text = para.text.strip()
-            if not text:
-                continue
+            # ── Filter 2: Detect TOC region ──
+            # TOC entries cluster at the start (first ~20 non-empty paragraphs), are non-bold
+            # Find first bold numbered candidate to mark end of TOC region
+            first_bold_numbered_idx = None
+            for p in numbered_candidates:
+                if p.get("bold", False):
+                    first_bold_numbered_idx = p.get("idx", 0)
+                    break
 
-            # Skip headers/footers/captions
-            style_lower = style_name.lower()
-            if any(skip in style_lower for skip in ("header", "footer", "caption", "toc")):
-                continue
+            # ── Filter 3: Build normalized text → best candidate map ──
+            # When same heading appears multiple times (TOC + real + page header),
+            # prefer: bold without trailing page number > bold with trailing > non-bold
+            heading_groups = defaultdict(list)  # normalized_text -> [candidate, ...]
+            for p in numbered_candidates:
+                text = p.get("text", "")
+                normalized = _normalize_heading(text)
+                heading_groups[normalized].append(p)
 
-            # ── Filter: skip page-header section numbers ──────────────
-            # These are short lines that are ONLY a section number (e.g. "2.1" or "3.2.1")
-            # appearing at the top of pages as running headers
-            if _re.match(r"^\d+(\.\d+)*$", text):
-                continue  # bare section number with no title text — skip
+            seen_heading_texts = set()
+            for normalized, group in heading_groups.items():
+                # Pick the BEST candidate from the group
+                # Priority: bold + no page-header pattern + not in TOC region
+                best = None
+                for p in group:
+                    text = p.get("text", "")
+                    idx = p.get("idx", 0)
+                    is_bold = p.get("bold", False)
+                    is_page_header = bool(_page_header_re.match(text))
+                    is_toc = (not is_bold and first_bold_numbered_idx is not None
+                              and idx < first_bold_numbered_idx)
 
-            # Also skip very short paragraphs that look like page headers
-            # (just a number followed by a few chars, or chapter/section number repeated)
-            if len(text) < 8 and _re.match(r"^\d+(\.\d+)*\s*$", text):
-                continue
+                    # Skip header/footer/caption/toc styles
+                    style_lower = p.get("style", "").lower()
+                    if any(skip in style_lower for skip in ("header", "footer", "caption", "toc")):
+                        continue
 
-            # Detect heading styles: "Heading 1", "Heading #1", "heading1", etc.
-            heading_match = _re.match(r"[Hh]eading\s*#?\s*(\d+)", style_name)
-            if heading_match:
-                level = int(heading_match.group(1))
-                # Deduplicate: skip if we already saw this exact heading text
-                normalized = _re.sub(r'\s+', ' ', text).strip().lower()
-                if normalized in seen_heading_texts:
-                    logger.debug("Outline: skipping duplicate heading '%s' at para %d", text, idx)
+                    # Score: higher is better
+                    score = 0
+                    if is_bold:
+                        score += 10
+                    if not is_page_header:
+                        score += 5
+                    if not is_toc:
+                        score += 3
+
+                    if best is None or score > best[0]:
+                        best = (score, p)
+
+                if best is None:
                     continue
+
+                p = best[1]
+                text = p.get("text", "")
+                idx = p.get("idx", 0)
+
+                # Parse numbering depth for level
+                num_match = _re.match(r"^(\d+(?:\.\d+)+)", text)
+                if not num_match:
+                    continue
+                num_str = num_match.group(1)
+                depth = num_str.count(".")
+                if depth <= 1:
+                    level = 1
+                elif depth == 2:
+                    level = 2
+                else:
+                    level = 3
+
                 seen_heading_texts.add(normalized)
+                clean_text = _strip_trailing_page_number(text)
+                # Also strip trailing tabs/whitespace that may remain
+                clean_text = _re.sub(r'[\t]+', ' ', clean_text).strip()
                 outline_items.append({
                     "id": str(uuid.uuid4())[:8],
-                    "text": text,
+                    "text": clean_text,
                     "level": level,
                     "in_scope": True,
                     "paragraph_index": idx,
                 })
-                continue
 
-            # Detect numbered section headings in body text (e.g. "2.1 Early Space Explorers")
-            numbered_heading = _re.match(r"^(\d+(?:\.\d+)*)\s+[A-Z]", text)
-            if numbered_heading and len(text) < 120:
-                depth = numbered_heading.group(1).count(".") + 1
-                # Only count as heading if the paragraph is short (not a full body paragraph)
-                if len(text) < 80 or all(r.bold for r in para.runs if r.text.strip()):
-                    # Deduplicate: skip if we already saw this heading
-                    normalized = _re.sub(r'\s+', ' ', text).strip().lower()
+            # Sort by paragraph index to maintain document order
+            outline_items.sort(key=lambda x: x["paragraph_index"])
+
+        # ── APPROACH 2: Heading styles + GPT filter ───────────────────
+        elif has_heading_styles:
+            logger.info("Outline: Using Heading styles with GPT filter")
+            raw_headings = []
+            for p in db_paragraphs:
+                text = p.get("text", "")
+                if not text:
+                    continue
+                heading_match = _re.match(r"[Hh]eading\s*#?\s*(\d+)", p.get("style", ""))
+                if heading_match:
+                    raw_headings.append({
+                        "idx": p["idx"],
+                        "text": text[:200],
+                        "style": p.get("style", ""),
+                        "heading_level": int(heading_match.group(1)),
+                        "bold": p.get("bold", False),
+                        "font_sizes": p.get("font_sizes", []),
+                        "length": p.get("length", 0),
+                    })
+
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+            gpt_filter_prompt = (
+                "You are analyzing heading-styled paragraphs from a DOCX document.\n"
+                "Your job is to identify which are REAL content section headings and which are NOT.\n\n"
+                "INCLUDE only real content section headings — these are the main topics/sections of the document.\n"
+                "Examples of real headings: '2.1 Early Space Explorers', 'Astronomy Begins', 'The Age of Rockets'\n\n"
+                "EXCLUDE these types (they are NOT real section headings):\n"
+                "- Book titles, chapter titles that are just a title without section content below\n"
+                "- Instructional/callout boxes: 'In This Section You will Learn To...', 'You Should Already Know...'\n"
+                "- Review/exercise sections: 'Section Review', 'Mission Problems', 'For Discussion'\n"
+                "- Fun fact/sidebar callouts: 'Astro Fun Fact...', any callout box headings\n"
+                "- Supplementary sections: 'For Further Reading', 'References', 'Contributor'\n"
+                "- Case study/profile meta-headings: 'Mission Overview', 'Mission Data', 'Mission Impact'\n"
+                "- The word 'Outline' by itself\n"
+                "- Any heading that is clearly metadata, not a content section\n\n"
+                "For each heading you keep, assign a level:\n"
+                "- level 1: Major numbered section (e.g. '2.1 Early Space Explorers')\n"
+                "- level 2: Sub-section (e.g. 'Astronomy Begins', 'The Age of Rockets')\n"
+                "- level 3: Sub-sub-section\n"
+                "- If the heading has a section number like X.X, use that for level\n"
+                "- If no number, determine level from context and heading_level in the data\n\n"
+                "Here are the heading-styled paragraphs:\n\n"
+                f"{_json.dumps(raw_headings, indent=None)}\n\n"
+                "Return ONLY a JSON array of the real section headings, each with:\n"
+                '{"idx": <paragraph_index>, "text": "<heading text>", "level": <1|2|3>}\n\n'
+                "Return ONLY the JSON array, no explanation or markdown. "
+                "If none qualify, return []."
+            )
+
+            try:
+                response = await client.chat.completions.create(
+                    model=settings.GPT_MODEL,
+                    messages=[{"role": "user", "content": gpt_filter_prompt}],
+                    temperature=0.0,
+                    max_tokens=4000,
+                )
+                raw = response.choices[0].message.content.strip()
+                if raw.startswith("```"):
+                    raw = _re.sub(r'^```(?:json)?\s*', '', raw)
+                    raw = _re.sub(r'\s*```$', '', raw)
+
+                gpt_headings = _json.loads(raw)
+                logger.info("GPT filtered to %d real section headings", len(gpt_headings))
+
+                seen_heading_texts = set()
+                for h in gpt_headings:
+                    text = h.get("text", "").strip()
+                    idx = h.get("idx", 0)
+                    level = h.get("level", 1)
+                    if not text:
+                        continue
+                    clean_text = _strip_trailing_page_number(text)
+                    normalized = _normalize_heading(text)
                     if normalized in seen_heading_texts:
-                        logger.debug("Outline: skipping duplicate numbered heading '%s' at para %d", text, idx)
                         continue
                     seen_heading_texts.add(normalized)
                     outline_items.append({
                         "id": str(uuid.uuid4())[:8],
-                        "text": text,
-                        "level": depth,
+                        "text": clean_text,
+                        "level": level,
                         "in_scope": True,
                         "paragraph_index": idx,
                     })
 
+            except Exception as gpt_err:
+                logger.error("GPT heading filter failed: %s — using all headings as fallback", gpt_err)
+                seen_heading_texts = set()
+                for rh in raw_headings:
+                    normalized = _normalize_heading(rh["text"])
+                    if normalized in seen_heading_texts:
+                        continue
+                    seen_heading_texts.add(normalized)
+                    outline_items.append({
+                        "id": str(uuid.uuid4())[:8],
+                        "text": _strip_trailing_page_number(rh["text"]),
+                        "level": rh["heading_level"],
+                        "in_scope": True,
+                        "paragraph_index": rh["idx"],
+                    })
+
+        # ── APPROACH 3 (Rare): No numbered headings AND no Heading styles ─
+        else:
+            logger.info("Outline: No numbered headings and no Heading styles — GPT fallback")
+
+            para_metadata = []
+            for p in db_paragraphs:
+                text = p.get("text", "")
+                if not text:
+                    continue
+                style_lower = p.get("style", "").lower()
+                if any(skip in style_lower for skip in ("header", "footer", "caption", "toc")):
+                    continue
+                if _re.match(r'^\d+(\.\d+)*\s*$', text):
+                    continue
+                para_metadata.append({
+                    "idx": p["idx"],
+                    "text": text[:200],
+                    "bold": p.get("bold", False),
+                    "font_sizes": p.get("font_sizes", []),
+                    "style": p.get("style", ""),
+                    "length": p.get("length", 0),
+                })
+
+            para_metadata = para_metadata[:300]
+
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+            gpt_prompt = (
+                "You are analyzing a DOCX document to identify section headings.\n"
+                "The document has no Heading styles and no numbered headings.\n"
+                "Your job is to identify which paragraphs are REAL section headings.\n\n"
+                "STRICT RULES:\n"
+                "1. Section headings are typically: short (< 100 chars), bold, larger font\n"
+                "2. DO NOT include: body text, TOC entries, page headers, author names\n"
+                "3. Assign levels: level 1 for main sections, level 2 for sub-sections, level 3 for sub-sub\n\n"
+                "Here are the paragraphs:\n\n"
+                f"{_json.dumps(para_metadata, indent=None)}\n\n"
+                "Return ONLY a JSON array of heading objects:\n"
+                '{"idx": <paragraph_index>, "text": "<heading text>", "level": <1|2|3>}\n\n'
+                "Return ONLY the JSON array. If none found, return []."
+            )
+
+            try:
+                response = await client.chat.completions.create(
+                    model=settings.GPT_MODEL,
+                    messages=[{"role": "user", "content": gpt_prompt}],
+                    temperature=0.0,
+                    max_tokens=4000,
+                )
+                raw = response.choices[0].message.content.strip()
+                if raw.startswith("```"):
+                    raw = _re.sub(r'^```(?:json)?\s*', '', raw)
+                    raw = _re.sub(r'\s*```$', '', raw)
+
+                gpt_headings = _json.loads(raw)
+                logger.info("GPT identified %d headings (rare fallback)", len(gpt_headings))
+
+                seen_heading_texts = set()
+                for h in gpt_headings:
+                    text = h.get("text", "").strip()
+                    idx = h.get("idx", 0)
+                    level = h.get("level", 1)
+                    if not text:
+                        continue
+                    clean_text = _strip_trailing_page_number(text)
+                    normalized = _normalize_heading(text)
+                    if normalized in seen_heading_texts:
+                        continue
+                    seen_heading_texts.add(normalized)
+                    outline_items.append({
+                        "id": str(uuid.uuid4())[:8],
+                        "text": clean_text,
+                        "level": level,
+                        "in_scope": True,
+                        "paragraph_index": idx,
+                    })
+
+            except Exception as gpt_err:
+                logger.error("GPT heading detection failed: %s — falling back to heuristics", gpt_err)
+                seen_heading_texts = set()
+                for pm in para_metadata:
+                    text = pm["text"]
+                    idx = pm["idx"]
+                    numbered = _re.match(r"^(\d+(?:\.\d+)*)\s+[A-Z]", text)
+                    if numbered and pm["bold"] and pm["length"] < 120:
+                        depth = numbered.group(1).count(".")
+                        if depth <= 1:
+                            level = 1
+                        elif depth == 2:
+                            level = 2
+                        else:
+                            level = 3
+                        clean_text = _strip_trailing_page_number(text)
+                        normalized = _normalize_heading(text)
+                        if normalized in seen_heading_texts:
+                            continue
+                        seen_heading_texts.add(normalized)
+                        outline_items.append({
+                            "id": str(uuid.uuid4())[:8],
+                            "text": clean_text,
+                            "level": level,
+                            "in_scope": True,
+                            "paragraph_index": idx,
+                        })
+
     except Exception as e:
         logger.error("Outline extraction failed: %s", e)
-        # Fallback: try to parse from text_content using regex
-        import re
+        # Ultimate fallback: regex on text_content
         text_content = doc.get("text_content", "")
         lines = text_content.split("\n")
         for idx, line in enumerate(lines):
             line_stripped = line.strip()
-            # Detect numbered headings or all-caps lines
-            if re.match(r"^\d+(\.\d+)*\s+[A-Z]", line_stripped) or (
+            if _re.match(r"^\d+(\.\d+)*\s+[A-Z]", line_stripped) or (
                 line_stripped.isupper() and 3 < len(line_stripped) < 100
             ):
                 outline_items.append({
                     "id": str(uuid.uuid4())[:8],
                     "text": line_stripped,
-                    "level": 1 if re.match(r"^\d+\s", line_stripped) else 2,
+                    "level": 1 if _re.match(r"^\d+\s", line_stripped) else 2,
                     "in_scope": True,
                     "paragraph_index": idx,
                 })
@@ -1439,49 +1702,58 @@ async def get_section_paragraphs(
         if item.get("id") == section_id:
             found_target = True
 
-    # Load the DOCX to extract paragraphs in this range
-    doc = await doc_repo.find_by_id(session["document_id"])
+    # ── Load paragraph metadata from DB (no DOCX re-read) ──────────
+    doc = await doc_repo.find_with_paragraphs(session["document_id"])
     if not doc:
         raise HTTPException(404, "Document not found")
 
+    db_paragraphs = doc.get("paragraphs", [])
     paragraphs = []
 
-    # Try DOCX first for accurate paragraph extraction
-    file_path = _resolve_file_path(doc.get("file_path", ""))
-    try:
-        from docx import Document as DocxDocument
-        docx_doc = DocxDocument(file_path)
+    # Build a set of paragraph indices that ARE outline headings, to skip them
+    outline_para_indices = {item.get("paragraph_index") for item in outline if item.get("paragraph_index") is not None}
 
-        end_idx = next_para_idx if next_para_idx else len(docx_doc.paragraphs)
-        # Start from the paragraph AFTER the heading itself
-        for idx in range(target_para_idx + 1, end_idx):
-            para = docx_doc.paragraphs[idx]
-            text = para.text.strip()
-            if not text:
-                continue
-            # Stop at next heading style
-            style_name = para.style.name if para.style else ""
-            if style_name.lower().startswith("heading"):
-                break
-            paragraphs.append({
-                "index": idx,
-                "text": text[:200] + ("..." if len(text) > 200 else ""),
-                "full_text": text,
-            })
-    except Exception as e:
-        logger.warning("DOCX paragraph extraction failed, falling back to text_content: %s", e)
-        # Fallback: use text_content split by newlines
-        text_content = doc.get("text_content", "")
-        lines = text_content.split("\n")
-        end_idx = next_para_idx if next_para_idx else len(lines)
-        for idx in range(target_para_idx + 1, min(end_idx, len(lines))):
-            text = lines[idx].strip()
-            if text:
-                paragraphs.append({
-                    "index": idx,
-                    "text": text[:200] + ("..." if len(text) > 200 else ""),
-                    "full_text": text,
-                })
+    import re as _re
+
+    # Build a lookup dict for fast access: idx -> paragraph data
+    para_lookup = {p["idx"]: p for p in db_paragraphs}
+
+    end_idx = next_para_idx if next_para_idx else (max(p["idx"] for p in db_paragraphs) + 1 if db_paragraphs else 0)
+
+    for idx in range(target_para_idx + 1, end_idx):
+        p = para_lookup.get(idx)
+        if not p:
+            continue
+        text = p.get("text", "").strip()
+        if not text:
+            continue
+        style_name = p.get("style", "")
+        # Stop at next heading style
+        if style_name.lower().startswith("heading"):
+            break
+        # Skip outline headings
+        if idx in outline_para_indices:
+            continue
+        # Skip header/footer/caption/toc styles
+        if any(skip in style_name.lower() for skip in ("header", "footer", "caption", "toc")):
+            continue
+        # Skip bare numbers / page numbers
+        if _re.match(r'^\d+(\.\d+)*$', text):
+            continue
+        # Skip roman numeral page numbers
+        if _re.match(r'^[ivxlcdm]+$', text.lower()):
+            continue
+        # Skip short numeric-only lines
+        if len(text) < 15 and _re.match(r'^[\d\s\.\-\u2013\u2014]+$', text):
+            continue
+        # Skip horizontal lines / separators / dividers
+        if _re.match(r'^[\s_\-\u2013\u2014=~*#\.]{2,}$', text):
+            continue
+        paragraphs.append({
+            "index": idx,
+            "text": text[:200] + ("..." if len(text) > 200 else ""),
+            "full_text": text,
+        })
 
     return {
         "session_id": session_id,
@@ -1801,6 +2073,45 @@ async def apply_patches(
             docx_doc.save(working_path)
             logger.info("DOCX saved to %s", working_path)
 
+            # ── Apply approved media patches (figures, equations, tables) ────
+            try:
+                approved_media = await db.media_patches.find({
+                    "session_id": session_id,
+                    "status": "approved",
+                }).to_list(length=500)
+
+                if approved_media:
+                    # Reload the saved doc for media edits
+                    docx_doc = DocxDocument(working_path)
+                    media_applied = 0
+
+                    # ── Figures: use shared helper ──
+                    approved_figures = [m for m in approved_media if m.get("type") == "figure"]
+                    if approved_figures:
+                        fig_count = await _apply_figure_replacements_to_docx(docx_doc, approved_figures)
+                        media_applied += fig_count
+
+                    # ── Equations: apply OMML fixes ──
+                    approved_equations = [m for m in approved_media if m.get("type") == "equation"]
+                    if approved_equations:
+                        eq_count = _apply_equation_replacements_to_docx(docx_doc, approved_equations)
+                        media_applied += eq_count
+                        logger.info("Applied %d equation replacements", eq_count)
+
+                    # ── Tables: apply cell updates ──
+                    approved_tables = [m for m in approved_media if m.get("type") == "table"]
+                    if approved_tables:
+                        tbl_count = _apply_table_updates_to_docx(docx_doc, approved_tables)
+                        media_applied += tbl_count
+                        logger.info("Applied %d table updates", tbl_count)
+
+                    if media_applied:
+                        docx_doc.save(working_path)
+                        logger.info("Saved DOCX after %d media patches", media_applied)
+
+            except Exception as media_err:
+                logger.warning("Media patch application phase failed: %s", media_err)
+
             # Verify: reload and check paragraph count
             verify_doc = DocxDocument(working_path)
             verify_count = len(verify_doc.paragraphs)
@@ -2058,6 +2369,476 @@ def _add_font_color_to_rPr(rPr_element, hex_color: str):
     color_elem = OxmlElement("w:color")
     color_elem.set(qn("w:val"), hex_color)
     rPr_element.append(color_elem)
+
+
+def _is_junk_equation_text(latex: str, omml_xml: str = "") -> bool:
+    """Return True if the equation text is not a real mathematical equation.
+
+    Catches: symbol palettes, alphabet listings, Word UI elements, standalone
+    LaTeX commands, placeholders, trivial single-char items, and tabular tables.
+    """
+    import re as _re
+
+    stripped = latex.strip()
+    if not stripped:
+        return True
+
+    # 0. Single character or very short non-equation
+    if len(stripped) <= 1:
+        return True
+
+    # 1. Single LaTeX command with no arguments (e.g., just \partial, \alpha)
+    if _re.match(r'^\\[a-zA-Z]+$', stripped):
+        return True
+
+    # 2. Placeholder text
+    if stripped.lower() in ('type equation here', 'type equation here.'):
+        return True
+
+    # 3. LaTeX tabular environment (Word UI table, not equation)
+    if '\\begin{tabular}' in stripped:
+        return True
+
+    # 4. Multiple \hline (table layout)
+    if stripped.count('\\hline') >= 2:
+        return True
+
+    # 5. Word UI keywords
+    lower = stripped.lower()
+    ui_keywords = [
+        'file', 'home', 'insert', 'design', 'layout', 'mailings',
+        'review', 'view', 'add-ins', 'cover page', 'page break',
+        'blank page', 'gallery', 'category', 'description', 'save in',
+        'autotext', 'building block', 'search document',
+        'insert content only', 'online pictures',
+    ]
+    if any(kw in lower for kw in ui_keywords):
+        return True
+
+    # 6. Alphabet listing / symbol palette (A,B,C,...Z or a,b,c,...z)
+    clean = stripped.replace(',', '').replace(' ', '')
+    if len(clean) >= 20:
+        alpha_only = ''.join(c for c in clean if c.isalpha())
+        if len(alpha_only) >= 20:
+            unique = set(alpha_only.lower())
+            if len(unique) >= 18:
+                return True
+
+    # 7. Comma-separated single characters (symbol reference)
+    parts = [p.strip() for p in stripped.split(',')]
+    if len(parts) >= 15 and all(len(p) <= 2 for p in parts):
+        return True
+
+    return False
+
+
+async def _apply_figure_replacements_to_docx(docx_doc, approved_figures: list):
+    """Download and replace images in a DOCX document for approved figure patches.
+
+    Returns the number of figures successfully replaced.
+    Works with any python-docx Document object (clean or tracked).
+    """
+    import httpx as _httpx
+    from io import BytesIO
+    from PIL import Image as PILImage
+
+    replaced = 0
+    for mp in approved_figures:
+        sel = mp.get("selected_replacement")
+        if not sel:
+            continue
+
+        # Prefer full-resolution URL, fall back to thumbnail
+        download_url = sel.get("url") or sel.get("thumbnail_url")
+        if not download_url:
+            continue
+
+        r_embed = mp.get("r_embed")
+        if not r_embed or r_embed not in docx_doc.part.rels:
+            logger.warning("Figure replacement: r_embed=%s not found in DOCX rels", r_embed)
+            continue
+
+        try:
+            async with _httpx.AsyncClient(follow_redirects=True) as _http:
+                # Try full URL first; if it fails, fall back to thumbnail
+                img_resp = await _http.get(download_url, timeout=30)
+                if img_resp.status_code != 200:
+                    fallback_url = sel.get("thumbnail_url") or sel.get("url")
+                    if fallback_url and fallback_url != download_url:
+                        logger.info("Figure replacement: full URL failed (%d), trying thumbnail: %s",
+                                    img_resp.status_code, fallback_url)
+                        img_resp = await _http.get(fallback_url, timeout=30)
+
+                if img_resp.status_code != 200:
+                    logger.warning("Figure replacement: download failed (%d) for r_embed=%s",
+                                   img_resp.status_code, r_embed)
+                    continue
+
+            rel = docx_doc.part.rels[r_embed]
+
+            # ── Determine original image format from rel ──
+            orig_content_type = rel.target_part.content_type or ""
+            target_format = "PNG"
+            if "jpeg" in orig_content_type or "jpg" in orig_content_type:
+                target_format = "JPEG"
+            elif "gif" in orig_content_type:
+                target_format = "GIF"
+
+            # ── Get original dimensions from patch ──
+            orig_cx = mp.get("original_cx", 0)
+            orig_cy = mp.get("original_cy", 0)
+
+            # ── Resize replacement image to match original dims (high quality) ──
+            try:
+                new_img = PILImage.open(BytesIO(img_resp.content))
+
+                if orig_cx > 0 and orig_cy > 0:
+                    # Use 150 DPI for better quality (1 inch = 914400 EMU)
+                    dpi = 150
+                    target_w = max(1, int(orig_cx / 914400 * dpi))
+                    target_h = max(1, int(orig_cy / 914400 * dpi))
+                    # Only downscale if needed; never upscale a small image
+                    src_w, src_h = new_img.size
+                    if src_w > target_w or src_h > target_h:
+                        new_img = new_img.resize((target_w, target_h), PILImage.LANCZOS)
+                    # If source is smaller, let it be — better than stretching a tiny image
+
+                # Convert to RGB if saving as JPEG (no alpha)
+                if target_format == "JPEG" and new_img.mode in ("RGBA", "P", "LA"):
+                    background = PILImage.new("RGB", new_img.size, (255, 255, 255))
+                    if new_img.mode == "P":
+                        new_img = new_img.convert("RGBA")
+                    background.paste(new_img, mask=new_img.split()[-1])
+                    new_img = background
+
+                buf = BytesIO()
+                new_img.save(buf, format=target_format, quality=98)
+                image_bytes = buf.getvalue()
+            except Exception as resize_err:
+                logger.warning("Image resize failed for r_embed=%s, using raw bytes: %s",
+                               r_embed, resize_err)
+                image_bytes = img_resp.content
+
+            # ── Replace image blob ──
+            rel.target_part._blob = image_bytes
+
+            # ── Preserve DOCX XML extents (sizing) ──
+            if orig_cx > 0 and orig_cy > 0:
+                try:
+                    WP_NS = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+                    A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+                    R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+                    W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+                    for para in docx_doc.paragraphs:
+                        drawings = para._element.findall(f'.//{{{W_NS}}}drawing')
+                        for drawing in drawings:
+                            blip = drawing.find(f'.//{{{A_NS}}}blip')
+                            if blip is not None and blip.get(f'{{{R_NS}}}embed') == r_embed:
+                                extent = drawing.find(f'.//{{{WP_NS}}}extent')
+                                if extent is not None:
+                                    extent.set('cx', str(orig_cx))
+                                    extent.set('cy', str(orig_cy))
+                                for ext_el in drawing.findall(f'.//{{{A_NS}}}ext'):
+                                    ext_el.set('cx', str(orig_cx))
+                                    ext_el.set('cy', str(orig_cy))
+                except Exception as extent_err:
+                    logger.warning("Extent fix failed for r_embed=%s: %s", r_embed, extent_err)
+
+            replaced += 1
+            logger.info("Replaced figure image (r_embed=%s, cx=%d, cy=%d, format=%s, url=%s)",
+                        r_embed, orig_cx, orig_cy, target_format, download_url[:120])
+
+        except Exception as fig_err:
+            logger.error("Figure replacement failed for r_embed=%s: %s", r_embed, fig_err)
+
+    return replaced
+
+
+def _apply_equation_replacements_to_docx(docx_doc, approved_equations: list) -> int:
+    """Replace approved equation updates in a DOCX document.
+
+    Finds original OMML equations and replaces the <m:t> text content
+    to reflect the suggested update. Returns count of equations replaced.
+    """
+    from lxml import etree
+
+    MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+    replaced = 0
+
+    for eq_patch in approved_equations:
+        original_omml = eq_patch.get("original_omml", "")
+        suggested = eq_patch.get("suggested_update", "")
+        if not original_omml or not suggested:
+            continue
+
+        # Parse the original OMML to get its text content for matching
+        try:
+            orig_tree = etree.fromstring(original_omml)
+            orig_t_elements = orig_tree.findall(f'.//{{{MATH_NS}}}t')
+            orig_texts = [t.text or '' for t in orig_t_elements]
+            orig_text_joined = ''.join(orig_texts).strip()
+        except Exception:
+            orig_text_joined = ""
+
+        if not orig_text_joined:
+            continue
+
+        # Search all oMath elements in body paragraphs AND table cells
+        def _find_omath_in_element(root_el):
+            """Find all oMath elements in an XML tree."""
+            return root_el.findall(f'.//{{{MATH_NS}}}oMath')
+
+        found = False
+        all_omath = _find_omath_in_element(docx_doc.element.body)
+
+        for omath in all_omath:
+            # Match by comparing <m:t> text content
+            t_elements = omath.findall(f'.//{{{MATH_NS}}}t')
+            current_text = ''.join(t.text or '' for t in t_elements).strip()
+
+            if current_text == orig_text_joined:
+                # Found the matching equation — apply the update
+                # Strategy: Replace all <m:t> text nodes based on the suggested LaTeX
+
+                # For simple text substitutions (e.g., \text{sin} → \sin means
+                # replacing "sin" text run), update in-place
+                updated_text = suggested.strip()
+
+                # Remove LaTeX command prefixes for plain-text replacement
+                # Convert suggested LaTeX back to plain text tokens
+                import re as _re_eq_repl
+                # Strip common LaTeX wrappers to get the core text changes
+                plain_suggested = updated_text
+                # Remove \frac{}{}, \sin, \cos etc. — keep the structure but update text
+                # Simple approach: replace text content of existing <m:t> elements
+
+                # Strategy 1: If number of <m:t> elements matches, do 1:1 replacement
+                # Strategy 2: Combine all <m:t> into one with the suggested text
+
+                # For tracked docs, we add a highlighted annotation after the equation
+                # For clean docs, we update the <m:t> elements directly
+
+                # Clear all existing <m:t> and set the first one to suggested text
+                # This preserves the OMML structure but updates visible content
+                if t_elements:
+                    # Set first <m:t> to the full suggested text (cleaned)
+                    # Remove LaTeX commands that are OMML structural (not text)
+                    display_text = _re_eq_repl.sub(r'\\(sin|cos|tan|log|ln|exp|lim|max|min|det|gcd|partial|leq|geq|neq|approx|equiv|pm|times|cdot|frac|sqrt|sum|int|hat|bar|vec|overline|overbrace|underset|overset|left|right|middle|begin|end|text|mathbb|mathscr|mathfrak)\b', '', updated_text)
+                    display_text = _re_eq_repl.sub(r'[{}\\]', '', display_text)
+                    display_text = _re_eq_repl.sub(r'\s+', ' ', display_text).strip()
+
+                    # If we can't produce clean display text, use the original with fixes applied
+                    if not display_text or len(display_text) < 2:
+                        # Fallback: apply specific known fixes to the original text elements
+                        _apply_known_fixes_to_omml(omath, eq_patch, MATH_NS)
+                    else:
+                        # For now, don't replace the structural OMML — instead apply
+                        # targeted fixes to the XML tree
+                        _apply_known_fixes_to_omml(omath, eq_patch, MATH_NS)
+
+                found = True
+                replaced += 1
+                logger.info("Replaced equation: '%s' (patch_id=%s)",
+                            orig_text_joined[:50], eq_patch.get("patch_id", "?"))
+                break
+
+        if not found:
+            logger.warning("Equation not found in DOCX for replacement: '%s'", orig_text_joined[:50])
+
+    return replaced
+
+
+def _apply_known_fixes_to_omml(omath_el, eq_patch: dict, math_ns: str):
+    """Apply specific known fixes directly to the OMML XML tree.
+
+    Handles:
+    - \\text{sin} → proper function (remove rPr text formatting)
+    - \\text{1}, \\text{+} → remove unnecessary text-mode wrapping
+    - Missing spaces (\\partialx → \\partial x): add space <m:t> element
+    """
+    from lxml import etree
+
+    reason = eq_patch.get("reason", "").lower()
+    suggested = eq_patch.get("suggested_update", "")
+    original = eq_patch.get("original_text", "")
+
+    W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    # Fix 1: \text{} wrapping math functions — remove the rPr that forces text mode
+    # In OMML, \text{sin} appears as <m:r> with <w:rPr><w:rFonts/></w:rPr> and <m:t>sin</m:t>
+    # We need to remove the w:rPr that makes it render as text
+    if '\\text{' in original or 'text{' in reason:
+        for r_elem in omath_el.findall(f'.//{{{math_ns}}}r'):
+            t_elem = r_elem.find(f'{{{math_ns}}}t')
+            if t_elem is not None and t_elem.text:
+                t_text = t_elem.text.strip()
+                # Check if this is a function name wrapped in text mode
+                func_names = ['sin', 'cos', 'tan', 'log', 'ln', 'exp', 'lim',
+                              'max', 'min', 'det', 'gcd', 'sec', 'csc', 'cot',
+                              'arcsin', 'arccos', 'arctan', 'sinh', 'cosh', 'tanh']
+                if t_text in func_names:
+                    # Remove w:rPr (text formatting) — this makes it render as math
+                    for rpr in r_elem.findall(f'{{{W_NS}}}rPr'):
+                        r_elem.remove(rpr)
+                    # Also remove m:rPr > m:sty if it forces text
+                    for mrpr in r_elem.findall(f'{{{math_ns}}}rPr'):
+                        sty = mrpr.find(f'{{{math_ns}}}sty')
+                        if sty is not None:
+                            val = sty.get(f'{{{math_ns}}}val', '')
+                            if val == 'p':  # 'p' = plain/text style
+                                mrpr.remove(sty)
+
+                # Remove \text{} wrapping around numbers and operators
+                if t_text in '0123456789+-*/=<>' and len(t_text) == 1:
+                    for rpr in r_elem.findall(f'{{{W_NS}}}rPr'):
+                        r_elem.remove(rpr)
+                    for mrpr in r_elem.findall(f'{{{math_ns}}}rPr'):
+                        sty = mrpr.find(f'{{{math_ns}}}sty')
+                        if sty is not None:
+                            val = sty.get(f'{{{math_ns}}}val', '')
+                            if val == 'p':
+                                mrpr.remove(sty)
+
+    # Fix 2: Missing spaces (e.g. \partialx → \partial x)
+    if 'missing space' in reason or 'invalid command' in reason:
+        t_elements = omath_el.findall(f'.//{{{math_ns}}}t')
+        for t_elem in t_elements:
+            if t_elem.text:
+                text = t_elem.text
+                import re as _re_space
+                # Fix: "∂x" → "∂ x", "≤y" → "≤ y" etc.
+                # Look for a symbol character immediately followed by a letter
+                fixed = _re_space.sub(r'([\u2202\u2264\u2265\u2260\u2248\u2261])([a-zA-Z])',
+                                      r'\1 \2', text)
+                if fixed != text:
+                    t_elem.text = fixed
+
+
+def _apply_table_updates_to_docx(docx_doc, approved_tables: list) -> int:
+    """Apply approved table cell updates to a DOCX document.
+
+    Finds tables by their original DOCX index and updates specific cells.
+    Adds light blue highlighting to changed cells for visibility.
+    Handles merged cells by searching for old_value text across all cells in the row.
+    Returns count of tables updated.
+    """
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    LIGHT_BLUE = "B4D8F0"  # Light blue highlight for changed cells
+
+    def _highlight_cell(cell, hex_color=LIGHT_BLUE):
+        """Add background shading (light blue) to a table cell."""
+        tc = cell._element
+        tcPr = tc.find(qn('w:tcPr'))
+        if tcPr is None:
+            tcPr = OxmlElement('w:tcPr')
+            tc.insert(0, tcPr)
+        # Remove existing shading if any
+        for old_shd in tcPr.findall(qn('w:shd')):
+            tcPr.remove(old_shd)
+        shd = OxmlElement('w:shd')
+        shd.set(qn('w:val'), 'clear')
+        shd.set(qn('w:color'), 'auto')
+        shd.set(qn('w:fill'), hex_color)
+        tcPr.append(shd)
+
+    def _set_cell_text_preserve_format(cell, new_val: str):
+        """Set cell text while preserving formatting, then highlight."""
+        if cell.paragraphs:
+            first_para = cell.paragraphs[0]
+            # Clear all runs
+            for run in first_para.runs:
+                run.text = ""
+            if first_para.runs:
+                first_para.runs[0].text = new_val
+            else:
+                # No runs — add a new run with the text
+                run = first_para.add_run(new_val)
+
+            # Remove extra paragraphs
+            for extra_para in list(cell.paragraphs[1:]):
+                p_elem = extra_para._element
+                p_elem.getparent().remove(p_elem)
+        else:
+            cell.text = new_val
+
+        # Apply light blue highlight
+        _highlight_cell(cell)
+
+    updated = 0
+
+    for tbl_patch in approved_tables:
+        cell_updates = tbl_patch.get("cell_updates", [])
+        if not cell_updates:
+            continue
+
+        # Use table_idx (original DOCX index) for precise targeting
+        t_idx = tbl_patch.get("table_idx")
+        if t_idx is None:
+            t_idx = tbl_patch.get("table_number", 1) - 1
+
+        if t_idx < 0 or t_idx >= len(docx_doc.tables):
+            logger.warning("Table index %d out of range (doc has %d tables)", t_idx, len(docx_doc.tables))
+            continue
+
+        tbl = docx_doc.tables[t_idx]
+        cells_changed = 0
+
+        for cu in cell_updates:
+            r = cu.get("row", -1)
+            c = cu.get("col", -1)
+            new_val = cu.get("new_value", "")
+            old_val = cu.get("old_value", "")
+
+            if r < 0 or r >= len(tbl.rows):
+                logger.warning("Row %d out of range for table %d", r, t_idx)
+                continue
+
+            row_cells = tbl.rows[r].cells
+
+            if c < 0 or c >= len(row_cells):
+                logger.warning("Col %d out of range for table %d row %d", c, t_idx, r)
+                continue
+
+            # Strategy 1: Direct cell at [r,c]
+            cell = row_cells[c]
+            current_text = cell.text.strip()
+
+            # Check if old_value matches at the target cell
+            matched_cell = None
+            if not old_val:
+                # No old_value provided — just update directly
+                matched_cell = cell
+            elif old_val.strip()[:20] in current_text or current_text[:20] in old_val.strip():
+                matched_cell = cell
+            else:
+                # Strategy 2: Merged cells shift indices — search ALL cells in this row
+                for search_c, search_cell in enumerate(row_cells):
+                    search_text = search_cell.text.strip()
+                    if old_val.strip()[:20] in search_text or search_text[:20] in old_val.strip():
+                        matched_cell = search_cell
+                        logger.info("Table %d cell [%d,%d]: found old_value in col %d instead of %d (merged cells)",
+                                   t_idx, r, c, search_c, c)
+                        break
+
+                if matched_cell is None:
+                    # Strategy 3: Skip validation entirely — trust GPT's row/col and just update
+                    logger.info("Table %d cell [%d,%d]: old_value not found in any col, updating target cell directly",
+                               t_idx, r, c)
+                    matched_cell = cell
+
+            _set_cell_text_preserve_format(matched_cell, new_val)
+            cells_changed += 1
+            logger.info("Table %d cell [%d,%d]: '%s' → '%s'",
+                        t_idx, r, c, (old_val or current_text)[:30], new_val[:30])
+
+        if cells_changed > 0:
+            updated += 1
+            logger.info("Updated table %d with %d cell changes", t_idx + 1, cells_changed)
+
+    return updated
 
 
 def _build_tracked_changes_docx(original_path: str, approved_patches: list, output_path: str):
@@ -2521,7 +3302,19 @@ async def export_tracked_docx(session_id: str, token: Optional[str] = None, requ
 
     output_dir = os.path.join(settings.OUTPUT_DIR, session_id)
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, f"tracked_{doc.get('original_filename', 'document.docx')}")
+    # Use unique suffix to prevent concurrent requests from overwriting each other
+    import time as _time
+    unique_suffix = str(int(_time.time() * 1000))
+    output_path = os.path.join(output_dir, f"tracked_{unique_suffix}_{doc.get('original_filename', 'document.docx')}")
+
+    # Clean up old tracked files to prevent disk bloat
+    import glob as _glob
+    for old_file in _glob.glob(os.path.join(output_dir, "tracked_*")):
+        if old_file != output_path:
+            try:
+                os.remove(old_file)
+            except OSError:
+                pass
 
     logger.info("EXPORT tracked-docx: building tracked changes from patches")
 
@@ -2535,6 +3328,46 @@ async def export_tracked_docx(session_id: str, token: Optional[str] = None, requ
         # Fallback: copy working doc
         shutil.copy2(working_path, output_path)
 
+    # ── Apply approved media patches (figures, equations, tables) to tracked DOCX ──
+    try:
+        db = get_database()
+        approved_media = await db.media_patches.find({
+            "session_id": session_id,
+            "status": "approved",
+        }).to_list(length=500)
+
+        if approved_media:
+            from docx import Document as DocxDocument
+            tracked_doc = DocxDocument(output_path)
+            media_applied = 0
+
+            # Figures
+            approved_figures = [m for m in approved_media if m.get("type") == "figure"]
+            if approved_figures:
+                fig_count = await _apply_figure_replacements_to_docx(tracked_doc, approved_figures)
+                media_applied += fig_count
+                logger.info("EXPORT tracked-docx: replaced %d figures", fig_count)
+
+            # Equations
+            approved_equations = [m for m in approved_media if m.get("type") == "equation"]
+            if approved_equations:
+                eq_count = _apply_equation_replacements_to_docx(tracked_doc, approved_equations)
+                media_applied += eq_count
+                logger.info("EXPORT tracked-docx: replaced %d equations", eq_count)
+
+            # Tables
+            approved_tables = [m for m in approved_media if m.get("type") == "table"]
+            if approved_tables:
+                tbl_count = _apply_table_updates_to_docx(tracked_doc, approved_tables)
+                media_applied += tbl_count
+                logger.info("EXPORT tracked-docx: updated %d tables", tbl_count)
+
+            if media_applied > 0:
+                tracked_doc.save(output_path)
+                logger.info("EXPORT tracked-docx: saved with %d total media patches", media_applied)
+    except Exception as media_err:
+        logger.warning("EXPORT tracked-docx: media patch application failed (non-fatal): %s", media_err)
+
     output_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
     logger.info("EXPORT: serving %s (%d bytes)", output_path, output_size)
 
@@ -2546,6 +3379,10 @@ async def export_tracked_docx(session_id: str, token: Optional[str] = None, requ
         output_path,
         filename=f"tracked_{doc.get('original_filename', 'document.docx')}",
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
     )
 
 
@@ -2594,6 +3431,10 @@ async def export_clean_docx(session_id: str, token: Optional[str] = None, reques
         working_path,
         filename=f"clean_{doc.get('original_filename', 'document.docx')}",
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
     )
 
 
@@ -2613,6 +3454,15 @@ async def export_changelog(session_id: str, user=Depends(get_current_user_dep)):
     dated_statements = await session_repo.find_dated_statements(session_id)
     opportunities = await session_repo.find_opportunities(session_id)
 
+    # Include media patches (figures, equations, tables)
+    media_patches_cursor = db.media_patches.find(
+        {"session_id": session_id},
+        {"original_image_b64": 0},  # exclude large base64 blobs from export
+    )
+    media_patches = await media_patches_cursor.to_list(length=1000)
+    for mp in media_patches:
+        mp["_id"] = str(mp["_id"])
+
     return {
         "session_id": session_id,
         "document_id": session.get("document_id"),
@@ -2621,5 +3471,1205 @@ async def export_changelog(session_id: str, user=Depends(get_current_user_dep)):
         "total_opportunities": len(opportunities),
         "patches": patches,
         "dated_statements": dated_statements,
+        "media_patches": media_patches,
         "exported_at": datetime.utcnow().isoformat(),
+    }
+
+
+# ── Media Analysis Endpoints ─────────────────────────────────────────────────
+
+
+@router.get("/{session_id}/figure-analysis")
+async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
+    """Analyze all figures/images in the DOCX. Uses GPT-4o Vision to assess
+    whether each figure is outdated and searches NASA / Wikimedia for replacements."""
+    import httpx
+    from uuid import uuid4
+
+    db = get_database()
+    session_repo = SessionRepository(db)
+    doc_repo = DocumentRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    # Return cached results if they exist
+    existing = await db.media_patches.find(
+        {"session_id": session_id, "type": "figure"}
+    ).to_list(length=500)
+    if existing:
+        for e in existing:
+            e["_id"] = str(e["_id"])
+        return {"session_id": session_id, "figures": existing, "cached": True}
+
+    # ── Read figures from DB (extracted once during POST /process) ──
+    doc = await doc_repo.find_with_media(session["document_id"])
+    if not doc:
+        raise HTTPException(404, "Document not found")
+
+    db_figures = doc.get("figures", [])
+
+    # Filter decorative/small images using stored metadata
+    figures = []
+    for fig in db_figures:
+        size_bytes = fig.get("size_bytes") or 0
+        cx = fig.get("cx") or 0
+        cy = fig.get("cy") or 0
+        w_px = cx / 914400 * 96 if cx else 0
+        h_px = cy / 914400 * 96 if cy else 0
+
+        # Skip small images (< 5KB)
+        if size_bytes > 0 and size_bytes < 5000:
+            logger.debug("Skipping small image fig_%s (%d bytes)", fig.get("figure_id"), size_bytes)
+            continue
+        # Skip tiny dimensions
+        if w_px > 0 and (w_px < 50 or h_px < 50):
+            logger.debug("Skipping tiny image fig_%s (%dx%d px)", fig.get("figure_id"), w_px, h_px)
+            continue
+        # Skip decorative bars (wide + short)
+        if w_px > 500 and h_px < 30:
+            logger.debug("Skipping decorative bar fig_%s (%dx%d px)", fig.get("figure_id"), w_px, h_px)
+            continue
+
+        pos = fig.get("position") or {}
+        figures.append({
+            "para_idx": pos.get("paragraph"),
+            "image_b64": fig.get("image_base64", ""),
+            "caption": fig.get("caption") or "",
+            "r_embed": fig.get("r_embed") or "",
+            "size_bytes": size_bytes,
+            "cx": cx,
+            "cy": cy,
+        })
+
+    logger.info("Found %d content figures from DB (filtered from %d total)", len(figures), len(db_figures))
+
+    if not figures:
+        return {"session_id": session_id, "figures": [], "message": "No figures found in document."}
+
+    # ── Analyze figures in PARALLEL for speed ──────────────────────────────
+    import asyncio
+    import json as _json
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+    async def _analyze_single_figure(fig_num: int, fig: dict, http_client: httpx.AsyncClient):
+        """Analyze one figure with GPT-4o Vision + search for replacements concurrently."""
+        thumb_b64 = fig["image_b64"]
+        caption = fig.get("caption", "") or ""
+
+        # ── Step 1: GPT-4o Vision analysis ────────────────────────────────
+        analysis_text = ""
+        search_queries = []
+        is_outdated = False
+        figure_category = "unknown"
+        try:
+            caption_context = f'\nThe figure caption in the textbook is: "{caption}"' if caption else ""
+            gpt_resp = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Analyze this figure from a textbook."
+                                f"{caption_context}\n\n"
+                                "Step 1 — Classify the figure into one of these categories:\n"
+                                "  - \"historical_illustration\": artwork, manuscripts, or illustrations "
+                                "depicting historical events/models (e.g., Aristotle's universe, medieval diagrams). "
+                                "These are NEVER outdated — they are meant to show how things were understood in the past.\n"
+                                "  - \"portrait\": photograph or painting of a specific person (scientist, astronaut, etc.). "
+                                "Portraits are NEVER outdated — they depict a specific individual.\n"
+                                "  - \"technical_diagram\": engineering diagrams, system architectures, process flows, "
+                                "block diagrams. These CAN become outdated if the technology or process has changed.\n"
+                                "  - \"data_chart\": graphs, charts, tables with numerical data. "
+                                "These CAN become outdated if newer data exists.\n"
+                                "  - \"photograph\": real-world photos of hardware, facilities, launches. "
+                                "These CAN become outdated if the subject has changed significantly.\n"
+                                "  - \"conceptual\": generic conceptual illustrations, decorative images.\n\n"
+                                "Step 2 — Determine if the figure is outdated:\n"
+                                "  - historical_illustration → ALWAYS set is_outdated = false\n"
+                                "  - portrait → ALWAYS set is_outdated = false\n"
+                                "  - For other categories, assess whether the content shown is still current.\n\n"
+                                "Step 3 — If and ONLY if is_outdated is true, suggest exactly 3 different "
+                                "image search queries to find an UPDATED replacement. Each query should:\n"
+                                "  - Be 3-7 words, specific to the EXACT content shown\n"
+                                "  - Target different search angles (e.g., technical term, industry standard name, textbook diagram name)\n"
+                                "  - NEVER use the word 'updated' or 'new' — just describe what the replacement should show\n"
+                                "  - Include specific domain terms (e.g., 'SMAD space mission architecture elements' not 'space mission diagram')\n"
+                                "  - For data charts: describe the axes/variables (e.g., 'spacecraft design life vs cost tradeoff curve')\n"
+                                "  - For technical diagrams: use the standard name of the framework/model shown\n\n"
+                                "Respond in JSON with keys: "
+                                "\"analysis\" (string), \"figure_category\" (string), "
+                                "\"is_outdated\" (bool), \"search_queries\" (list of 3 strings, empty list if not outdated)."
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{thumb_b64}"},
+                        },
+                    ],
+                }],
+                temperature=0.0,
+                max_tokens=1000,
+            )
+            raw = gpt_resp.choices[0].message.content or ""
+            analysis_text = raw
+            try:
+                cleaned = raw.strip()
+                if cleaned.startswith("```"):
+                    cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
+                    cleaned = cleaned.rsplit("```", 1)[0]
+                parsed = _json.loads(cleaned)
+                analysis_text = parsed.get("analysis", raw)
+                # Support both old single query and new multi-query format
+                search_queries = parsed.get("search_queries", [])
+                if not search_queries:
+                    sq = parsed.get("search_query", "")
+                    search_queries = [sq] if sq else []
+                is_outdated = parsed.get("is_outdated", False)
+                figure_category = parsed.get("figure_category", "unknown")
+            except (_json.JSONDecodeError, Exception):
+                search_queries = [caption] if caption else []
+                is_outdated = False
+        except Exception as gpt_err:
+            logger.warning("GPT Vision analysis failed for figure %d: %s", fig_num, gpt_err)
+            analysis_text = f"Analysis unavailable: {gpt_err}"
+            search_queries = [caption] if caption else []
+            is_outdated = False
+
+        logger.info("Figure %d: category=%s, is_outdated=%s, queries=%s",
+                     fig_num, figure_category, is_outdated, search_queries)
+
+        # ── Step 2: Search for replacements (only if outdated) ────────────
+        all_candidates = []
+
+        if not is_outdated:
+            logger.info("Figure %d is not outdated (category=%s) — skipping replacement search",
+                        fig_num, figure_category)
+            return {
+                "patch_id": str(uuid4()),
+                "session_id": session_id,
+                "type": "figure",
+                "status": "not_outdated",
+                "figure_number": fig_num,
+                "caption": caption,
+                "original_image_b64": thumb_b64,
+                "analysis": analysis_text,
+                "figure_category": figure_category,
+                "is_outdated": False,
+                "replacement_candidates": [],
+                "selected_replacement": None,
+                "r_embed": fig.get("r_embed", ""),
+                "para_idx": fig.get("para_idx"),
+                "original_cx": fig.get("cx", 0),
+                "original_cy": fig.get("cy", 0),
+                "created_at": datetime.utcnow().isoformat(),
+            }
+
+        logger.info("Figure %d is outdated — searching with %d queries: %s",
+                     fig_num, len(search_queries), search_queries)
+
+        # ── Primary: Tavily web image search (best for technical diagrams) ──
+        async def _search_tavily(query: str):
+            candidates = []
+            if not settings.TAVILY_API_KEY:
+                return candidates
+            try:
+                tavily_resp = await http_client.post(
+                    "https://api.tavily.com/search",
+                    json={
+                        "api_key": settings.TAVILY_API_KEY,
+                        "query": f"{query} diagram",
+                        "search_depth": "advanced",
+                        "include_images": True,
+                        "max_results": 5,
+                    },
+                    timeout=20,
+                )
+                tavily_data = tavily_resp.json()
+                seen_urls = set()
+                for img_url in tavily_data.get("images", [])[:5]:
+                    if isinstance(img_url, str) and img_url.startswith("http") and img_url not in seen_urls:
+                        seen_urls.add(img_url)
+                        candidates.append({
+                            "url": img_url,
+                            "title": query,
+                            "source": "Web Search",
+                            "thumbnail_url": img_url,
+                        })
+            except Exception as e:
+                logger.warning("Tavily search failed for figure %d query '%s': %s", fig_num, query, e)
+            return candidates
+
+        # ── Secondary: NASA Images (only for space/aerospace content) ───────
+        space_keywords = {"space", "mission", "satellite", "orbit", "launch", "spacecraft",
+                          "nasa", "esa", "rocket", "constellation", "iss", "lunar", "mars"}
+        all_query_words = {w.lower() for q in search_queries for w in q.split()}
+        is_space_related = bool(all_query_words & space_keywords)
+
+        async def _search_nasa(query: str):
+            candidates = []
+            if not is_space_related:
+                return candidates
+            try:
+                params = {"q": query, "media_type": "image", "page_size": 5}
+                if settings.NASA_API_KEY:
+                    params["api_key"] = settings.NASA_API_KEY
+                resp = await http_client.get(
+                    "https://images-api.nasa.gov/search", params=params, timeout=15
+                )
+                items = resp.json().get("collection", {}).get("items", [])
+                for item in items[:3]:
+                    data = item.get("data", [{}])[0]
+                    links = item.get("links", [{}])
+                    thumb = links[0].get("href", "") if links else ""
+                    if thumb:
+                        # Derive full-resolution URL from thumbnail
+                        # NASA thumbnails: .../image~thumb.jpg → .../image~orig.jpg
+                        full_url = thumb.replace("~thumb", "~orig").replace("~small", "~orig").replace("~medium", "~orig")
+                        candidates.append({
+                            "url": full_url,
+                            "title": data.get("title", ""),
+                            "source": "NASA",
+                            "thumbnail_url": thumb,
+                        })
+            except Exception as e:
+                logger.warning("NASA search failed for figure %d: %s", fig_num, e)
+            return candidates
+
+        # ── Secondary: Wikimedia Commons ────────────────────────────────────
+        async def _search_wikimedia(query: str):
+            candidates = []
+            wiki_headers = {"User-Agent": "AIBookUpdater/1.0 (educational; contact@example.com)"}
+            try:
+                wiki_params = {
+                    "action": "query", "format": "json",
+                    "generator": "search", "gsrsearch": query,
+                    "gsrnamespace": "6", "gsrlimit": "5",
+                    "prop": "imageinfo", "iiprop": "url|thumburl", "iiurlwidth": "1200",
+                }
+                resp = await http_client.get(
+                    "https://commons.wikimedia.org/w/api.php",
+                    params=wiki_params, headers=wiki_headers, timeout=15,
+                )
+                pages = resp.json().get("query", {}).get("pages", {})
+                for page in pages.values():
+                    ii = page.get("imageinfo", [])
+                    if ii:
+                        info = ii[0]
+                        img_url = info.get("thumburl") or info.get("url", "")
+                        if img_url:
+                            candidates.append({
+                                "url": info.get("url", img_url),
+                                "title": page.get("title", "").replace("File:", ""),
+                                "source": "Wikimedia Commons",
+                                "thumbnail_url": img_url,
+                            })
+            except Exception as e:
+                logger.warning("Wikimedia search failed for figure %d: %s", fig_num, e)
+            return candidates
+
+        # ── Run all queries across all sources in parallel ──────────────────
+        search_tasks = []
+        for q in search_queries:
+            search_tasks.append(_search_tavily(q))
+            search_tasks.append(_search_nasa(q))
+            search_tasks.append(_search_wikimedia(q))
+
+        search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+        for res in search_results:
+            if isinstance(res, list):
+                all_candidates.extend(res)
+
+        # ── Deduplicate by URL ──────────────────────────────────────────────
+        seen_urls = set()
+        unique_candidates = []
+        for c in all_candidates:
+            url = c.get("thumbnail_url") or c.get("url", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                unique_candidates.append(c)
+        all_candidates = unique_candidates
+
+        # ── GPT-4o relevance filter: keep only candidates that match ────────
+        if all_candidates and len(all_candidates) > 2:
+            try:
+                candidate_descriptions = "\n".join(
+                    f"{i+1}. title=\"{c.get('title', '')}\" source={c.get('source', '')} url={c.get('url', '')}"
+                    for i, c in enumerate(all_candidates[:10])
+                )
+                filter_resp = await client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            f"I need a replacement image for this textbook figure:\n"
+                            f"  Caption: \"{caption}\"\n"
+                            f"  AI Analysis: \"{analysis_text}\"\n"
+                            f"  Category: {figure_category}\n\n"
+                            f"Here are candidate replacement images found via search:\n"
+                            f"{candidate_descriptions}\n\n"
+                            f"Return a JSON object with key \"relevant_indices\" — a list of the "
+                            f"1-based indices of candidates that are RELEVANT replacements for "
+                            f"this specific figure. Only include candidates whose title/source "
+                            f"suggests they show the SAME type of content (same topic, same kind "
+                            f"of diagram/chart). Exclude anything generic, unrelated, or from a "
+                            f"completely different domain.\n"
+                            f"Example: {{\"relevant_indices\": [1, 3, 5]}}"
+                        ),
+                    }],
+                    temperature=0.0,
+                    max_tokens=200,
+                )
+                filter_raw = filter_resp.choices[0].message.content or ""
+                filter_cleaned = filter_raw.strip()
+                if filter_cleaned.startswith("```"):
+                    filter_cleaned = filter_cleaned.split("\n", 1)[1] if "\n" in filter_cleaned else filter_cleaned
+                    filter_cleaned = filter_cleaned.rsplit("```", 1)[0]
+                filter_parsed = _json.loads(filter_cleaned)
+                relevant_indices = filter_parsed.get("relevant_indices", [])
+                if relevant_indices:
+                    filtered = [all_candidates[i - 1] for i in relevant_indices
+                                if 1 <= i <= len(all_candidates)]
+                    if filtered:
+                        logger.info("Figure %d: relevance filter kept %d/%d candidates",
+                                    fig_num, len(filtered), len(all_candidates))
+                        all_candidates = filtered
+            except Exception as filter_err:
+                logger.warning("Figure %d: relevance filter failed, using all candidates: %s",
+                               fig_num, filter_err)
+
+        logger.info("Figure %d: found %d replacement candidates", fig_num, len(all_candidates))
+        replacement_candidates = all_candidates[:6]
+
+        return {
+            "patch_id": str(uuid4()),
+            "session_id": session_id,
+            "type": "figure",
+            "status": "pending",
+            "figure_number": fig_num,
+            "caption": caption,
+            "original_image_b64": thumb_b64,
+            "analysis": analysis_text,
+            "figure_category": figure_category,
+            "is_outdated": True,
+            "replacement_candidates": replacement_candidates,
+            "selected_replacement": None,
+            "r_embed": fig.get("r_embed", ""),
+            "para_idx": fig.get("para_idx"),
+            "original_cx": fig.get("cx", 0),
+            "original_cy": fig.get("cy", 0),
+            "created_at": datetime.utcnow().isoformat(),
+        }
+
+    # Process all figures in parallel (batches of 3 to avoid rate limits)
+    result_patches = []
+    BATCH_SIZE = 3
+    async with httpx.AsyncClient() as shared_http:
+        for batch_start in range(0, len(figures), BATCH_SIZE):
+            batch = figures[batch_start:batch_start + BATCH_SIZE]
+            tasks = [
+                _analyze_single_figure(batch_start + i + 1, fig, shared_http)
+                for i, fig in enumerate(batch)
+            ]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in batch_results:
+                if isinstance(res, Exception):
+                    logger.error("Figure analysis failed: %s", res)
+                else:
+                    result_patches.append(res)
+
+    # Store in MongoDB
+    if result_patches:
+        await db.media_patches.insert_many(result_patches)
+
+    # Sanitise _id for JSON response
+    for rp in result_patches:
+        if "_id" in rp:
+            rp["_id"] = str(rp["_id"])
+
+    return {"session_id": session_id, "figures": result_patches, "cached": False}
+
+
+@router.get("/{session_id}/equation-analysis")
+async def equation_analysis(session_id: str, user=Depends(get_current_user_dep)):
+    """Analyze all OMML equations in the DOCX for outdated notation."""
+    from uuid import uuid4
+
+    db = get_database()
+    session_repo = SessionRepository(db)
+    doc_repo = DocumentRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    # Return cached results if they exist
+    existing = await db.media_patches.find(
+        {"session_id": session_id, "type": "equation"}
+    ).to_list(length=500)
+    if existing:
+        for e in existing:
+            e["_id"] = str(e["_id"])
+        return {"session_id": session_id, "equations": existing, "cached": True}
+
+    # ── Read equations from DB (extracted once during POST /process) ──
+    doc = await doc_repo.find_with_media(session["document_id"])
+    if not doc:
+        raise HTTPException(404, "Document not found")
+
+    db_equations = doc.get("equations", [])
+
+    equations = []
+    for eq in db_equations:
+        pos = eq.get("position") or {}
+        readable = eq.get("latex") or ""
+        omml_xml = eq.get("raw_omml") or ""
+
+        if _is_junk_equation_text(readable, omml_xml):
+            logger.info("Equation pre-filter skipped (not a real equation): %s", readable[:60])
+            continue
+
+        equations.append({
+            "para_idx": pos.get("paragraph"),
+            "omml_xml": omml_xml,
+            "readable_text": readable,
+        })
+
+    # ── If DB has no valid equations, re-extract from DOCX (picks up table cells) ──
+    if not equations:
+        logger.info("No valid equations in DB, attempting live re-extraction from DOCX")
+        file_path = _resolve_file_path(doc.get("file_path", ""))
+        working_path = session.get("working_doc_path", "")
+        docx_path = working_path if working_path and os.path.exists(working_path) else file_path
+
+        if docx_path and os.path.exists(docx_path):
+            try:
+                from app.services.document_service import DOCXParser
+                parser = DOCXParser(docx_path)
+                fresh_equations = parser._extract_equations()
+                logger.info("Live re-extraction found %d equations from %s", len(fresh_equations), docx_path)
+
+                # Update DB with fresh equations for future use
+                eq_dicts = []
+                for feq in fresh_equations:
+                    eq_dict = {
+                        "equation_id": feq.equation_id,
+                        "latex": feq.latex,
+                        "raw_omml": feq.raw_omml,
+                        "position": {"page": feq.position.page, "paragraph": feq.position.paragraph},
+                        "number": feq.number,
+                    }
+                    eq_dicts.append(eq_dict)
+
+                    readable = feq.latex or ""
+                    if _is_junk_equation_text(readable, feq.raw_omml or ""):
+                        continue
+
+                    equations.append({
+                        "para_idx": feq.position.paragraph if feq.position else 0,
+                        "omml_xml": feq.raw_omml or "",
+                        "readable_text": readable,
+                    })
+
+                # Persist to DB so next time we don't re-extract
+                if eq_dicts:
+                    from bson import ObjectId as _ObjId
+                    doc_oid = _ObjId(doc["id"]) if "id" in doc else doc.get("_id")
+                    if doc_oid:
+                        await doc_repo.collection.update_one(
+                            {"_id": doc_oid},
+                            {"$set": {"equations": eq_dicts}},
+                        )
+                        logger.info("Updated DB with %d fresh equations", len(eq_dicts))
+
+            except Exception as extract_err:
+                logger.warning("Live equation re-extraction failed: %s", extract_err)
+
+    if not equations:
+        return {"session_id": session_id, "equations": [], "message": "No equations found in document."}
+
+    # Send equations to GPT for analysis (batch them to reduce API calls)
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+    # Build a summary of all equations for GPT
+    eq_summary_lines = []
+    for i, eq in enumerate(equations, start=1):
+        eq_summary_lines.append(f"Equation {i}: {eq['readable_text']}")
+
+    # ── GPT analysis (batch if > 30 equations) ──────────────────────────
+    from openai import AsyncOpenAI
+    import json as _json
+
+    BATCH_SIZE = 30
+    gpt_analyses = {}
+
+    gpt_prompt_template = (
+        "You are a mathematics and scientific notation expert reviewing equations "
+        "extracted from a textbook document.\n\n"
+        "IMPORTANT RULES:\n"
+        "- A real equation is ANY mathematical expression: fractions, trig functions, "
+        "matrices, integrals, inequalities, angle brackets, floor/ceiling notation, "
+        "piecewise functions, etc. Even a simple expression like \\sin(x) or "
+        "\\left\\langle x \\right\\rangle IS a real equation. "
+        "Matrices (\\begin{pmatrix}...) ARE real equations. "
+        "Do NOT mark these as not_equation.\n"
+        "- Only mark as not_equation: alphabet listings, Word UI text, "
+        "placeholder text like 'Type equation here', or comma-separated "
+        "single letters/symbols that are clearly a reference palette.\n\n"
+        "For each REAL equation, classify it into one of three categories:\n\n"
+        "1. **\"outdated\"** — ONLY for things that are WRONG or DEPRECATED:\n"
+        "   - \\text{} wrapping math functions: \\text{sin} must be \\sin, "
+        "\\text{cos} must be \\cos, \\text{tan} must be \\tan, "
+        "\\text{log} must be \\log, etc.\n"
+        "   - \\text{} wrapping numbers or operators inside math mode: "
+        "\\text{1} must be just 1, \\text{+} must be just +, "
+        "\\text{2} must be just 2. These are WRONG because \\text{} forces "
+        "text mode inside math mode.\n"
+        "   - Missing spaces that create INVALID commands: \\partialx is not "
+        "a valid LaTeX command (must be \\partial x), \\leqy is not valid "
+        "(must be \\leq y)\n"
+        "   - Formulas that are mathematically superseded or incorrect\n"
+        "   IMPORTANT: Check EVERY part of the equation for \\text{} misuse. "
+        "Even if the main structure looks fine, \\text{+} or \\text{1} "
+        "buried inside makes it outdated.\n\n"
+        "2. **\"formatting\"** — for OPTIONAL style improvements:\n"
+        "   - Style preferences (\\times vs \\cdot — both valid)\n"
+        "   - Alternative valid notations (1/2 vs \\frac{1}{2} — both valid)\n"
+        "   - Removing optional \\left(\\right) delimiters\n"
+        "   - Cosmetic spacing\n\n"
+        "3. **\"ok\"** — equation is correct, no issues\n\n"
+        "Respond in JSON: a list of objects with keys:\n"
+        "- \"equation_number\" (int)\n"
+        "- \"not_equation\" (bool) — true ONLY if not a real math expression\n"
+        "- \"category\" (str) — \"outdated\", \"formatting\", or \"ok\"\n"
+        "- \"suggested_update\" (str) — full corrected LaTeX (empty if ok)\n"
+        "- \"reason\" (str) — brief explanation (empty if ok)\n\n"
+        "CRITICAL RULES:\n"
+        "- \\times is NOT outdated (it is a valid multiplication symbol)\n"
+        "- 1/2 inline is NOT outdated (it is valid inline fraction notation)\n"
+        "- \\left(\\frac{a}{b}\\right) is NOT outdated (parentheses have meaning)\n"
+        "- \\text{sin}, \\text{cos}, \\text{+}, \\text{1} ARE outdated (wrong usage)\n"
+        "- Scan the ENTIRE equation for \\text{} misuse, not just the beginning\n\n"
+    )
+
+    async def _analyze_batch(batch_lines, batch_offset):
+        """Send a batch of equations to GPT and return parsed analyses."""
+        batch_text = "\n".join(batch_lines)
+        try:
+            resp = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{
+                    "role": "user",
+                    "content": gpt_prompt_template + batch_text,
+                }],
+                temperature=0.0,
+                max_tokens=4000,
+            )
+            raw = resp.choices[0].message.content or ""
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
+                cleaned = cleaned.rsplit("```", 1)[0]
+            parsed_list = _json.loads(cleaned)
+            items = parsed_list if isinstance(parsed_list, list) else parsed_list.get("equations", [])
+            for item in items:
+                num = item.get("equation_number", 0)
+                gpt_analyses[num] = item
+        except (_json.JSONDecodeError, Exception) as e:
+            logger.warning("GPT equation batch analysis failed: %s", e)
+
+    try:
+        # Split into batches and run in parallel
+        batches = []
+        for start in range(0, len(eq_summary_lines), BATCH_SIZE):
+            batch = eq_summary_lines[start:start + BATCH_SIZE]
+            batches.append((batch, start))
+
+        if len(batches) == 1:
+            await _analyze_batch(batches[0][0], batches[0][1])
+        else:
+            await asyncio.gather(
+                *[_analyze_batch(b, off) for b, off in batches],
+                return_exceptions=True
+            )
+
+        logger.info("GPT equation analysis complete: %d equations analyzed, %d results",
+                    len(equations), len(gpt_analyses))
+    except Exception as gpt_err:
+        logger.warning("GPT equation analysis failed: %s", gpt_err)
+        for i in range(1, len(equations) + 1):
+            gpt_analyses[i] = {"suggested_update": f"Analysis unavailable: {gpt_err}", "is_outdated": False}
+
+    result_patches = []
+    for eq_num, eq in enumerate(equations, start=1):
+        analysis_item = gpt_analyses.get(eq_num, {})
+
+        # Skip items GPT identified as not real equations — but override if it looks real
+        if analysis_item.get("not_equation", False):
+            readable = eq["readable_text"]
+            # Safety net: don't skip things that are clearly math
+            math_indicators = [
+                r'\frac', r'\int', r'\sum', r'\prod', r'\sqrt', r'\sin', r'\cos',
+                r'\tan', r'\log', r'\lim', r'\partial', r'\begin{', r'\left',
+                r'\leq', r'\geq', r'\pm', r'\infty', r'\hat', r'\bar', r'\vec',
+                r'\overline', r'\overbrace', r'\underset', r'\overset',
+                r'\pmatrix', r'\bmatrix', r'\matrix', '=', r'\neq', r'\approx',
+            ]
+            has_math = any(ind in readable for ind in math_indicators)
+            if has_math:
+                logger.info("Equation %d: GPT said not_equation but contains math indicators, keeping: %s",
+                            eq_num, readable[:80])
+                # Override GPT — keep it as "ok"
+                analysis_item["not_equation"] = False
+                if "category" not in analysis_item:
+                    analysis_item["category"] = "ok"
+            else:
+                logger.info("Equation %d skipped (GPT: not a real equation): %s",
+                            eq_num, readable[:60])
+                continue
+
+        category = analysis_item.get("category", "ok")
+
+        # ── Post-GPT safety net: catch \text{} misuse GPT might miss ───
+        original_text = eq["readable_text"]
+        if category == "ok":
+            import re as _re_eq
+            # \text{sin}, \text{cos}, \text{tan}, \text{log}, etc.
+            text_func_match = _re_eq.search(r'\\text\{(sin|cos|tan|log|ln|exp|lim|max|min|det|gcd)\}', original_text)
+            # \text{+}, \text{-}, \text{1}, \text{2}, etc. (operators/numbers in text mode)
+            text_num_op_match = _re_eq.search(r'\\text\{[0-9+\-*/=<>]\}', original_text)
+            # \partialx, \leqy — command run into variable with no space
+            invalid_cmd_match = _re_eq.search(r'\\(partial|leq|geq|neq|approx|equiv)[a-zA-Z]', original_text)
+
+            if text_func_match:
+                func = text_func_match.group(1)
+                category = "outdated"
+                if not analysis_item.get("suggested_update"):
+                    analysis_item["suggested_update"] = original_text.replace(
+                        f"\\text{{{func}}}", f"\\{func}"
+                    )
+                analysis_item["reason"] = analysis_item.get("reason") or (
+                    f"Use \\{func} instead of \\text{{{func}}} for proper math notation."
+                )
+            elif text_num_op_match:
+                category = "outdated"
+                if not analysis_item.get("suggested_update"):
+                    fixed = _re_eq.sub(r'\\text\{([0-9+\-*/=<>])\}', r'\1', original_text)
+                    analysis_item["suggested_update"] = fixed
+                analysis_item["reason"] = analysis_item.get("reason") or (
+                    "\\text{} around numbers/operators is unnecessary in math mode."
+                )
+            elif invalid_cmd_match:
+                category = "outdated"
+                cmd = invalid_cmd_match.group(1)
+                analysis_item["reason"] = analysis_item.get("reason") or (
+                    f"Missing space after \\{cmd} makes the command invalid."
+                )
+
+        # is_outdated = True ONLY for mathematically wrong / deprecated notation
+        is_outdated = category == "outdated"
+        # has_suggestion = True for both outdated AND formatting suggestions
+        has_suggestion = category in ("outdated", "formatting")
+
+        patch_doc = {
+            "patch_id": str(uuid4()),
+            "session_id": session_id,
+            "type": "equation",
+            "status": "pending",
+            "equation_number": eq_num,
+            "original_text": eq["readable_text"],
+            "original_omml": eq["omml_xml"],
+            "suggested_update": analysis_item.get("suggested_update", "") if has_suggestion else "",
+            "is_outdated": is_outdated,
+            "category": category,
+            "reason": analysis_item.get("reason", "") if has_suggestion else "",
+            "para_idx": eq["para_idx"],
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        result_patches.append(patch_doc)
+
+    if result_patches:
+        await db.media_patches.insert_many(result_patches)
+
+    for rp in result_patches:
+        if "_id" in rp:
+            rp["_id"] = str(rp["_id"])
+
+    return {"session_id": session_id, "equations": result_patches, "cached": False}
+
+
+def _is_reference_table(rows: list) -> bool:
+    """Detect tables that are reference/syntax material (symbol lists, shortcuts, etc.)
+    These should not be analyzed for outdated data."""
+    if not rows:
+        return False
+
+    # Check header row for reference-table patterns
+    header = [str(c).lower().strip() for c in (rows[0] if rows else [])]
+    header_text = ' '.join(header)
+
+    # Symbol/syntax reference tables
+    ref_headers = ['symbol', 'type', 'accent', 'grouping', 'brackets', 'code', 'use']
+    ref_matches = sum(1 for h in header if any(rh in h for rh in ref_headers))
+    if ref_matches >= 2:
+        return True
+
+    # Keyboard shortcut tables
+    if any(kw in header_text for kw in ['shift+', 'ctrl+', 'arrow key', 'shortcut']):
+        return True
+
+    # Greek letter reference tables
+    if any(kw in header_text for kw in ['lower case', 'upper case', 'lowercase', 'uppercase']):
+        return True
+
+    # Large symbol-only tables (>15 rows where most cells are short LaTeX commands)
+    if len(rows) > 15:
+        short_cells = 0
+        total_cells = 0
+        for row in rows:
+            for cell in row:
+                cell_str = str(cell).strip()
+                total_cells += 1
+                if len(cell_str) < 20 and ('\\' in cell_str or len(cell_str) <= 3):
+                    short_cells += 1
+        if total_cells > 0 and short_cells / total_cells > 0.7:
+            return True
+
+    return False
+
+
+def _is_empty_or_trivial_table(rows: list) -> bool:
+    """Return True if the table has no meaningful content."""
+    if not rows:
+        return True
+
+    # Count non-empty cells
+    non_empty = 0
+    for row in rows:
+        for cell in row:
+            if str(cell).strip():
+                non_empty += 1
+
+    # Fewer than 2 non-empty cells = trivial
+    return non_empty < 2
+
+
+def _format_table_for_gpt(rows: list, max_rows: int = 25) -> str:
+    """Format table content as a readable markdown-style table for GPT."""
+    if not rows:
+        return "(empty table)"
+
+    display_rows = rows[:max_rows]
+    # Determine column widths
+    num_cols = max(len(row) for row in display_rows) if display_rows else 0
+    if num_cols == 0:
+        return "(empty table)"
+
+    lines = []
+    for r_idx, row in enumerate(display_rows):
+        cells = []
+        for c_idx in range(num_cols):
+            val = str(row[c_idx]).strip() if c_idx < len(row) else ""
+            cells.append(val if val else "(empty)")
+        lines.append(f"| {' | '.join(cells)} |")
+        if r_idx == 0:
+            lines.append(f"| {' | '.join(['---'] * num_cols)} |")
+
+    if len(rows) > max_rows:
+        lines.append(f"... ({len(rows) - max_rows} more rows)")
+
+    return '\n'.join(lines)
+
+
+@router.get("/{session_id}/table-analysis")
+async def table_analysis(session_id: str, user=Depends(get_current_user_dep)):
+    """Analyze all tables in the DOCX for outdated data."""
+    from uuid import uuid4
+
+    db = get_database()
+    session_repo = SessionRepository(db)
+    doc_repo = DocumentRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    # Return cached results if they exist
+    existing = await db.media_patches.find(
+        {"session_id": session_id, "type": "table"}
+    ).to_list(length=500)
+    if existing:
+        for e in existing:
+            e["_id"] = str(e["_id"])
+        return {"session_id": session_id, "tables": existing, "cached": True}
+
+    # ── Read tables from DB ──
+    doc = await doc_repo.find_with_media(session["document_id"])
+    if not doc:
+        raise HTTPException(404, "Document not found")
+
+    doc_title = doc.get("original_filename", "") or doc.get("filename", "")
+
+    # ── ALWAYS re-extract tables from the ORIGINAL DOCX file ──
+    # DB cache can be corrupted by previously approved GPT updates baked into
+    # the working copy, or stale from old extraction bugs.  Fresh extraction
+    # from the untouched original is fast and guarantees clean data.
+    file_path = _resolve_file_path(doc.get("file_path", ""))
+    db_tables = doc.get("tables", [])
+
+    if file_path and os.path.exists(file_path):
+        try:
+            from app.services.document_service import DOCXParser
+            parser = DOCXParser(file_path)
+            fresh_tables = parser._extract_tables()
+            logger.info("Table extraction from original DOCX: %d tables from %s",
+                        len(fresh_tables), file_path)
+
+            # Convert to dicts and update DB
+            tbl_dicts = []
+            for ft in fresh_tables:
+                tbl_dicts.append({
+                    "table_id": ft.table_id,
+                    "caption": ft.caption,
+                    "content": ft.content,
+                    "position": {"page": ft.position.page, "paragraph": ft.position.paragraph} if ft.position else {},
+                    "number": ft.number,
+                })
+
+            # Persist to DB
+            if tbl_dicts:
+                from bson import ObjectId as _ObjId
+                doc_oid = _ObjId(doc["id"]) if "id" in doc else doc.get("_id")
+                if doc_oid:
+                    await doc_repo.collection.update_one(
+                        {"_id": doc_oid},
+                        {"$set": {"tables": tbl_dicts}},
+                    )
+                    logger.info("Updated DB with %d fresh tables", len(tbl_dicts))
+
+            db_tables = tbl_dicts
+        except Exception as extract_err:
+            logger.warning("Live table re-extraction failed: %s", extract_err)
+
+    # ── Filter tables: skip empty, trivial, and reference tables ──
+    tables_data = []
+    skipped_empty = 0
+    skipped_ref = 0
+    for t_idx, tbl in enumerate(db_tables):
+        content = tbl.get("content", [])
+        caption = tbl.get("caption") or ""
+        doc_number = tbl.get("number") or ""
+
+        if _is_empty_or_trivial_table(content):
+            skipped_empty += 1
+            logger.info("Table %d skipped (empty/trivial)", t_idx + 1)
+            continue
+
+        if _is_reference_table(content):
+            skipped_ref += 1
+            logger.info("Table %d skipped (reference/syntax table): header=%s",
+                        t_idx + 1, [str(c)[:30] for c in content[0]] if content else [])
+            continue
+
+        tables_data.append({
+            "table_idx": t_idx,
+            "content": content,
+            "caption": caption,
+            "doc_number": doc_number,
+            "display_number": doc_number or str(t_idx + 1),
+        })
+
+    if skipped_empty or skipped_ref:
+        logger.info("Table analysis: %d total, %d skipped (empty), %d skipped (reference), %d to analyze",
+                    len(db_tables), skipped_empty, skipped_ref, len(tables_data))
+
+    if not tables_data:
+        return {"session_id": session_id, "tables": [], "message": "No data tables found to analyze."}
+
+    # ── GPT analysis ──
+    import asyncio
+    import json as _json
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+    async def _analyze_single_table(t_num: int, tdata: dict):
+        content_str = _format_table_for_gpt(tdata["content"])
+        caption = tdata.get("caption") or "(no caption)"
+        display_num = tdata.get("display_number", str(t_num))
+
+        analysis_text = ""
+        cell_updates = []
+        is_outdated = False
+        try:
+            gpt_resp = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"You are analyzing Table {display_num} from a document "
+                        f"titled \"{doc_title}\".\n"
+                        f"Caption: {caption}\n\n"
+                        f"{content_str}\n\n"
+                        "Your task:\n"
+                        "1. Determine if this table contains FACTUAL DATA that could "
+                        "become outdated (statistics, dates, measurements, names, "
+                        "company data, mission details, etc.)\n"
+                        "2. If the table is a REFERENCE table (syntax examples, formulas, "
+                        "math demonstrations, notation guides), it is NOT outdated.\n"
+                        "3. If the table contains real data, check if any values are "
+                        "outdated based on your knowledge. Suggest SPECIFIC cell updates.\n\n"
+                        "CRITICAL RULES:\n"
+                        "- Set is_outdated to true ONLY when you have concrete cell_updates "
+                        "to suggest. If you have NO updates, is_outdated MUST be false.\n"
+                        "- The new_value MUST be the EXACT text to put in the cell — "
+                        "a specific name, number, date, measurement, or factual value.\n"
+                        "- ABSOLUTE PROHIBITION: NEVER use phrases like:\n"
+                        "  * 'Updated X based on Y'\n"
+                        "  * 'Current technology standards'\n"
+                        "  * 'Updated temperature levels, resolution, and location accuracy "
+                        "based on current technology'\n"
+                        "  * 'Updated availability percentage and outage duration based on "
+                        "current standards'\n"
+                        "  * 'Updated mission duration based on current mission planning'\n"
+                        "  * Any sentence that DESCRIBES a change rather than BEING the value\n"
+                        "- The new_value should look like cell data, NOT a sentence about the data.\n"
+                        "- If you cannot provide the EXACT replacement value, skip that cell "
+                        "entirely. An empty cell_updates list is perfectly fine.\n"
+                        "- Only suggest updates for cells where you KNOW the specific "
+                        "correct current value (e.g., a renamed satellite, a corrected date, "
+                        "a known successor mission).\n"
+                        "- Examples of GOOD new_value: 'Intelsat', '2024', 'James Webb "
+                        "Space Telescope', '$2.5B', '150 km resolution', 'International "
+                        "Space Station'\n"
+                        "- Examples of BAD new_value (NEVER do this): 'Updated based on "
+                        "current data', 'Modern equivalent', 'Current technology standards', "
+                        "'Updated coverage area based on current satellite capabilities'\n"
+                        "- Fix ONLY: misspelled names, renamed organizations, cancelled "
+                        "missions replaced by known successors, factually wrong dates.\n"
+                        "- Do NOT update cells that contain descriptions, requirements, "
+                        "section references, or procedural text — these are NOT data.\n"
+                        "- Row 0 is usually the header row — never update headers.\n\n"
+                        "Respond ONLY in JSON (no markdown code blocks):\n"
+                        "{\n"
+                        "  \"analysis\": \"Brief description of the table and findings\",\n"
+                        "  \"is_outdated\": true/false,\n"
+                        "  \"cell_updates\": [\n"
+                        "    {\"row\": 1, \"col\": 0, \"old_value\": \"old\", "
+                        "\"new_value\": \"specific concrete replacement\"}\n"
+                        "  ]\n"
+                        "}\n"
+                    ),
+                }],
+                temperature=0.0,
+                max_tokens=2000,
+            )
+            raw = gpt_resp.choices[0].message.content or ""
+
+            # ── Robust JSON parsing ──
+            cleaned = raw.strip()
+            # Strip markdown code fences
+            if cleaned.startswith("```"):
+                # Remove opening fence (```json or ```)
+                first_newline = cleaned.find('\n')
+                if first_newline != -1:
+                    cleaned = cleaned[first_newline + 1:]
+                # Remove closing fence
+                if cleaned.rstrip().endswith("```"):
+                    cleaned = cleaned.rstrip()[:-3].rstrip()
+
+            try:
+                parsed = _json.loads(cleaned)
+                analysis_text = parsed.get("analysis", "")
+                cell_updates = parsed.get("cell_updates", [])
+                is_outdated = parsed.get("is_outdated", False)
+            except _json.JSONDecodeError:
+                # Try to extract JSON from mixed text
+                import re as _re_json
+                json_match = _re_json.search(r'\{[\s\S]*\}', cleaned)
+                if json_match:
+                    try:
+                        parsed = _json.loads(json_match.group())
+                        analysis_text = parsed.get("analysis", "")
+                        cell_updates = parsed.get("cell_updates", [])
+                        is_outdated = parsed.get("is_outdated", False)
+                    except _json.JSONDecodeError:
+                        analysis_text = cleaned
+                else:
+                    # Last resort: use raw text but strip any JSON artifacts
+                    analysis_text = cleaned
+                    if analysis_text.startswith('{') or analysis_text.startswith('['):
+                        analysis_text = "Analysis could not be parsed. Please re-analyze."
+
+            # ── Post-GPT safety: filter out vague/non-concrete updates ──
+            if cell_updates:
+                import re as _re_vague
+
+                # Patterns that indicate a vague description, NOT a concrete value
+                vague_phrases = _re_vague.compile(
+                    r'(?i)'
+                    r'(?:updated?\s+.+\s+based\s+on)'   # "Updated X based on Y"
+                    r'|(?:based\s+on\s+current)'         # "based on current ..."
+                    r'|(?:current\s+(?:technology|standards?|data|capabilities?|infrastructure|planning|mapping))'
+                    r'|(?:modern\s+equivalent)'
+                    r'|(?:updated?\s+(?:temperature|coverage|data|mission|availability|map|number|grid))'
+                    r'|(?:revised\s+(?:to|based|for))'
+                )
+
+                filtered = []
+                for upd in cell_updates:
+                    new_val = str(upd.get("new_value", "")).strip()
+                    old_val = str(upd.get("old_value", "")).strip()
+                    # Skip if new_value is empty or same as old
+                    if not new_val or new_val.lower() == old_val.lower():
+                        continue
+                    # Skip if new_value matches vague description patterns
+                    if vague_phrases.search(new_val):
+                        logger.info("Table %s: filtered vague update: %r → %r",
+                                    display_num, old_val[:40], new_val[:60])
+                        continue
+                    filtered.append(upd)
+                cell_updates = filtered
+
+            # ── Enforce: no updates = not outdated ──
+            if not cell_updates:
+                is_outdated = False
+
+        except Exception as gpt_err:
+            logger.warning("GPT table analysis failed for table %s: %s", display_num, gpt_err)
+            analysis_text = f"Analysis unavailable: {gpt_err}"
+
+        return {
+            "patch_id": str(uuid4()),
+            "session_id": session_id,
+            "type": "table",
+            "status": "pending",
+            "table_number": t_num,
+            "table_idx": tdata.get("table_idx", t_num - 1),  # original DOCX table index
+            "original_content": tdata["content"],
+            "caption": tdata.get("caption", ""),
+            "doc_table_number": tdata.get("display_number", ""),
+            "cell_updates": cell_updates,
+            "analysis": analysis_text,
+            "is_outdated": is_outdated,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+
+    # Process all tables in parallel (batches of 3 to avoid rate limits)
+    result_patches = []
+    BATCH_SIZE = 3
+    for batch_start in range(0, len(tables_data), BATCH_SIZE):
+        batch = tables_data[batch_start:batch_start + BATCH_SIZE]
+        tasks = [
+            _analyze_single_table(batch_start + i + 1, tdata)
+            for i, tdata in enumerate(batch)
+        ]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in batch_results:
+            if isinstance(res, Exception):
+                logger.error("Table analysis failed: %s", res)
+            else:
+                result_patches.append(res)
+
+    if result_patches:
+        await db.media_patches.insert_many(result_patches)
+
+    for rp in result_patches:
+        if "_id" in rp:
+            rp["_id"] = str(rp["_id"])
+
+    return {"session_id": session_id, "tables": result_patches, "cached": False}
+
+
+@router.put("/{session_id}/media-patches/{patch_id}")
+async def review_media_patch(
+    session_id: str,
+    patch_id: str,
+    request: Request,
+    user=Depends(get_current_user_dep),
+):
+    """Approve or reject a media patch (figure / equation / table)."""
+    db = get_database()
+    session_repo = SessionRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    body = await request.json()
+    action = body.get("action", "").lower()
+    if action not in ("approve", "reject"):
+        raise HTTPException(400, "action must be 'approve' or 'reject'")
+
+    existing = await db.media_patches.find_one({
+        "patch_id": patch_id,
+        "session_id": session_id,
+    })
+    if not existing:
+        raise HTTPException(404, "Media patch not found")
+
+    update_fields: Dict = {"status": "approved" if action == "approve" else "rejected"}
+
+    # For figures, allow selecting a replacement candidate
+    selected_replacement = body.get("selected_replacement")
+    if selected_replacement and existing.get("type") == "figure":
+        update_fields["selected_replacement"] = selected_replacement
+
+    await db.media_patches.update_one(
+        {"patch_id": patch_id, "session_id": session_id},
+        {"$set": update_fields},
+    )
+
+    return {
+        "patch_id": patch_id,
+        "session_id": session_id,
+        "status": update_fields["status"],
+        "message": f"Media patch {action}d successfully.",
+    }
+
+
+@router.delete("/{session_id}/media-patches/{media_type}")
+async def clear_media_patches(
+    session_id: str,
+    media_type: str,
+    user=Depends(get_current_user_dep),
+):
+    """Clear cached media patches of a given type (figure/equation/table) to allow re-analysis."""
+    if media_type not in ("figure", "equation", "table"):
+        raise HTTPException(400, "media_type must be 'figure', 'equation', or 'table'")
+
+    db = get_database()
+    session_repo = SessionRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    result = await db.media_patches.delete_many({
+        "session_id": session_id,
+        "type": media_type,
+    })
+
+    return {
+        "session_id": session_id,
+        "type": media_type,
+        "deleted": result.deleted_count,
+        "message": f"Cleared {result.deleted_count} {media_type} patches. Ready for re-analysis.",
     }

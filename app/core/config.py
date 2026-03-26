@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     MATHPIX_APP_KEY: str = ""
     OPENAI_API_KEY: str = ""
     TAVILY_API_KEY: str = ""
+    NASA_API_KEY: str = ""
 
     # AI Analysis Settings
     GPT_MODEL: str = "gpt-4o"

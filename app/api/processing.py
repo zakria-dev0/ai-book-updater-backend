@@ -89,13 +89,16 @@ async def _run_processing(document_id: str, db):
 
         parser = DOCXParser(document["file_path"], use_nougat=False)
 
-        await _update_stage(repo, document_id, "Extracting text", 20, "Extracting text content")
+        await _update_stage(repo, document_id, "Extracting text", 15, "Extracting text content")
         text = parser._extract_text()
+
+        await _update_stage(repo, document_id, "Extracting paragraphs", 30, "Extracting paragraph metadata")
+        paragraphs = parser._extract_paragraphs()
 
         await _update_stage(repo, document_id, "Extracting figures", 45, "Extracting embedded images")
         figures = parser._extract_figures()
 
-        await _update_stage(repo, document_id, "Extracting tables", 65, "Extracting tables")
+        await _update_stage(repo, document_id, "Extracting tables", 60, "Extracting tables")
         tables = parser._extract_tables()
 
         await _update_stage(repo, document_id, "Extracting equations", 70, "Extracting OMML equations and converting to LaTeX")
@@ -124,6 +127,7 @@ async def _run_processing(document_id: str, db):
 
         await repo.update_fields(document_id, {
             "text_content": text,
+            "paragraphs": paragraphs,
             "equations": [eq.model_dump() for eq in equations],
             "figures": [fig.model_dump() for fig in figures],
             "tables": [tbl.model_dump() for tbl in tables],
@@ -263,6 +267,7 @@ async def reprocess_document(
         "processing_started_at": datetime.utcnow(),
         "processing_history": [],
         "text_content": None,
+        "paragraphs": [],
         "equations": [],
         "figures": [],
         "tables": [],

@@ -34,6 +34,10 @@ class Figure(BaseModel):
     image_base64: str
     position: Position
     number: Optional[str] = None  # e.g., "Figure 6-5"
+    r_embed: Optional[str] = None  # relationship embed ID in DOCX
+    size_bytes: Optional[int] = None  # image file size in bytes
+    cx: Optional[int] = 0  # width in EMU
+    cy: Optional[int] = 0  # height in EMU
 
 class Table(BaseModel):
     table_id: str
@@ -41,6 +45,24 @@ class Table(BaseModel):
     content: List[List[str]]  # 2D array of table cells
     position: Position
     number: Optional[str] = None  # e.g., "Table 6-1"
+
+class ParagraphMeta(BaseModel):
+    """Rich paragraph metadata extracted once during processing.
+    Downstream endpoints (outline, section-paragraphs) read from this
+    instead of re-opening the DOCX file."""
+    idx: int
+    text: str
+    style: str = ""
+    bold: bool = False
+    font_sizes: List[float] = []
+    length: int = 0
+    has_image: bool = False
+    r_embeds: List[str] = []
+    image_cx: int = 0
+    image_cy: int = 0
+    has_equation: bool = False
+    page: int = 1
+
 
 class ProcessingHistoryEntry(BaseModel):
     stage: str
@@ -69,6 +91,7 @@ class Document(BaseModel):
     
     # Extracted content
     text_content: Optional[str] = None
+    paragraphs: List[ParagraphMeta] = []  # rich paragraph metadata for downstream use
     equations: List[Equation] = []
     figures: List[Figure] = []
     tables: List[Table] = []
