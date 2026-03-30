@@ -5235,3 +5235,219 @@ async def clear_media_patches(
         "deleted": result.deleted_count,
         "message": f"Cleared {result.deleted_count} {media_type} patches. Ready for re-analysis.",
     }
+
+
+# ── Spell & Grammar Check ──────────────────────────────────────────────────────
+
+class SpellFixPayload(BaseModel):
+    approved_issue_ids: List[str] = []
+
+
+@router.post("/{session_id}/run-spell-check")
+async def run_spell_check(
+    session_id: str,
+    user=Depends(get_current_user_dep),
+):
+    """
+    Run GPT-based spell and grammar check on the document's text content.
+    Returns a list of SpellIssue objects for admin review.
+    Preserves technical terms, equations, and proper nouns.
+    """
+    import json as _json
+    from openai import AsyncOpenAI
+
+    db = get_database()
+    session_repo = SessionRepository(db)
+    doc_repo = DocumentRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    doc = await doc_repo.find_with_media(session["document_id"])
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    text_content = doc.get("text_content", "")
+    if not text_content:
+        return {"session_id": session_id, "issues": [], "total_issues": 0, "status": "complete"}
+
+    # Split into chunks of ~2000 chars to keep GPT calls manageable
+    chunk_size = 2000
+    paragraphs = [p.strip() for p in text_content.split("\n") if p.strip()]
+    chunks = []  # list of (start_para_idx, chunk_text)
+    current_chunk = []
+    current_len = 0
+    start_idx = 0
+
+    for idx, para in enumerate(paragraphs):
+        current_chunk.append(para)
+        current_len += len(para)
+        if current_len >= chunk_size:
+            chunks.append((start_idx, "\n".join(current_chunk)))
+            current_chunk = []
+            current_len = 0
+            start_idx = idx + 1
+
+    if current_chunk:
+        chunks.append((start_idx, "\n".join(current_chunk)))
+
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    all_issues = []
+
+    system_prompt = (
+        "You are a professional copy editor for technical textbooks. "
+        "Check the given text for spelling errors, grammar mistakes, and clarity issues. "
+        "STRICT RULES:\n"
+        "1. Do NOT flag technical terms, scientific notation, equations, Greek letters, "
+        "   unit abbreviations (km/s, AU, etc.), or proper nouns (NASA, Hubble, etc.).\n"
+        "2. Only flag genuine errors — do not suggest style rewrites.\n"
+        "3. Keep corrections minimal — change only what is clearly wrong.\n"
+        "4. For each issue return a JSON object with:\n"
+        '   {"original_text": "<exact phrase from text>", '
+        '"suggested_text": "<corrected phrase>", '
+        '"issue_type": "spelling"|"grammar"|"clarity", '
+        '"explanation": "<brief reason>"}\n'
+        "5. Return ONLY a JSON array. If no issues found, return []."
+    )
+
+    for start_para, chunk_text in chunks:
+        try:
+            resp = await client.chat.completions.create(
+                model=settings.GPT_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": chunk_text},
+                ],
+                temperature=0.0,
+                max_tokens=2000,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r'^```(?:json)?\s*', '', raw)
+                raw = re.sub(r'\s*```$', '', raw)
+            found = _json.loads(raw)
+            for item in found:
+                all_issues.append({
+                    "issue_id": str(uuid.uuid4()),
+                    "paragraph_idx": start_para,
+                    "original_text": item.get("original_text", ""),
+                    "suggested_text": item.get("suggested_text", ""),
+                    "issue_type": item.get("issue_type", "grammar"),
+                    "explanation": item.get("explanation", ""),
+                    "status": "pending",
+                })
+        except Exception as e:
+            logger.warning("Spell check chunk failed: %s", e)
+            continue
+
+    # Resolve document _id for update
+    from bson import ObjectId as _ObjId
+    doc_oid = _ObjId(doc["id"]) if "id" in doc else doc.get("_id")
+
+    await doc_repo.collection.update_one(
+        {"_id": doc_oid},
+        {"$set": {
+            "spell_issues": all_issues,
+            "spell_check_status": "pending",
+            "updated_at": datetime.utcnow(),
+        }},
+    )
+
+    # Also store on session for quick access
+    session_oid = _ObjId(session["id"]) if "id" in session else session.get("_id")
+    await db.sessions.update_one(
+        {"_id": session_oid},
+        {"$set": {
+            "spell_issues": all_issues,
+            "status": "spell_check_pending",
+            "updated_at": datetime.utcnow(),
+        }},
+    )
+
+    return {
+        "session_id": session_id,
+        "issues": all_issues,
+        "total_issues": len(all_issues),
+        "status": "complete",
+    }
+
+
+@router.post("/{session_id}/apply-spell-fixes")
+async def apply_spell_fixes(
+    session_id: str,
+    payload: SpellFixPayload,
+    user=Depends(get_current_user_dep),
+):
+    """Apply approved spell/grammar fixes to the document text_content in the DB."""
+    from bson import ObjectId as _ObjId
+
+    db = get_database()
+    session_repo = SessionRepository(db)
+    doc_repo = DocumentRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    doc = await doc_repo.find_with_media(session["document_id"])
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # Spell issues stored on session (set during run-spell-check)
+    spell_issues = session.get("spell_issues", [])
+    approved_ids = set(payload.approved_issue_ids)
+
+    text_content = doc.get("text_content", "")
+    applied = 0
+
+    for issue in spell_issues:
+        if issue["issue_id"] in approved_ids and issue.get("original_text"):
+            text_content = text_content.replace(
+                issue["original_text"], issue["suggested_text"], 1
+            )
+            applied += 1
+
+    doc_oid = _ObjId(doc["id"]) if "id" in doc else doc.get("_id")
+    await doc_repo.collection.update_one(
+        {"_id": doc_oid},
+        {"$set": {"text_content": text_content, "updated_at": datetime.utcnow()}},
+    )
+
+    session_oid = _ObjId(session["id"]) if "id" in session else session.get("_id")
+    await db.sessions.update_one(
+        {"_id": session_oid},
+        {"$set": {"status": "audit_complete", "updated_at": datetime.utcnow()}},
+    )
+
+    return {"applied": applied, "status": "audit_complete"}
+
+
+@router.post("/{session_id}/skip-spell-check")
+async def skip_spell_check(
+    session_id: str,
+    user=Depends(get_current_user_dep),
+):
+    """Advance session past spell check without applying any fixes."""
+    from bson import ObjectId as _ObjId
+
+    db = get_database()
+    session_repo = SessionRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    session_oid = _ObjId(session["id"]) if "id" in session else session.get("_id")
+    await db.sessions.update_one(
+        {"_id": session_oid},
+        {"$set": {"status": "audit_complete", "updated_at": datetime.utcnow()}},
+    )
+
+    return {"status": "audit_complete", "message": "Spell check skipped"}
