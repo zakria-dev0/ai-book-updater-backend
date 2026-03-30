@@ -243,7 +243,7 @@ def _resolve_font_from_style(style_ref):
     return result
 
 
-def _create_styled_p(text, highlight_color=None, style_ref=None):
+def _create_styled_p(text, highlight_color=None, style_ref=None, preserve_numbering=False):
     """Create a w:p XML element that exactly matches the book's body text style.
 
     Two-phase approach:
@@ -253,6 +253,11 @@ def _create_styled_p(text, highlight_color=None, style_ref=None):
 
     This handles documents where spacing/font are defined in styles.xml
     rather than on individual paragraphs.
+
+    Args:
+        preserve_numbering: If True, keep numPr from style_ref (for content
+            that should continue a list). If False (default), strip it to
+            prevent AI text from accidentally joining a list.
     """
     new_p = OxmlElement("w:p")
 
@@ -266,10 +271,11 @@ def _create_styled_p(text, highlight_color=None, style_ref=None):
                 el = pPr.find(tag)
                 if el is not None:
                     pPr.remove(el)
-            # Remove numbering (don't join AI text to a list)
-            numPr = pPr.find(qn("w:numPr"))
-            if numPr is not None:
-                pPr.remove(numPr)
+            # Remove numbering unless explicitly asked to preserve it
+            if not preserve_numbering:
+                numPr = pPr.find(qn("w:numPr"))
+                if numPr is not None:
+                    pPr.remove(numPr)
         else:
             pPr = OxmlElement("w:pPr")
             pStyle_el = OxmlElement("w:pStyle")

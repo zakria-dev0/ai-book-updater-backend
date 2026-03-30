@@ -26,16 +26,22 @@ EQUATION_PATTERN = re.compile(
 EQUATION_PAREN_PATTERN = re.compile(
     r"\((\d+[\-\.]\d+)\)"
 )
+# Page number references: "page 145", "pages 10-15", "p. 42", "pp. 10-15"
+PAGE_REF_PATTERN = re.compile(
+    r"\b(?:pages?|pp?\.?)\s+(\d{1,5})(?:\s*[-–—]\s*(\d{1,5}))?\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass
 class Reference:
     """A reference to a figure, table, or equation found in text."""
-    ref_type: str       # "figure", "table", "equation"
-    number: str         # e.g., "2-3", "6.4"
+    ref_type: str       # "figure", "table", "equation", "page"
+    number: str         # e.g., "2-3", "6.4", "145"
     position: int       # character position in text
-    raw_text: str       # e.g., "Figure 2-3"
+    raw_text: str       # e.g., "Figure 2-3", "page 145"
     paragraph_idx: int = 0
+    end_number: str = ""  # for page ranges: "147" in "pages 145-147"
 
 
 @dataclass
@@ -44,6 +50,7 @@ class ReferenceMap:
     figures: Dict[str, List[int]] = field(default_factory=dict)
     tables: Dict[str, List[int]] = field(default_factory=dict)
     equations: Dict[str, List[int]] = field(default_factory=dict)
+    pages: Dict[str, List[int]] = field(default_factory=dict)
 
 
 class RenumberingService:
@@ -85,6 +92,16 @@ class RenumberingService:
                 paragraph_idx=paragraph_idx,
             ))
 
+        for match in PAGE_REF_PATTERN.finditer(text):
+            refs.append(Reference(
+                ref_type="page",
+                number=match.group(1),
+                position=match.start(),
+                raw_text=match.group(0),
+                paragraph_idx=paragraph_idx,
+                end_number=match.group(2) or "",
+            ))
+
         return refs
 
     @staticmethod
@@ -110,6 +127,9 @@ class RenumberingService:
                     ref_map.tables.setdefault(ref.number, []).append(idx)
                 elif ref.ref_type == "equation":
                     ref_map.equations.setdefault(ref.number, []).append(idx)
+                elif ref.ref_type == "page":
+                    page_key = f"{ref.number}-{ref.end_number}" if ref.end_number else ref.number
+                    ref_map.pages.setdefault(page_key, []).append(idx)
 
         return ref_map
 
@@ -221,3 +241,73 @@ class RenumberingService:
             text = pattern.sub(rf"\g<1>{new_number}\g<2>", text)
 
         return text
+
+    @staticmethod
+    def renumber_sequential(
+        text: str,
+        ref_type: str,
+        existing_numbers: list,
+        removed_numbers: set,
+    ) -> tuple:
+        """Renumber all references sequentially after items are added/removed.
+
+        Args:
+            text: Full document text
+            ref_type: "figure", "table", or "equation"
+            existing_numbers: Sorted list of all current numbers e.g. ["1-1", "1-2", "1-3"]
+            removed_numbers: Set of numbers that were removed
+
+        Returns:
+            (updated_text, number_map) where number_map is {old: new}
+        """
+        if not removed_numbers:
+            return text, {}
+
+        # Group by chapter prefix
+        num_pat = re.compile(r'^(\d+)([\-\.])(\d+)$')
+        chapter_groups = {}
+
+        for num in existing_numbers:
+            m = num_pat.match(num)
+            if m:
+                chap, sep, seq = m.group(1), m.group(2), int(m.group(3))
+                chapter_groups.setdefault((chap, sep), []).append((seq, num))
+
+        number_map = {}
+        for (chap, sep), items in chapter_groups.items():
+            items.sort(key=lambda x: x[0])
+            remaining = [(seq, num) for seq, num in items if num not in removed_numbers]
+            for new_idx, (_, old_num) in enumerate(remaining, start=1):
+                new_num = f"{chap}{sep}{new_idx}"
+                if new_num != old_num:
+                    number_map[old_num] = new_num
+
+        # Apply all renumbering to text
+        for old_num, new_num in number_map.items():
+            text = RenumberingService.renumber_after_changes(
+                text, old_num, new_num, ref_type
+            )
+
+        if number_map:
+            logger.info("Sequential renumbering (%s): %d items renumbered — %s",
+                       ref_type, len(number_map), number_map)
+
+        return text, number_map
+
+    @staticmethod
+    def find_page_references(text: str) -> List[Reference]:
+        """Find all hardcoded page number references in text.
+
+        Returns list of Reference objects for page references like
+        "page 145", "pages 10-15", "p. 42".
+        """
+        refs = []
+        for match in PAGE_REF_PATTERN.finditer(text):
+            refs.append(Reference(
+                ref_type="page",
+                number=match.group(1),
+                position=match.start(),
+                raw_text=match.group(0),
+                end_number=match.group(2) or "",
+            ))
+        return refs
