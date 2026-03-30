@@ -7,6 +7,7 @@ import uuid
 import copy
 import shutil
 import os
+import re
 import subprocess
 
 from app.core.security import get_current_user_dep, verify_download_token, decode_token
@@ -2085,11 +2086,14 @@ async def apply_patches(
                     docx_doc = DocxDocument(working_path)
                     media_applied = 0
 
-                    # ── Figures: use shared helper ──
+                    # ── Figures: replace images + update captions ──
                     approved_figures = [m for m in approved_media if m.get("type") == "figure"]
                     if approved_figures:
                         fig_count = await _apply_figure_replacements_to_docx(docx_doc, approved_figures)
                         media_applied += fig_count
+                        cap_count = _update_figure_captions_in_docx(docx_doc, approved_figures)
+                        if cap_count:
+                            logger.info("Updated %d figure captions", cap_count)
 
                     # ── Equations: apply OMML fixes ──
                     approved_equations = [m for m in approved_media if m.get("type") == "equation"]
@@ -2098,12 +2102,22 @@ async def apply_patches(
                         media_applied += eq_count
                         logger.info("Applied %d equation replacements", eq_count)
 
-                    # ── Tables: apply cell updates ──
+                    # ── Tables: apply cell updates + update captions ──
                     approved_tables = [m for m in approved_media if m.get("type") == "table"]
                     if approved_tables:
                         tbl_count = _apply_table_updates_to_docx(docx_doc, approved_tables)
                         media_applied += tbl_count
                         logger.info("Applied %d table updates", tbl_count)
+                        tcap_count = _update_table_captions_in_docx(docx_doc, approved_tables)
+                        if tcap_count:
+                            logger.info("Updated %d table captions", tcap_count)
+
+                    # Headers/footers: preserve from original
+                    try:
+                        original_doc_for_hf = DocxDocument(original_path)
+                        _preserve_headers_footers(original_doc_for_hf, docx_doc)
+                    except Exception as hf_err:
+                        logger.debug("Headers/footers preservation skipped: %s", hf_err)
 
                     if media_applied:
                         docx_doc.save(working_path)
@@ -2442,15 +2456,20 @@ async def _apply_figure_replacements_to_docx(docx_doc, approved_figures: list):
     from io import BytesIO
     from PIL import Image as PILImage
 
+    _BROWSER_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
     replaced = 0
     for mp in approved_figures:
         sel = mp.get("selected_replacement")
         if not sel:
-            continue
-
-        # Prefer full-resolution URL, fall back to thumbnail
-        download_url = sel.get("url") or sel.get("thumbnail_url")
-        if not download_url:
             continue
 
         r_embed = mp.get("r_embed")
@@ -2458,21 +2477,58 @@ async def _apply_figure_replacements_to_docx(docx_doc, approved_figures: list):
             logger.warning("Figure replacement: r_embed=%s not found in DOCX rels", r_embed)
             continue
 
-        try:
-            async with _httpx.AsyncClient(follow_redirects=True) as _http:
-                # Try full URL first; if it fails, fall back to thumbnail
-                img_resp = await _http.get(download_url, timeout=30)
-                if img_resp.status_code != 200:
-                    fallback_url = sel.get("thumbnail_url") or sel.get("url")
-                    if fallback_url and fallback_url != download_url:
-                        logger.info("Figure replacement: full URL failed (%d), trying thumbnail: %s",
-                                    img_resp.status_code, fallback_url)
-                        img_resp = await _http.get(fallback_url, timeout=30)
+        # Build ordered list of URLs to try: selected url, thumbnail, then other candidates
+        urls_to_try = []
+        primary_url = sel.get("url") or sel.get("thumbnail_url")
+        if primary_url:
+            urls_to_try.append(primary_url)
+        thumb_url = sel.get("thumbnail_url") or sel.get("url")
+        if thumb_url and thumb_url not in urls_to_try:
+            urls_to_try.append(thumb_url)
 
-                if img_resp.status_code != 200:
-                    logger.warning("Figure replacement: download failed (%d) for r_embed=%s",
-                                   img_resp.status_code, r_embed)
-                    continue
+        # Also try other replacement candidates if the selected one fails
+        other_candidates = mp.get("replacement_candidates", [])
+        for cand in other_candidates:
+            for key in ("url", "thumbnail_url"):
+                cand_url = cand.get(key)
+                if cand_url and cand_url not in urls_to_try:
+                    urls_to_try.append(cand_url)
+
+        if not urls_to_try:
+            continue
+
+        try:
+            img_resp = None
+            download_url = None
+            async with _httpx.AsyncClient(
+                follow_redirects=True, headers=_BROWSER_HEADERS
+            ) as _http:
+                for attempt_url in urls_to_try:
+                    try:
+                        resp = await _http.get(attempt_url, timeout=30)
+                        if resp.status_code == 200:
+                            img_resp = resp
+                            download_url = attempt_url
+                            break
+                        else:
+                            logger.info(
+                                "Figure replacement: URL returned %d for r_embed=%s — %s",
+                                resp.status_code, r_embed, attempt_url[:150],
+                            )
+                    except Exception as url_err:
+                        logger.info(
+                            "Figure replacement: URL error for r_embed=%s — %s: %s",
+                            r_embed, attempt_url[:150], url_err,
+                        )
+
+            if img_resp is None or img_resp.status_code != 200:
+                logger.warning(
+                    "Figure replacement: all %d URLs failed for r_embed=%s. "
+                    "Tried: %s",
+                    len(urls_to_try), r_embed,
+                    [u[:80] for u in urls_to_try[:4]],
+                )
+                continue
 
             rel = docx_doc.part.rels[r_embed]
 
@@ -2839,6 +2895,488 @@ def _apply_table_updates_to_docx(docx_doc, approved_tables: list) -> int:
             logger.info("Updated table %d with %d cell changes", t_idx + 1, cells_changed)
 
     return updated
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Caption Updates, Renumbering, Page References, Headers/Footers Preservation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+_MATH_NS_RENUMBER = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+
+
+def _update_figure_captions_in_docx(docx_doc, approved_figures: list) -> int:
+    """Update figure captions in the DOCX when a figure is replaced.
+
+    Scans paragraphs near the replaced figure for a caption like
+    "Figure 1-2. Old caption text" and updates it with the new caption
+    from the approved patch's selected_replacement.
+
+    Returns count of captions updated.
+    """
+    import re as _re
+
+    fig_caption_pat = _re.compile(
+        r'((?:Figure|Fig\.?)\s+\d+[\-\.]\d+)([.:]\s*)(.*)',
+        _re.IGNORECASE | _re.DOTALL,
+    )
+
+    updated = 0
+    for mp in approved_figures:
+        sel = mp.get("selected_replacement")
+        if not sel:
+            continue
+        new_caption_text = sel.get("caption") or sel.get("title") or ""
+        if not new_caption_text:
+            continue
+
+        r_embed = mp.get("r_embed")
+        if not r_embed:
+            continue
+
+        # Find paragraph containing this figure's drawing, then look at nearby paragraphs for caption
+        R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+        A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+
+        fig_para_idx = None
+        for idx, para in enumerate(docx_doc.paragraphs):
+            drawings = para._element.findall(f'.//{{{_W_NS}}}drawing')
+            for drawing in drawings:
+                blip = drawing.find(f'.//{{{A_NS}}}blip')
+                if blip is not None and blip.get(f'{{{R_NS}}}embed') == r_embed:
+                    fig_para_idx = idx
+                    break
+            if fig_para_idx is not None:
+                break
+
+        if fig_para_idx is None:
+            continue
+
+        # Search nearby paragraphs (up to 3 before and after) for caption text
+        total_paras = len(docx_doc.paragraphs)
+        search_range = list(range(max(0, fig_para_idx - 3), min(total_paras, fig_para_idx + 4)))
+
+        for check_idx in search_range:
+            para = docx_doc.paragraphs[check_idx]
+            text = para.text.strip()
+            m = fig_caption_pat.match(text)
+            if m:
+                # Found caption paragraph — update the description part, keep "Figure X-Y."
+                fig_prefix = m.group(1)  # e.g. "Figure 1-2"
+                separator = m.group(2)   # e.g. ". " or ": "
+                new_full = f"{fig_prefix}{separator}{new_caption_text}"
+
+                # Replace text in runs while preserving formatting
+                _replace_paragraph_text_preserve_format(para, new_full)
+                updated += 1
+                logger.info("Updated figure caption near para %d: '%s' → '%s'",
+                            fig_para_idx, text[:50], new_full[:50])
+                break
+
+    return updated
+
+
+def _update_table_captions_in_docx(docx_doc, approved_tables: list) -> int:
+    """Update table captions in DOCX when table analysis provides updated captions.
+
+    Returns count of captions updated.
+    """
+    import re as _re
+
+    tbl_caption_pat = _re.compile(
+        r'((?:TABLE|Table|Tbl\.?)\s+\d+[\-\.]\d+)([.:]\s*)(.*)',
+        _re.IGNORECASE | _re.DOTALL,
+    )
+
+    updated = 0
+    for mp in approved_tables:
+        new_caption = mp.get("updated_caption", "")
+        if not new_caption:
+            continue
+
+        table_idx = mp.get("table_idx", -1)
+        if table_idx < 0 or table_idx >= len(docx_doc.tables):
+            continue
+
+        # Walk body children to find the table element and look at preceding paragraphs
+        tbl_element = docx_doc.tables[table_idx]._tbl
+        body = docx_doc.element.body
+        children = list(body)
+
+        tbl_pos = None
+        for i, child in enumerate(children):
+            if child is tbl_element:
+                tbl_pos = i
+                break
+
+        if tbl_pos is None:
+            continue
+
+        # Check up to 3 paragraphs before the table for caption
+        for offset in range(1, 4):
+            check_pos = tbl_pos - offset
+            if check_pos < 0:
+                break
+            child = children[check_pos]
+            tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+            if tag != 'p':
+                continue
+
+            texts = []
+            for t_el in child.iter(f'{{{_W_NS}}}t'):
+                if t_el.text:
+                    texts.append(t_el.text)
+            para_text = ''.join(texts).strip()
+
+            m = tbl_caption_pat.match(para_text)
+            if m:
+                tbl_prefix = m.group(1)
+                separator = m.group(2)
+                new_full = f"{tbl_prefix}{separator}{new_caption}"
+
+                # Find the python-docx paragraph for this element
+                for para in docx_doc.paragraphs:
+                    if para._element is child:
+                        _replace_paragraph_text_preserve_format(para, new_full)
+                        updated += 1
+                        logger.info("Updated table caption: '%s' → '%s'",
+                                    para_text[:50], new_full[:50])
+                        break
+                break
+
+    return updated
+
+
+def _replace_paragraph_text_preserve_format(para, new_text: str):
+    """Replace paragraph text while preserving the formatting of the first run."""
+    runs = para.runs
+    if not runs:
+        # No runs — create one
+        para.text = new_text
+        return
+
+    # Keep first run's formatting, set its text, clear the rest
+    runs[0].text = new_text
+    for r in runs[1:]:
+        r.text = ""
+
+
+def _update_equation_numbers_in_omml(docx_doc, number_map: dict) -> int:
+    """Update equation number labels in OMML elements within the DOCX.
+
+    number_map: {old_number: new_number} e.g. {"6-4": "6-3", "6-5": "6-4"}
+
+    Equation numbers in OMML appear as <m:t> text like "(6-4)" near the end
+    of the equation's oMath element (often in a separate oMath or run).
+    Also updates standalone text runs that contain equation numbers like "(6-4)".
+
+    Returns count of equation numbers updated.
+    """
+    import re as _re
+
+    if not number_map:
+        return 0
+
+    updated = 0
+
+    # Pattern to find equation numbers like (6-4), (1.2), etc.
+    eq_num_pat = _re.compile(r'\((\d+[\-\.]\d+)\)')
+
+    # 1. Update equation numbers in OMML <m:t> elements
+    for omath in docx_doc.element.body.iter(f'{{{_MATH_NS_RENUMBER}}}oMath'):
+        for mt in omath.iter(f'{{{_MATH_NS_RENUMBER}}}t'):
+            if mt.text:
+                m = eq_num_pat.search(mt.text)
+                if m and m.group(1) in number_map:
+                    old_num = m.group(1)
+                    new_num = number_map[old_num]
+                    mt.text = mt.text.replace(f"({old_num})", f"({new_num})")
+                    updated += 1
+                    logger.info("OMML equation number: (%s) → (%s)", old_num, new_num)
+
+    # 2. Update equation numbers in regular text runs (some DOCX files have the
+    #    equation label as a plain text run next to the oMath element)
+    for para in docx_doc.paragraphs:
+        for run in para.runs:
+            if run.text:
+                m = eq_num_pat.search(run.text)
+                if m and m.group(1) in number_map:
+                    old_num = m.group(1)
+                    new_num = number_map[old_num]
+                    run.text = run.text.replace(f"({old_num})", f"({new_num})")
+                    updated += 1
+
+    return updated
+
+
+def _renumber_captions_and_references(docx_doc, ref_type: str, number_map: dict) -> int:
+    """Renumber figure/table/equation captions and all text references in the DOCX.
+
+    ref_type: "figure", "table", or "equation"
+    number_map: {old_number: new_number} e.g. {"1-5": "1-4", "1-6": "1-5"}
+
+    Updates:
+    1. Caption paragraphs (e.g., "Figure 1-5." → "Figure 1-4.")
+    2. All text references (e.g., "see Figure 1-5" → "see Figure 1-4")
+    3. For equations: also updates OMML labels
+
+    Returns total count of replacements made.
+    """
+    import re as _re
+
+    if not number_map:
+        return 0
+
+    updated = 0
+
+    # Build regex patterns for this reference type
+    if ref_type == "figure":
+        patterns = [
+            _re.compile(rf'\b((?:Figure|Fig\.?)\s+){_re.escape(old)}\b', _re.IGNORECASE)
+            for old in number_map
+        ]
+    elif ref_type == "table":
+        patterns = [
+            _re.compile(rf'\b((?:TABLE|Table|Tbl\.?)\s+){_re.escape(old)}\b', _re.IGNORECASE)
+            for old in number_map
+        ]
+    elif ref_type == "equation":
+        patterns = [
+            _re.compile(rf'\b((?:Equation|Eq\.?)\s*\(){_re.escape(old)}(\))', _re.IGNORECASE)
+            for old in number_map
+        ]
+    else:
+        return 0
+
+    old_numbers = list(number_map.keys())
+
+    for para in docx_doc.paragraphs:
+        original_text = para.text
+        if not original_text:
+            continue
+
+        # Check if any old number exists in this paragraph
+        has_match = False
+        for old_num in old_numbers:
+            if old_num in original_text:
+                has_match = True
+                break
+        if not has_match:
+            continue
+
+        # Apply all replacements to each run
+        for run in para.runs:
+            if not run.text:
+                continue
+            new_text = run.text
+            for i, old_num in enumerate(old_numbers):
+                if old_num not in new_text:
+                    continue
+                new_num = number_map[old_num]
+                if ref_type == "equation":
+                    new_text = new_text.replace(f"({old_num})", f"({new_num})")
+                else:
+                    new_text = patterns[i].sub(rf'\g<1>{new_num}', new_text)
+            if new_text != run.text:
+                updated += 1
+                run.text = new_text
+
+    # For equations: also update OMML elements
+    if ref_type == "equation":
+        updated += _update_equation_numbers_in_omml(docx_doc, number_map)
+
+    if updated:
+        logger.info("Renumbered %d %s references: %s", updated, ref_type, number_map)
+
+    return updated
+
+
+def _build_sequential_number_map(
+    existing_numbers: list, removed_numbers: set, chapter: str = None
+) -> dict:
+    """Build a renumbering map to maintain sequential numbering after removals.
+
+    existing_numbers: sorted list of all current numbers e.g. ["1-1", "1-2", "1-3", "1-5"]
+    removed_numbers: set of numbers that were removed e.g. {"1-3"}
+
+    Returns: {old_number: new_number} only for items that need renumbering.
+    e.g. {"1-5": "1-4"} (1-3 removed, so 1-5 becomes 1-4)
+    """
+    import re as _re
+
+    if not removed_numbers:
+        return {}
+
+    # Group numbers by chapter prefix
+    chapter_groups = {}
+    num_pat = _re.compile(r'^(\d+)([\-\.])(\d+)$')
+
+    for num in existing_numbers:
+        m = num_pat.match(num)
+        if m:
+            chap = m.group(1)
+            sep = m.group(2)
+            seq = int(m.group(3))
+            chapter_groups.setdefault((chap, sep), []).append((seq, num))
+
+    number_map = {}
+    for (chap, sep), items in chapter_groups.items():
+        # Sort by sequence number
+        items.sort(key=lambda x: x[0])
+        # Filter out removed items and assign new sequential numbers
+        remaining = [(seq, num) for seq, num in items if num not in removed_numbers]
+        for new_idx, (old_seq, old_num) in enumerate(remaining, start=1):
+            new_num = f"{chap}{sep}{new_idx}"
+            if new_num != old_num:
+                number_map[old_num] = new_num
+
+    return number_map
+
+
+# ── Page Number Reference Detection & Updates ──
+
+_PAGE_REF_PATTERN = re.compile(
+    r'\b(?:'
+    r'(?:pages?|pp?\.?)\s+(\d{1,5})\s*[-–—]\s*(\d{1,5})'   # "pages 145-147", "pp. 10-15"
+    r'|(?:pages?|pp?\.?)\s+(\d{1,5})'                        # "page 145", "p. 42"
+    r'|(?:around|approximately|about|near)\s+page\s+(\d{1,5})'  # "around page 145"
+    r')\b',
+    re.IGNORECASE,
+)
+
+
+def _detect_page_references(docx_doc) -> list:
+    """Detect all hardcoded page number references in the document.
+
+    Returns list of dicts: [{paragraph_idx, text, page_numbers, raw_match}, ...]
+    """
+    refs = []
+    for idx, para in enumerate(docx_doc.paragraphs):
+        text = para.text
+        if not text:
+            continue
+        for m in _PAGE_REF_PATTERN.finditer(text):
+            pages = []
+            if m.group(1) and m.group(2):  # range
+                pages = list(range(int(m.group(1)), int(m.group(2)) + 1))
+            elif m.group(3):  # single
+                pages = [int(m.group(3))]
+            elif m.group(4):  # approximate
+                pages = [int(m.group(4))]
+
+            refs.append({
+                "paragraph_idx": idx,
+                "text": text[:80],
+                "page_numbers": pages,
+                "raw_match": m.group(0),
+                "start": m.start(),
+                "end": m.end(),
+            })
+    return refs
+
+
+def _update_page_references(docx_doc, page_offset_map: dict) -> int:
+    """Update hardcoded page number references based on an offset map.
+
+    page_offset_map: {old_page: new_page} e.g. {145: 147, 146: 148}
+
+    Returns count of references updated.
+    """
+    updated = 0
+    for para in docx_doc.paragraphs:
+        for run in para.runs:
+            if not run.text:
+                continue
+            new_text = run.text
+            changed = False
+            for m in _PAGE_REF_PATTERN.finditer(run.text):
+                if m.group(1) and m.group(2):
+                    old_start, old_end = int(m.group(1)), int(m.group(2))
+                    new_start = page_offset_map.get(old_start, old_start)
+                    new_end = page_offset_map.get(old_end, old_end)
+                    if new_start != old_start or new_end != old_end:
+                        old_str = m.group(0)
+                        new_str = old_str.replace(str(old_start), str(new_start)).replace(str(old_end), str(new_end))
+                        new_text = new_text.replace(old_str, new_str)
+                        changed = True
+                elif m.group(3):
+                    old_page = int(m.group(3))
+                    new_page = page_offset_map.get(old_page)
+                    if new_page and new_page != old_page:
+                        new_text = new_text.replace(m.group(0), m.group(0).replace(str(old_page), str(new_page)))
+                        changed = True
+                elif m.group(4):
+                    old_page = int(m.group(4))
+                    new_page = page_offset_map.get(old_page)
+                    if new_page and new_page != old_page:
+                        new_text = new_text.replace(m.group(0), m.group(0).replace(str(old_page), str(new_page)))
+                        changed = True
+            if changed:
+                run.text = new_text
+                updated += 1
+
+    if updated:
+        logger.info("Updated %d page number references", updated)
+    return updated
+
+
+# ── Headers/Footers Preservation ──
+
+def _preserve_headers_footers(source_doc, target_doc):
+    """Copy headers and footers from source DOCX to target DOCX.
+
+    This ensures headers/footers are preserved during DOCX reconstruction.
+    Copies header/footer relationships and XML parts from all sections.
+    """
+    from copy import deepcopy
+
+    try:
+        # Copy headers and footers for each section
+        for src_section, tgt_section in zip(source_doc.sections, target_doc.sections):
+            # Copy header
+            if src_section.header and src_section.header.is_linked_to_previous is False:
+                try:
+                    # Deep copy the header XML
+                    src_header_el = src_section.header._element
+                    tgt_header_el = tgt_section.header._element
+                    # Clear target header and copy source content
+                    for child in list(tgt_header_el):
+                        tgt_header_el.remove(child)
+                    for child in src_header_el:
+                        tgt_header_el.append(deepcopy(child))
+                except Exception as hdr_err:
+                    logger.debug("Header copy failed for a section: %s", hdr_err)
+
+            # Copy footer
+            if src_section.footer and src_section.footer.is_linked_to_previous is False:
+                try:
+                    src_footer_el = src_section.footer._element
+                    tgt_footer_el = tgt_section.footer._element
+                    for child in list(tgt_footer_el):
+                        tgt_footer_el.remove(child)
+                    for child in src_footer_el:
+                        tgt_footer_el.append(deepcopy(child))
+                except Exception as ftr_err:
+                    logger.debug("Footer copy failed for a section: %s", ftr_err)
+
+            # Preserve page layout settings from source
+            try:
+                src_sectPr = src_section._sectPr
+                tgt_sectPr = tgt_section._sectPr
+                # Copy page size
+                for tag in ['pgSz', 'pgMar', 'cols', 'docGrid']:
+                    src_el = src_sectPr.find(f'{{{_W_NS}}}{tag}')
+                    tgt_el = tgt_sectPr.find(f'{{{_W_NS}}}{tag}')
+                    if src_el is not None:
+                        if tgt_el is not None:
+                            tgt_sectPr.remove(tgt_el)
+                        tgt_sectPr.append(deepcopy(src_el))
+            except Exception as layout_err:
+                logger.debug("Page layout copy failed: %s", layout_err)
+
+        logger.info("Headers/footers preserved across %d sections", len(source_doc.sections))
+    except Exception as e:
+        logger.warning("Headers/footers preservation failed (non-fatal): %s", e)
 
 
 def _build_tracked_changes_docx(original_path: str, approved_patches: list, output_path: str):
@@ -3341,12 +3879,15 @@ async def export_tracked_docx(session_id: str, token: Optional[str] = None, requ
             tracked_doc = DocxDocument(output_path)
             media_applied = 0
 
-            # Figures
+            # Figures: replace images + update captions
             approved_figures = [m for m in approved_media if m.get("type") == "figure"]
             if approved_figures:
                 fig_count = await _apply_figure_replacements_to_docx(tracked_doc, approved_figures)
                 media_applied += fig_count
                 logger.info("EXPORT tracked-docx: replaced %d figures", fig_count)
+                cap_count = _update_figure_captions_in_docx(tracked_doc, approved_figures)
+                if cap_count:
+                    logger.info("EXPORT tracked-docx: updated %d figure captions", cap_count)
 
             # Equations
             approved_equations = [m for m in approved_media if m.get("type") == "equation"]
@@ -3355,12 +3896,22 @@ async def export_tracked_docx(session_id: str, token: Optional[str] = None, requ
                 media_applied += eq_count
                 logger.info("EXPORT tracked-docx: replaced %d equations", eq_count)
 
-            # Tables
+            # Tables: update cells + captions
             approved_tables = [m for m in approved_media if m.get("type") == "table"]
             if approved_tables:
                 tbl_count = _apply_table_updates_to_docx(tracked_doc, approved_tables)
                 media_applied += tbl_count
                 logger.info("EXPORT tracked-docx: updated %d tables", tbl_count)
+                tcap_count = _update_table_captions_in_docx(tracked_doc, approved_tables)
+                if tcap_count:
+                    logger.info("EXPORT tracked-docx: updated %d table captions", tcap_count)
+
+            # Headers/footers: preserve from original
+            try:
+                original_doc = DocxDocument(original_path)
+                _preserve_headers_footers(original_doc, tracked_doc)
+            except Exception as hf_err:
+                logger.debug("Headers/footers preservation skipped: %s", hf_err)
 
             if media_applied > 0:
                 tracked_doc.save(output_path)
@@ -4176,6 +4727,17 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
                 analysis_item["reason"] = analysis_item.get("reason") or (
                     f"Missing space after \\{cmd} makes the command invalid."
                 )
+
+        # ── Filter out no-op suggestions (suggested_update == original) ──
+        suggested = analysis_item.get("suggested_update", "")
+        original_normalized = eq["readable_text"].strip().replace(" ", "")
+        suggested_normalized = suggested.strip().replace(" ", "") if suggested else ""
+        if category == "formatting" and (
+            not suggested
+            or suggested_normalized == original_normalized
+        ):
+            category = "ok"
+            logger.info("Equation %d: suggestion identical to original — downgraded to ok", eq_num)
 
         # is_outdated = True ONLY for mathematically wrong / deprecated notation
         is_outdated = category == "outdated"
