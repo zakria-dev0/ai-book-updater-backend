@@ -9,6 +9,7 @@ import shutil
 import os
 import re
 import subprocess
+import base64
 
 from app.core.security import get_current_user_dep, verify_download_token, decode_token
 from app.database.connection import get_database
@@ -104,6 +105,14 @@ class PatchReviewRequest(BaseModel):
 class DatedStatementResolveRequest(BaseModel):
     statement_id: str
     resolution: str  # "still_current", "flag_for_patch", "acceptable"
+
+
+class CreateCustomIssueRequest(BaseModel):
+    title: str
+    find_text: str
+    replace_with: str
+    scope: str = "whole_document"  # "whole_document" or section name
+    severity: str = "medium"  # "high", "medium", "low"
 
 
 class ResetToStepRequest(BaseModel):
@@ -867,7 +876,7 @@ async def _run_diagnostic_task(session_id: str, session: dict, doc: dict):
             rule_lines.append(f"- Do NOT flag issues in these sections: {', '.join(rules['preserve_sections'])}.")
         rules_block = "\n".join(rule_lines)
 
-        system_msg = "You are a meticulous document auditor. Your job is to find EVERY sentence that contains potentially outdated information, stale references, temporal language, or changed real-world status. Be extremely thorough — missing an issue is worse than flagging one that turns out to be fine. Return only valid JSON."
+        system_msg = "You are a meticulous document auditor. Your job is to find EVERY sentence that contains potentially outdated information, stale references, temporal language, or changed real-world status. Be extremely thorough — missing an issue is worse than flagging one that turns out to be fine. IMPORTANT: Never spell out Greek letters — always preserve the original symbols (Δ, α, β, θ, Σ, etc.) and subscript/superscript notation exactly as written. Return only valid JSON."
 
         # Delete old opportunities for re-run
         await session_repo.delete_opportunities(session_id)
@@ -1049,6 +1058,52 @@ async def select_opportunities(
     }
 
 
+# ── Custom Issue Creation ─────────────────────────────────────────────────────
+
+@router.post("/{session_id}/custom-issue")
+async def create_custom_issue(
+    session_id: str,
+    req: CreateCustomIssueRequest,
+    user=Depends(get_current_user_dep),
+):
+    """Create a custom issue (find-and-replace) added manually by the user."""
+    db = get_database()
+    session_repo = SessionRepository(db)
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    custom_opp = {
+        "opportunity_id": str(uuid.uuid4())[:8],
+        "session_id": session_id,
+        "section_ref": req.scope if req.scope != "whole_document" else "Whole Document",
+        "original_sentence": req.find_text,
+        "issue_type": "custom_replacement",
+        "severity": req.severity,
+        "confidence": 1.0,
+        "brief_reason": req.title,
+        "selected": True,
+        "is_custom": True,
+        "replace_with": req.replace_with,
+        "scope": req.scope,
+    }
+
+    await session_repo.create_opportunities([custom_opp])
+    logger.info("Custom issue created for session %s: '%s' → '%s'",
+                session_id, req.find_text[:50], req.replace_with[:50])
+
+    # Remove MongoDB _id (ObjectId) before returning — FastAPI can't serialize it
+    custom_opp.pop("_id", None)
+
+    return {
+        "session_id": session_id,
+        "opportunity": custom_opp,
+        "message": "Custom issue created successfully.",
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 5: RESEARCH PLANNING
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1111,6 +1166,22 @@ async def _plan_research_task(session_id: str, session: dict):
         plans = []
         for opp in selected:
             opp_id = opp.get("opportunity_id", opp.get("id", ""))
+
+            # Custom issues skip GPT research — auto-create a plan marked approved
+            if opp.get("is_custom"):
+                plans.append({
+                    "plan_id": str(uuid.uuid4())[:8],
+                    "opportunity_id": opp_id,
+                    "session_id": session_id,
+                    "search_queries": [],
+                    "target_sources": [],
+                    "facts_to_verify": [f"Custom replacement: '{opp.get('original_sentence', '')}' → '{opp.get('replace_with', '')}'"],
+                    "approved": True,
+                    "is_custom": True,
+                    "replace_with": opp.get("replace_with", ""),
+                })
+                continue
+
             prompt = f"""Given this outdated claim from a technical document:
 Claim: "{opp.get('original_sentence', '')}"
 Issue: {opp.get('brief_reason', '')}
@@ -1514,6 +1585,27 @@ async def _generate_patches_task(session_id: str, session: dict):
         async def _generate_one_patch(opp):
             """Generate a single patch for one opportunity — runs in parallel."""
             opp_id = opp.get("opportunity_id", opp.get("id", ""))
+
+            # Custom issues: create patch directly without GPT — user already provided replacement
+            if opp.get("is_custom"):
+                return {
+                    "patch_id": str(uuid.uuid4())[:8],
+                    "opportunity_id": opp_id,
+                    "session_id": session_id,
+                    "original_sentence": opp.get("original_sentence", ""),
+                    "revised_sentence": opp.get("replace_with", ""),
+                    "citation": "Manual replacement by editor",
+                    "rationale": opp.get("brief_reason", "Custom find-and-replace"),
+                    "confidence": 1.0,
+                    "change_pct": 100,
+                    "status": PatchStatus.PENDING.value,
+                    "editor_revision": None,
+                    "reviewed_at": None,
+                    "section_ref": opp.get("section_ref", ""),
+                    "is_custom": True,
+                    "scope": opp.get("scope", "whole_document"),
+                }
+
             accepted_evidence = await session_repo.find_accepted_evidence_for_opportunity(opp_id)
 
             if not accepted_evidence and all_accepted_evidence:
@@ -1560,7 +1652,7 @@ Return ONLY valid JSON. No other text."""
                 response = await client.chat.completions.create(
                     model=settings.GPT_MODEL,
                     messages=[
-                        {"role": "system", "content": "You are a precise technical editor. Write concise, accurate replacement sentences that update outdated information while preserving the document's style."},
+                        {"role": "system", "content": "You are a precise technical editor. Write concise, accurate replacement sentences that update outdated information while preserving the document's style. CRITICAL: Never spell out Greek letters — always use the original symbols (Δ, α, β, θ, Σ, π, etc.). Never convert subscripts/superscripts to plain text (keep v₁ not v1, Δv not Delta v)."},
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.3,
@@ -1844,7 +1936,7 @@ Return ONLY valid JSON. No other text."""
         response = await client.chat.completions.create(
             model=settings.GPT_MODEL,
             messages=[
-                {"role": "system", "content": "You are a precise technical editor. Generate accurate, well-cited content that matches the document's style."},
+                {"role": "system", "content": "You are a precise technical editor. Generate accurate, well-cited content that matches the document's style. CRITICAL: Never spell out Greek letters — always use the original symbols (Δ, α, β, θ, Σ, π, etc.). Never convert subscripts/superscripts to plain text (keep v₁ not v1, Δv not Delta v)."},
                 {"role": "user", "content": prompt_text},
             ],
             temperature=0.3,
@@ -2056,13 +2148,35 @@ async def apply_patches(
                     skipped += 1
                     continue
 
+                # Custom patches with whole_document scope: replace ALL occurrences
+                replace_all = patch.get("is_custom") and patch.get("scope") == "whole_document"
+
                 found = False
+                replace_count = 0
                 for para in docx_doc.paragraphs:
                     if original_text in para.text:
-                        _replace_text_in_paragraph(para, original_text, final_text)
+                        _replace_text_in_paragraph(para, original_text, final_text, replace_all_in_para=replace_all)
                         found = True
-                        applied += 1
-                        break
+                        replace_count += 1
+                        if not replace_all:
+                            applied += 1
+                            break
+
+                # Also search in table cells for whole-document custom patches
+                if replace_all:
+                    for table in docx_doc.tables:
+                        for row in table.rows:
+                            for cell in row.cells:
+                                for para in cell.paragraphs:
+                                    if original_text in para.text:
+                                        _replace_text_in_paragraph(para, original_text, final_text, replace_all_in_para=True)
+                                        found = True
+                                        replace_count += 1
+
+                if replace_all and found:
+                    applied += 1
+                    logger.info("Custom replace-all: '%s' → '%s' in %d paragraphs",
+                                original_text[:40], final_text[:40], replace_count)
 
                 if not found:
                     skipped += 1
@@ -2086,7 +2200,7 @@ async def apply_patches(
                     docx_doc = DocxDocument(working_path)
                     media_applied = 0
 
-                    # ── Figures: replace images + update captions ──
+                    # ── Figures: replace images + update captions + add source URLs ──
                     approved_figures = [m for m in approved_media if m.get("type") == "figure"]
                     if approved_figures:
                         fig_count = await _apply_figure_replacements_to_docx(docx_doc, approved_figures)
@@ -2094,6 +2208,9 @@ async def apply_patches(
                         cap_count = _update_figure_captions_in_docx(docx_doc, approved_figures)
                         if cap_count:
                             logger.info("Updated %d figure captions", cap_count)
+                        src_count = _add_figure_source_urls(docx_doc, approved_figures)
+                        if src_count:
+                            logger.info("Added %d figure source URLs", src_count)
 
                     # ── Equations: apply OMML fixes ──
                     approved_equations = [m for m in approved_media if m.get("type") == "equation"]
@@ -2105,9 +2222,9 @@ async def apply_patches(
                     # ── Tables: apply cell updates + update captions ──
                     approved_tables = [m for m in approved_media if m.get("type") == "table"]
                     if approved_tables:
-                        tbl_count = _apply_table_updates_to_docx(docx_doc, approved_tables)
+                        tbl_count = _apply_table_updates_to_docx(docx_doc, approved_tables, highlight=False)
                         media_applied += tbl_count
-                        logger.info("Applied %d table updates", tbl_count)
+                        logger.info("Applied %d table updates (clean, no highlight)", tbl_count)
                         tcap_count = _update_table_captions_in_docx(docx_doc, approved_tables)
                         if tcap_count:
                             logger.info("Updated %d table captions", tcap_count)
@@ -2159,14 +2276,21 @@ async def apply_patches(
     }
 
 
-def _replace_text_in_paragraph(paragraph, old_text: str, new_text: str):
-    """Replace text in a paragraph while preserving run formatting."""
+def _replace_text_in_paragraph(paragraph, old_text: str, new_text: str, replace_all_in_para: bool = False):
+    """Replace text in a paragraph while preserving run formatting.
+
+    When replace_all_in_para=True, replaces ALL occurrences within this paragraph.
+    Otherwise, only replaces the first occurrence.
+    """
     # Join all runs to get full text
     full_text = "".join(run.text for run in paragraph.runs)
     if old_text not in full_text:
         return
 
-    new_full = full_text.replace(old_text, new_text, 1)
+    if replace_all_in_para:
+        new_full = full_text.replace(old_text, new_text)
+    else:
+        new_full = full_text.replace(old_text, new_text, 1)
 
     # Put all text in first run, clear the rest
     if paragraph.runs:
@@ -2443,6 +2567,13 @@ def _is_junk_equation_text(latex: str, omml_xml: str = "") -> bool:
     if len(parts) >= 15 and all(len(p) <= 2 for p in parts):
         return True
 
+    # 8. Trivial inline math — no relational operator and too short to be a real formula
+    # Catches standalone symbols like Δv, μ, V∞, R_{SOI}, single variables with subscripts
+    clean = _re.sub(r'\\(?:text|mathrm|mathbf)\{([^}]*)\}', r'\1', stripped).replace(' ', '')
+    has_relation = bool(_re.search(r'[=<>≤≥≈≠]|\\(?:eq|leq|geq|neq|approx|sim|equiv|le|ge)', stripped))
+    if not has_relation and len(clean) < 30:
+        return True
+
     return False
 
 
@@ -2476,6 +2607,49 @@ async def _apply_figure_replacements_to_docx(docx_doc, approved_figures: list):
         if not r_embed or r_embed not in docx_doc.part.rels:
             logger.warning("Figure replacement: r_embed=%s not found in DOCX rels", r_embed)
             continue
+
+        # ── Handle user-uploaded local images ──
+        if sel.get("is_user_upload") and sel.get("local_path"):
+            local_path = sel["local_path"]
+            if os.path.exists(local_path):
+                try:
+                    with open(local_path, "rb") as lf:
+                        local_bytes = lf.read()
+
+                    rel = docx_doc.part.rels[r_embed]
+                    orig_content_type = rel.target_part.content_type or ""
+                    target_format = "PNG"
+                    if "jpeg" in orig_content_type or "jpg" in orig_content_type:
+                        target_format = "JPEG"
+                    elif "gif" in orig_content_type:
+                        target_format = "GIF"
+
+                    orig_cx = mp.get("original_cx", 0)
+                    orig_cy = mp.get("original_cy", 0)
+
+                    new_img = PILImage.open(BytesIO(local_bytes))
+                    if orig_cx > 0 and orig_cy > 0:
+                        dpi = 150
+                        target_w = max(1, int(orig_cx / 914400 * dpi))
+                        target_h = max(1, int(orig_cy / 914400 * dpi))
+                        src_w, src_h = new_img.size
+                        if src_w > target_w or src_h > target_h:
+                            new_img = new_img.resize((target_w, target_h), PILImage.LANCZOS)
+
+                    if new_img.mode in ("RGBA", "P") and target_format == "JPEG":
+                        new_img = new_img.convert("RGB")
+
+                    buf = BytesIO()
+                    new_img.save(buf, format=target_format, quality=95)
+                    buf.seek(0)
+                    rel.target_part._blob = buf.read()
+                    replaced += 1
+                    logger.info("Figure replacement (user upload): r_embed=%s replaced from %s", r_embed, local_path)
+                    continue
+                except Exception as local_err:
+                    logger.warning("Figure replacement: failed to read local file %s: %s", local_path, local_err)
+            else:
+                logger.warning("Figure replacement: local file not found: %s", local_path)
 
         # Build ordered list of URLs to try: selected url, thumbnail, then other candidates
         urls_to_try = []
@@ -2770,12 +2944,39 @@ def _apply_known_fixes_to_omml(omath_el, eq_patch: dict, math_ns: str):
                 if fixed != text:
                     t_elem.text = fixed
 
+    # Fix 3: Greek letter preservation — convert any spelled-out Greek names back to symbols
+    # This catches cases where GPT's suggested update accidentally used English names
+    _GREEK_NAME_TO_SYMBOL = {
+        'Alpha': 'Α', 'Beta': 'Β', 'Gamma': 'Γ', 'Delta': 'Δ', 'Epsilon': 'Ε',
+        'Zeta': 'Ζ', 'Eta': 'Η', 'Theta': 'Θ', 'Iota': 'Ι', 'Kappa': 'Κ',
+        'Lambda': 'Λ', 'Mu': 'Μ', 'Nu': 'Ν', 'Xi': 'Ξ', 'Pi': 'Π',
+        'Rho': 'Ρ', 'Sigma': 'Σ', 'Tau': 'Τ', 'Upsilon': 'Υ', 'Phi': 'Φ',
+        'Chi': 'Χ', 'Psi': 'Ψ', 'Omega': 'Ω',
+        'alpha': 'α', 'beta': 'β', 'gamma': 'γ', 'delta': 'δ', 'epsilon': 'ε',
+        'zeta': 'ζ', 'eta': 'η', 'theta': 'θ', 'iota': 'ι', 'kappa': 'κ',
+        'lambda': 'λ', 'mu': 'μ', 'nu': 'ν', 'xi': 'ξ', 'pi': 'π',
+        'rho': 'ρ', 'sigma': 'σ', 'tau': 'τ', 'upsilon': 'υ', 'phi': 'φ',
+        'chi': 'χ', 'psi': 'ψ', 'omega': 'ω',
+    }
+    t_elements = omath_el.findall(f'.//{{{math_ns}}}t')
+    for t_elem in t_elements:
+        if t_elem.text:
+            text = t_elem.text
+            for name, symbol in _GREEK_NAME_TO_SYMBOL.items():
+                # Only replace standalone words (not substrings of other words)
+                import re as _re_greek
+                text = _re_greek.sub(r'\b' + name + r'\b', symbol, text)
+            if text != t_elem.text:
+                logger.debug("Greek letter fix in OMML: '%s' → '%s'", t_elem.text, text)
+                t_elem.text = text
 
-def _apply_table_updates_to_docx(docx_doc, approved_tables: list) -> int:
+
+def _apply_table_updates_to_docx(docx_doc, approved_tables: list, highlight: bool = True) -> int:
     """Apply approved table cell updates to a DOCX document.
 
     Finds tables by their original DOCX index and updates specific cells.
-    Adds light blue highlighting to changed cells for visibility.
+    When highlight=True, adds light blue highlighting to changed cells for visibility.
+    When highlight=False (clean document), no color is applied.
     Handles merged cells by searching for old_value text across all cells in the row.
     Returns count of tables updated.
     """
@@ -2786,6 +2987,8 @@ def _apply_table_updates_to_docx(docx_doc, approved_tables: list) -> int:
 
     def _highlight_cell(cell, hex_color=LIGHT_BLUE):
         """Add background shading (light blue) to a table cell."""
+        if not highlight:
+            return
         tc = cell._element
         tcPr = tc.find(qn('w:tcPr'))
         if tcPr is None:
@@ -2801,7 +3004,7 @@ def _apply_table_updates_to_docx(docx_doc, approved_tables: list) -> int:
         tcPr.append(shd)
 
     def _set_cell_text_preserve_format(cell, new_val: str):
-        """Set cell text while preserving formatting, then highlight."""
+        """Set cell text while preserving formatting, then optionally highlight."""
         if cell.paragraphs:
             first_para = cell.paragraphs[0]
             # Clear all runs
@@ -2820,7 +3023,7 @@ def _apply_table_updates_to_docx(docx_doc, approved_tables: list) -> int:
         else:
             cell.text = new_val
 
-        # Apply light blue highlight
+        # Apply light blue highlight only for tracked documents
         _highlight_cell(cell)
 
     updated = 0
@@ -2903,6 +3106,212 @@ def _apply_table_updates_to_docx(docx_doc, approved_tables: list) -> int:
 
 _W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 _MATH_NS_RENUMBER = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+
+
+def _add_figure_source_urls(docx_doc, approved_figures: list) -> int:
+    """Add 'Source: <clickable URL>' annotation below the caption of each replaced figure.
+
+    Finds the caption paragraph near the replaced figure and inserts a new
+    paragraph right after it with a clickable hyperlink to the source page.
+    Uses source_page_url (full webpage) when available, falls back to image URL.
+    Returns count of source annotations added.
+    """
+    import re as _re
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from copy import deepcopy
+
+    fig_caption_pat = _re.compile(
+        r'(?:Figure|Fig\.?)\s+\d+[\-\.]\d+',
+        _re.IGNORECASE,
+    )
+
+    added = 0
+    R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+
+    for mp in approved_figures:
+        sel = mp.get("selected_replacement")
+        if not sel:
+            continue
+
+        # Only use the source page URL (full website), never the raw image URL
+        source_page = sel.get("source_page_url") or ""
+        source_name = sel.get("source") or "Web"
+
+        # SAFETY: Reject any URL that is actually a raw image file
+        _img_exts = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.tiff', '.ico')
+        if source_page:
+            from urllib.parse import urlparse as _urlparse_check
+            _path_check = _urlparse_check(source_page).path.lower()
+            if any(_path_check.endswith(ext) for ext in _img_exts):
+                logger.warning("Blocked image URL from appearing as source: %s", source_page[:100])
+                source_page = ""
+
+        if not source_page:
+            # No valid source page available — skip adding source annotation
+            continue
+        display_url = source_page
+        link_url = source_page
+
+        r_embed = mp.get("r_embed")
+        if not r_embed:
+            continue
+
+        # Find paragraph containing this figure's drawing
+        fig_para_idx = None
+        for idx, para in enumerate(docx_doc.paragraphs):
+            drawings = para._element.findall(f'.//{{{_W_NS}}}drawing')
+            for drawing in drawings:
+                blip = drawing.find(f'.//{{{A_NS}}}blip')
+                if blip is not None and blip.get(f'{{{R_NS}}}embed') == r_embed:
+                    fig_para_idx = idx
+                    break
+            if fig_para_idx is not None:
+                break
+
+        if fig_para_idx is None:
+            continue
+
+        # Find caption paragraph near the figure (up to 3 before/after)
+        total_paras = len(docx_doc.paragraphs)
+        search_range = list(range(max(0, fig_para_idx - 3), min(total_paras, fig_para_idx + 4)))
+
+        caption_para = None
+        for check_idx in search_range:
+            para = docx_doc.paragraphs[check_idx]
+            text = para.text.strip()
+            if fig_caption_pat.match(text):
+                caption_para = para
+                break
+
+        # If no caption found, use the figure paragraph itself
+        if caption_para is None:
+            caption_para = docx_doc.paragraphs[fig_para_idx]
+
+        # ── Build run formatting (italic, 8pt, gray) ──
+        def _make_styled_rPr():
+            rPr = OxmlElement('w:rPr')
+            i_el = OxmlElement('w:i')
+            i_el.set(qn('w:val'), 'true')
+            rPr.append(i_el)
+            sz = OxmlElement('w:sz')
+            sz.set(qn('w:val'), '16')  # 8pt
+            rPr.append(sz)
+            szCs = OxmlElement('w:szCs')
+            szCs.set(qn('w:val'), '16')
+            rPr.append(szCs)
+            color_el = OxmlElement('w:color')
+            color_el.set(qn('w:val'), '666666')
+            rPr.append(color_el)
+            return rPr
+
+        # ── Create paragraph ──
+        new_p = OxmlElement('w:p')
+
+        # Copy paragraph alignment from caption
+        caption_pPr = caption_para._element.find(qn('w:pPr'))
+        if caption_pPr is not None:
+            new_pPr = deepcopy(caption_pPr)
+            new_p.append(new_pPr)
+
+        # ── "Source: " label (plain italic text) ──
+        label_run = OxmlElement('w:r')
+        label_run.append(_make_styled_rPr())
+        label_t = OxmlElement('w:t')
+        label_t.set(qn('xml:space'), 'preserve')
+        label_t.text = f"Source ({source_name}): "
+        label_run.append(label_t)
+        new_p.append(label_run)
+
+        # ── Clickable hyperlink ──
+        # Add external hyperlink relationship directly via the document part
+        HYPERLINK_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
+        r_id = docx_doc.part.rels._next_rId if hasattr(docx_doc.part.rels, '_next_rId') else f"rId{len(docx_doc.part.rels) + 100}"
+        try:
+            # python-docx >=0.8.11 approach
+            docx_doc.part.relate_to(link_url, HYPERLINK_REL_TYPE, is_external=True)
+            # Get the rId that was just created
+            for rel_key, rel_val in docx_doc.part.rels.items():
+                if rel_val.target_ref == link_url and rel_val.is_external:
+                    r_id = rel_key
+                    break
+        except Exception:
+            try:
+                # Fallback: add_relationship directly
+                docx_doc.part.rels.add_relationship(
+                    HYPERLINK_REL_TYPE, link_url, r_id, is_external=True
+                )
+            except Exception as rel_err:
+                logger.warning("Failed to create hyperlink relationship: %s", rel_err)
+                # Last resort: just add as plain text
+                plain_run = OxmlElement('w:r')
+                plain_run.append(_make_styled_rPr())
+                plain_t = OxmlElement('w:t')
+                plain_t.set(qn('xml:space'), 'preserve')
+                plain_t.text = display_url
+                plain_run.append(plain_t)
+                new_p.append(plain_run)
+                caption_para._element.addnext(new_p)
+                added += 1
+                continue
+
+        # Create w:hyperlink element with the relationship ID
+        hyperlink = OxmlElement('w:hyperlink')
+        hyperlink.set(qn('r:id'), r_id)
+        # Also set w:history for Word to track it as visited
+        hyperlink.set(qn('w:history'), '1')
+
+        # Hyperlink run — blue underlined clickable text
+        link_run = OxmlElement('w:r')
+        link_rPr = OxmlElement('w:rPr')
+
+        # Hyperlink style (this is what makes Word treat it as clickable)
+        rStyle = OxmlElement('w:rStyle')
+        rStyle.set(qn('w:val'), 'Hyperlink')
+        link_rPr.append(rStyle)
+
+        # Italic
+        i_el = OxmlElement('w:i')
+        i_el.set(qn('w:val'), 'true')
+        link_rPr.append(i_el)
+
+        # Font size 8pt
+        sz = OxmlElement('w:sz')
+        sz.set(qn('w:val'), '16')
+        link_rPr.append(sz)
+        szCs = OxmlElement('w:szCs')
+        szCs.set(qn('w:val'), '16')
+        link_rPr.append(szCs)
+
+        # Blue color for hyperlink
+        color_el = OxmlElement('w:color')
+        color_el.set(qn('w:val'), '0563C1')
+        link_rPr.append(color_el)
+
+        # Underline (single)
+        u_el = OxmlElement('w:u')
+        u_el.set(qn('w:val'), 'single')
+        link_rPr.append(u_el)
+
+        link_run.append(link_rPr)
+
+        link_t = OxmlElement('w:t')
+        link_t.set(qn('xml:space'), 'preserve')
+        link_t.text = display_url
+        link_run.append(link_t)
+
+        hyperlink.append(link_run)
+        new_p.append(hyperlink)
+
+        # Insert the new paragraph right after the caption paragraph
+        caption_para._element.addnext(new_p)
+
+        added += 1
+        logger.info("Added source URL below caption near para %d: %s (page: %s)",
+                    fig_para_idx, source_name, display_url[:100])
+
+    return added
 
 
 def _update_figure_captions_in_docx(docx_doc, approved_figures: list) -> int:
@@ -3397,6 +3806,7 @@ def _build_tracked_changes_docx(original_path: str, approved_patches: list, outp
 
     regular_applied = 0
     ai_applied = 0
+    regular_patches = []  # collect for grouped-per-paragraph application
 
     for patch in approved_patches:
         final_text = patch.get("editor_revision") or patch.get("revised_sentence", "")
@@ -3412,12 +3822,10 @@ def _build_tracked_changes_docx(original_path: str, approved_patches: list, outp
                 para_text = ask_ai_meta.get("paragraph_text", "").strip()
                 para_idx = ask_ai_meta.get("paragraph_index", -1)
 
-                # Find target: paragraph-level or section-level
                 target_element = None
                 ref_para = None
 
                 if para_text and para_idx >= 0:
-                    # Try paragraph-level targeting
                     found_idx = None
                     if para_idx < len(docx_doc.paragraphs) and para_text[:50] in docx_doc.paragraphs[para_idx].text:
                         found_idx = para_idx
@@ -3461,21 +3869,83 @@ def _build_tracked_changes_docx(original_path: str, approved_patches: list, outp
                 original_text = patch.get("original_sentence", "")
                 if not original_text or not final_text:
                     continue
-
-                found = False
-                for para in docx_doc.paragraphs:
-                    if original_text in para.text:
-                        _apply_visual_diff_to_paragraph(para, original_text, final_text)
-                        found = True
-                        regular_applied += 1
-                        logger.info("TRACKED: regular patch applied (red/green) for '%s...'", original_text[:40])
-                        break
-
-                if not found:
-                    logger.warning("TRACKED: original text not found: '%s...'", original_text[:50])
+                regular_patches.append({
+                    "original_text": original_text,
+                    "final_text": final_text,
+                    "is_custom": patch.get("is_custom"),
+                    "scope": patch.get("scope"),
+                    "patch_id": patch.get("patch_id"),
+                })
 
         except Exception as e:
             logger.error("TRACKED: patch failed (patch_id=%s): %s", patch.get("patch_id"), e)
+
+    # ── Apply regular patches grouped by paragraph (single pass per paragraph) ──
+    # This prevents multiple patches on the same paragraph from corrupting each other
+    def _all_paragraphs(doc):
+        for p in doc.paragraphs:
+            yield p
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        yield p
+
+    applied_patch_ids = set()
+    for para in _all_paragraphs(docx_doc):
+        para_text = para.text or ""
+        if not para_text:
+            continue
+
+        # Find ALL patches that match this paragraph
+        matches = []
+        for rp in regular_patches:
+            old_t = rp["original_text"]
+            replace_all = rp.get("is_custom") and rp.get("scope") == "whole_document"
+            pid = rp.get("patch_id", "")
+
+            # Skip non-custom patches already applied to a previous paragraph
+            if not replace_all and pid in applied_patch_ids:
+                continue
+
+            if old_t in para_text:
+                if replace_all:
+                    search_start = 0
+                    while True:
+                        idx = para_text.find(old_t, search_start)
+                        if idx == -1:
+                            break
+                        matches.append((idx, old_t, rp["final_text"]))
+                        search_start = idx + len(old_t)
+                else:
+                    idx = para_text.index(old_t)
+                    matches.append((idx, old_t, rp["final_text"]))
+                    applied_patch_ids.add(pid)
+
+        if not matches:
+            continue
+
+        # Sort by position, remove overlaps
+        matches.sort(key=lambda m: m[0])
+        filtered = []
+        last_end = 0
+        for start, old_t, new_t in matches:
+            if start >= last_end:
+                filtered.append((start, old_t, new_t))
+                last_end = start + len(old_t)
+        matches = filtered
+
+        # Apply all matches in a single pass
+        _apply_multi_visual_diff_to_paragraph(para, matches)
+        regular_applied += len(matches)
+        for _, old_t, _ in matches:
+            logger.info("TRACKED: patch applied (strikethrough/green) for '%s...'", old_t[:40])
+
+    # Log patches that were not found
+    for rp in regular_patches:
+        pid = rp.get("patch_id", "")
+        if pid and pid not in applied_patch_ids and not (rp.get("is_custom") and rp.get("scope") == "whole_document"):
+            logger.warning("TRACKED: original text not found: '%s...'", rp["original_text"][:50])
 
     docx_doc.save(output_path)
     logger.info("TRACKED: visual diff DOCX saved — %d regular, %d AI patches applied", regular_applied, ai_applied)
@@ -3526,50 +3996,119 @@ def _make_highlighted_paragraph_xml(ref_para, text: str, highlight_color: str):
 def _apply_visual_diff_to_paragraph(para, old_text: str, new_text: str):
     """Apply visual diff: original in red strikethrough+red highlight, new in green highlight.
     All visible directly — no Review tab needed.
+
+    Uses para.text (which captures ALL text including hyperlinks, field codes, etc.)
+    rather than just para.runs to correctly locate the old text position.
+    Then walks the actual XML child elements (w:r, w:hyperlink, etc.) to split
+    runs at the exact boundaries of the matched text.
     """
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
     from copy import deepcopy
 
-    full_text = "".join(run.text for run in para.runs)
+    # Use para.text which captures text from ALL child elements, not just runs
+    full_text = para.text or ""
     if old_text not in full_text:
         return
 
-    start_idx = full_text.index(old_text)
-    end_idx = start_idx + len(old_text)
+    # ── Collect ALL text-bearing elements with their character offsets ──
+    def _get_run_text(r_elem):
+        """Get concatenated text from all w:t children of a run."""
+        parts = []
+        for t in r_elem.findall(qn("w:t")):
+            parts.append(t.text or "")
+        return "".join(parts)
 
-    before_text = full_text[:start_idx]
-    after_text = full_text[end_idx:]
+    def _get_elem_rPr(r_elem):
+        """Get run properties from a run element."""
+        rPr = r_elem.find(qn("w:rPr"))
+        return deepcopy(rPr) if rPr is not None else None
 
-    # Get original run formatting
-    orig_rPr = None
-    if para.runs:
-        orig_rPr_elem = para.runs[0]._element.find(qn("w:rPr"))
-        if orig_rPr_elem is not None:
-            orig_rPr = deepcopy(orig_rPr_elem)
+    # Build a flat list: each entry is (xml_element, text, char_offset)
+    # This handles w:r (runs), w:hyperlink > w:r, etc.
+    text_runs = []
+    char_offset = 0
+    for child in list(para._element):
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag == "r":
+            t = _get_run_text(child)
+            if t:
+                text_runs.append({"elem": child, "text": t, "offset": char_offset, "rPr": _get_elem_rPr(child)})
+                char_offset += len(t)
+        elif tag == "hyperlink":
+            for sub_r in child.findall(qn("w:r")):
+                t = _get_run_text(sub_r)
+                if t:
+                    text_runs.append({"elem": sub_r, "parent": child, "text": t, "offset": char_offset, "rPr": _get_elem_rPr(sub_r)})
+                    char_offset += len(t)
 
-    # Clear all existing runs
-    for run in list(para.runs):
-        run._element.getparent().remove(run._element)
+    # Verify the reconstructed text matches what we expect
+    reconstructed = "".join(tr["text"] for tr in text_runs)
 
-    def make_run_with_text(text, rPr_source=None):
+    # If our reconstruction doesn't contain the old_text, try a simpler fallback
+    if old_text not in reconstructed:
+        # Fallback: use para.text directly
+        reconstructed = full_text
+
+    # If still no match in reconstructed, give up
+    if old_text not in reconstructed:
+        return
+
+    # Recalculate start/end based on reconstructed text
+    r_start = reconstructed.index(old_text)
+    r_end = r_start + len(old_text)
+
+    # Get default formatting from the first run
+    default_rPr = None
+    if text_runs:
+        default_rPr = text_runs[0].get("rPr")
+
+    def make_run(text, rPr_source=None):
         r = OxmlElement("w:r")
         if rPr_source:
             r.append(deepcopy(rPr_source))
         else:
             r.append(OxmlElement("w:rPr"))
-        t = OxmlElement("w:t")
-        t.set(qn("xml:space"), "preserve")
-        t.text = text
-        r.append(t)
+        t_elem = OxmlElement("w:t")
+        t_elem.set(qn("xml:space"), "preserve")
+        t_elem.text = text
+        r.append(t_elem)
         return r
 
-    # 1. Unchanged text before
-    if before_text:
-        para._element.append(make_run_with_text(before_text, orig_rPr))
+    # ── Remove all text-bearing children from the paragraph ──
+    # Keep non-text elements like w:pPr (paragraph properties), w:bookmarkStart, etc.
+    for child in list(para._element):
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag in ("r", "hyperlink", "smartTag", "fldSimple"):
+            para._element.remove(child)
 
-    # 2. Original text — strikethrough only (no red color/highlight)
-    old_run = make_run_with_text(old_text, orig_rPr)
+    # ── Rebuild the paragraph with the visual diff ──
+    before_text = reconstructed[:r_start]
+    after_text = reconstructed[r_end:]
+
+    # 1. Unchanged text before — preserve per-run formatting where possible
+    if before_text:
+        # Try to reconstruct with original per-run formatting
+        pos = 0
+        for tr in text_runs:
+            tr_start = tr["offset"]
+            tr_end = tr_start + len(tr["text"])
+            if tr_end <= r_start and tr_start >= pos:
+                para._element.append(make_run(tr["text"], tr.get("rPr") or default_rPr))
+                pos = tr_end
+            elif tr_start < r_start and tr_end > tr_start:
+                # Partial overlap — take the part before old_text
+                overlap_end = min(tr_end, r_start)
+                if overlap_end > tr_start and tr_start >= pos:
+                    para._element.append(make_run(tr["text"][:overlap_end - tr_start], tr.get("rPr") or default_rPr))
+                    pos = overlap_end
+                break
+        # If we missed some before text, add it with default formatting
+        if pos < r_start:
+            para._element.append(make_run(reconstructed[pos:r_start], default_rPr))
+
+    # 2. Original text — strikethrough
+    old_run = make_run(old_text, default_rPr)
     old_rPr = old_run.find(qn("w:rPr"))
     if old_rPr is None:
         old_rPr = OxmlElement("w:rPr")
@@ -3577,12 +4116,12 @@ def _apply_visual_diff_to_paragraph(para, old_text: str, new_text: str):
     _add_strikethrough_to_rPr(old_rPr)
     para._element.append(old_run)
 
-    # 3. Space separator between old and new
-    sep_run = make_run_with_text(" ", orig_rPr)
+    # 3. Space separator
+    sep_run = make_run(" ", default_rPr)
     para._element.append(sep_run)
 
-    # 4. New text — green highlight, same font
-    new_run = make_run_with_text(new_text, orig_rPr)
+    # 4. New text — green highlight
+    new_run = make_run(new_text, default_rPr)
     new_rPr = new_run.find(qn("w:rPr"))
     if new_rPr is None:
         new_rPr = OxmlElement("w:rPr")
@@ -3590,9 +4129,148 @@ def _apply_visual_diff_to_paragraph(para, old_text: str, new_text: str):
     _add_highlight_to_rPr(new_rPr, "green")
     para._element.append(new_run)
 
-    # 5. Unchanged text after
+    # 5. Unchanged text after — preserve per-run formatting where possible
     if after_text:
-        para._element.append(make_run_with_text(after_text, orig_rPr))
+        pos = r_end
+        added = False
+        for tr in text_runs:
+            tr_start = tr["offset"]
+            tr_end = tr_start + len(tr["text"])
+            if tr_start >= r_end:
+                para._element.append(make_run(tr["text"], tr.get("rPr") or default_rPr))
+                pos = tr_end
+                added = True
+            elif tr_end > r_end and tr_start < r_end:
+                # Partial overlap — take the part after old_text
+                skip = r_end - tr_start
+                remaining = tr["text"][skip:]
+                if remaining:
+                    para._element.append(make_run(remaining, tr.get("rPr") or default_rPr))
+                    pos = tr_end
+                    added = True
+        # If we missed some after text, add with default formatting
+        if not added or pos < len(reconstructed):
+            leftover = reconstructed[max(pos, r_end):]
+            if leftover:
+                para._element.append(make_run(leftover, default_rPr))
+
+
+def _apply_multi_visual_diff_to_paragraph(para, matches):
+    """Apply multiple visual diffs to a paragraph in a single pass.
+
+    matches: list of (start_idx, old_text, new_text) sorted by start_idx, non-overlapping.
+
+    Rebuilds the paragraph once: unchanged text keeps original formatting,
+    old text gets strikethrough, new text gets green highlight.
+    """
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from copy import deepcopy
+
+    full_text = para.text or ""
+    if not full_text or not matches:
+        return
+
+    # ── Collect per-run formatting info ──
+    def _get_run_text(r_elem):
+        return "".join((t.text or "") for t in r_elem.findall(qn("w:t")))
+
+    def _get_elem_rPr(r_elem):
+        rPr = r_elem.find(qn("w:rPr"))
+        return deepcopy(rPr) if rPr is not None else None
+
+    # Build flat list of (text, rPr, offset) from all text-bearing children
+    text_runs = []
+    char_offset = 0
+    for child in list(para._element):
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag == "r":
+            t = _get_run_text(child)
+            if t:
+                text_runs.append({"text": t, "offset": char_offset, "rPr": _get_elem_rPr(child)})
+                char_offset += len(t)
+        elif tag == "hyperlink":
+            for sub_r in child.findall(qn("w:r")):
+                t = _get_run_text(sub_r)
+                if t:
+                    text_runs.append({"text": t, "offset": char_offset, "rPr": _get_elem_rPr(sub_r)})
+                    char_offset += len(t)
+
+    reconstructed = "".join(tr["text"] for tr in text_runs)
+
+    # If reconstruction doesn't match para.text, fall back to para.text
+    if not reconstructed:
+        reconstructed = full_text
+
+    # Get default formatting
+    default_rPr = text_runs[0]["rPr"] if text_runs else None
+
+    def make_run(text, rPr_source=None):
+        r = OxmlElement("w:r")
+        if rPr_source:
+            r.append(deepcopy(rPr_source))
+        else:
+            r.append(OxmlElement("w:rPr"))
+        t_elem = OxmlElement("w:t")
+        t_elem.set(qn("xml:space"), "preserve")
+        t_elem.text = text
+        r.append(t_elem)
+        return r
+
+    def get_rPr_at(pos):
+        """Get the run properties for the character at given position."""
+        for tr in text_runs:
+            if tr["offset"] <= pos < tr["offset"] + len(tr["text"]):
+                return tr.get("rPr") or default_rPr
+        return default_rPr
+
+    # ── Remove all text-bearing children ──
+    for child in list(para._element):
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag in ("r", "hyperlink", "smartTag", "fldSimple"):
+            para._element.remove(child)
+
+    # ── Rebuild paragraph in a single pass ──
+    cursor = 0
+    for start, old_text, new_text in matches:
+        # Verify match position in reconstructed text
+        actual_start = reconstructed.find(old_text, cursor)
+        if actual_start == -1:
+            continue
+        actual_end = actual_start + len(old_text)
+
+        # 1. Unchanged text before this match
+        if actual_start > cursor:
+            before = reconstructed[cursor:actual_start]
+            para._element.append(make_run(before, get_rPr_at(cursor)))
+
+        # 2. Old text — strikethrough only
+        old_run = make_run(old_text, get_rPr_at(actual_start))
+        old_rPr = old_run.find(qn("w:rPr"))
+        if old_rPr is None:
+            old_rPr = OxmlElement("w:rPr")
+            old_run.insert(0, old_rPr)
+        _add_strikethrough_to_rPr(old_rPr)
+        para._element.append(old_run)
+
+        # 3. Space separator
+        para._element.append(make_run(" ", default_rPr))
+
+        # 4. New text — green highlight
+        new_run = make_run(new_text, default_rPr)
+        new_rPr = new_run.find(qn("w:rPr"))
+        if new_rPr is None:
+            new_rPr = OxmlElement("w:rPr")
+            new_run.insert(0, new_rPr)
+        _add_highlight_to_rPr(new_rPr, "green")
+        para._element.append(new_run)
+
+        cursor = actual_end
+
+    # 5. Remaining unchanged text after all matches
+    if cursor < len(reconstructed):
+        after = reconstructed[cursor:]
+        para._element.append(make_run(after, get_rPr_at(cursor)))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3681,7 +4359,7 @@ Text:
         response = await client.chat.completions.create(
             model=settings.GPT_MODEL,
             messages=[
-                {"role": "system", "content": "You are a temporal language auditor. Find all date-sensitive statements that might be outdated. Return only valid JSON."},
+                {"role": "system", "content": "You are a temporal language auditor. Find all date-sensitive statements that might be outdated. Never spell out Greek letters — preserve original symbols (Δ, α, β, θ, etc.) exactly as written. Return only valid JSON."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
@@ -3879,7 +4557,7 @@ async def export_tracked_docx(session_id: str, token: Optional[str] = None, requ
             tracked_doc = DocxDocument(output_path)
             media_applied = 0
 
-            # Figures: replace images + update captions
+            # Figures: replace images + update captions + add source URLs
             approved_figures = [m for m in approved_media if m.get("type") == "figure"]
             if approved_figures:
                 fig_count = await _apply_figure_replacements_to_docx(tracked_doc, approved_figures)
@@ -3888,6 +4566,9 @@ async def export_tracked_docx(session_id: str, token: Optional[str] = None, requ
                 cap_count = _update_figure_captions_in_docx(tracked_doc, approved_figures)
                 if cap_count:
                     logger.info("EXPORT tracked-docx: updated %d figure captions", cap_count)
+                src_count = _add_figure_source_urls(tracked_doc, approved_figures)
+                if src_count:
+                    logger.info("EXPORT tracked-docx: added %d figure source URLs", src_count)
 
             # Equations
             approved_equations = [m for m in approved_media if m.get("type") == "equation"]
@@ -3899,9 +4580,9 @@ async def export_tracked_docx(session_id: str, token: Optional[str] = None, requ
             # Tables: update cells + captions
             approved_tables = [m for m in approved_media if m.get("type") == "table"]
             if approved_tables:
-                tbl_count = _apply_table_updates_to_docx(tracked_doc, approved_tables)
+                tbl_count = _apply_table_updates_to_docx(tracked_doc, approved_tables, highlight=True)
                 media_applied += tbl_count
-                logger.info("EXPORT tracked-docx: updated %d tables", tbl_count)
+                logger.info("EXPORT tracked-docx: updated %d tables (highlighted)", tbl_count)
                 tcap_count = _update_table_captions_in_docx(tracked_doc, approved_tables)
                 if tcap_count:
                     logger.info("EXPORT tracked-docx: updated %d table captions", tcap_count)
@@ -4120,55 +4801,91 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
         figure_category = "unknown"
         try:
             caption_context = f'\nThe figure caption in the textbook is: "{caption}"' if caption else ""
-            gpt_resp = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "Analyze this figure from a textbook."
-                                f"{caption_context}\n\n"
-                                "Step 1 — Classify the figure into one of these categories:\n"
-                                "  - \"historical_illustration\": artwork, manuscripts, or illustrations "
-                                "depicting historical events/models (e.g., Aristotle's universe, medieval diagrams). "
-                                "These are NEVER outdated — they are meant to show how things were understood in the past.\n"
-                                "  - \"portrait\": photograph or painting of a specific person (scientist, astronaut, etc.). "
-                                "Portraits are NEVER outdated — they depict a specific individual.\n"
-                                "  - \"technical_diagram\": engineering diagrams, system architectures, process flows, "
-                                "block diagrams. These CAN become outdated if the technology or process has changed.\n"
-                                "  - \"data_chart\": graphs, charts, tables with numerical data. "
-                                "These CAN become outdated if newer data exists.\n"
-                                "  - \"photograph\": real-world photos of hardware, facilities, launches. "
-                                "These CAN become outdated if the subject has changed significantly.\n"
-                                "  - \"conceptual\": generic conceptual illustrations, decorative images.\n\n"
-                                "Step 2 — Determine if the figure is outdated:\n"
-                                "  - historical_illustration → ALWAYS set is_outdated = false\n"
-                                "  - portrait → ALWAYS set is_outdated = false\n"
-                                "  - For other categories, assess whether the content shown is still current.\n\n"
-                                "Step 3 — If and ONLY if is_outdated is true, suggest exactly 3 different "
-                                "image search queries to find an UPDATED replacement. Each query should:\n"
-                                "  - Be 3-7 words, specific to the EXACT content shown\n"
-                                "  - Target different search angles (e.g., technical term, industry standard name, textbook diagram name)\n"
-                                "  - NEVER use the word 'updated' or 'new' — just describe what the replacement should show\n"
-                                "  - Include specific domain terms (e.g., 'SMAD space mission architecture elements' not 'space mission diagram')\n"
-                                "  - For data charts: describe the axes/variables (e.g., 'spacecraft design life vs cost tradeoff curve')\n"
-                                "  - For technical diagrams: use the standard name of the framework/model shown\n\n"
-                                "Respond in JSON with keys: "
-                                "\"analysis\" (string), \"figure_category\" (string), "
-                                "\"is_outdated\" (bool), \"search_queries\" (list of 3 strings, empty list if not outdated)."
-                            ),
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{thumb_b64}"},
-                        },
-                    ],
-                }],
-                temperature=0.0,
-                max_tokens=1000,
-            )
+
+            # Detect actual image MIME type from base64 data
+            _mime = "image/png"  # default
+            try:
+                _header = base64.b64decode(thumb_b64[:32])
+                if _header[:3] == b'\xff\xd8\xff':
+                    _mime = "image/jpeg"
+                elif _header[:4] == b'\x89PNG':
+                    _mime = "image/png"
+                elif _header[:4] == b'GIF8':
+                    _mime = "image/gif"
+                elif _header[:4] == b'RIFF':
+                    _mime = "image/webp"
+            except Exception:
+                pass
+
+            _vision_messages = [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Analyze this figure from a textbook."
+                            f"{caption_context}\n\n"
+                            "Step 1 — Classify the figure into one of these categories:\n"
+                            "  - \"historical_illustration\": artwork, manuscripts, or illustrations "
+                            "depicting historical events/models (e.g., Aristotle's universe, medieval diagrams). "
+                            "These are NEVER outdated — they are meant to show how things were understood in the past.\n"
+                            "  - \"portrait\": photograph or painting of a specific person (scientist, astronaut, etc.). "
+                            "Portraits are NEVER outdated — they depict a specific individual.\n"
+                            "  - \"technical_diagram\": engineering diagrams, system architectures, process flows, "
+                            "block diagrams. These CAN become outdated if the technology or process has changed.\n"
+                            "  - \"data_chart\": graphs, charts, tables with numerical data. "
+                            "These CAN become outdated if newer data exists.\n"
+                            "  - \"photograph\": real-world photos of hardware, facilities, launches. "
+                            "These CAN become outdated if the subject has changed significantly.\n"
+                            "  - \"conceptual\": generic conceptual illustrations, decorative images.\n\n"
+                            "Step 2 — Determine if the figure is outdated:\n"
+                            "  - historical_illustration → ALWAYS set is_outdated = false\n"
+                            "  - portrait → ALWAYS set is_outdated = false\n"
+                            "  - For other categories, assess whether the content shown is still current.\n\n"
+                            "Step 3 — If and ONLY if is_outdated is true, suggest exactly 3 different "
+                            "image search queries to find an UPDATED replacement. Each query should:\n"
+                            "  - Be 3-7 words, specific to the EXACT content shown\n"
+                            "  - Target different search angles (e.g., technical term, industry standard name, textbook diagram name)\n"
+                            "  - NEVER use the word 'updated' or 'new' — just describe what the replacement should show\n"
+                            "  - Include specific domain terms (e.g., 'SMAD space mission architecture elements' not 'space mission diagram')\n"
+                            "  - For data charts: describe the axes/variables (e.g., 'spacecraft design life vs cost tradeoff curve')\n"
+                            "  - For technical diagrams: use the standard name of the framework/model shown\n\n"
+                            "Respond in JSON with keys: "
+                            "\"analysis\" (string), \"figure_category\" (string), "
+                            "\"is_outdated\" (bool), \"search_queries\" (list of 3 strings, empty list if not outdated)."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{_mime};base64,{thumb_b64}"},
+                    },
+                ],
+            }]
+
+            # Retry up to 3 times on 429 rate-limit errors
+            gpt_resp = None
+            for _attempt in range(3):
+                try:
+                    gpt_resp = await client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=_vision_messages,
+                        temperature=0.0,
+                        max_tokens=1000,
+                    )
+                    break  # success
+                except Exception as _rate_err:
+                    _err_str = str(_rate_err)
+                    if "429" in _err_str or "rate_limit" in _err_str.lower():
+                        _wait = 1.0 * (_attempt + 1)  # 1s, 2s, 3s
+                        logger.info("Rate limit hit for figure %d, retrying in %.1fs (attempt %d/3)",
+                                   fig_num, _wait, _attempt + 1)
+                        await asyncio.sleep(_wait)
+                    else:
+                        raise  # non-rate-limit error, propagate
+
+            if gpt_resp is None:
+                raise Exception(f"Rate limit exceeded after 3 retries for figure {fig_num}")
+
             raw = gpt_resp.choices[0].message.content or ""
             analysis_text = raw
             try:
@@ -4239,21 +4956,108 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
                         "query": f"{query} diagram",
                         "search_depth": "advanced",
                         "include_images": True,
+                        "include_image_descriptions": True,
                         "max_results": 5,
                     },
                     timeout=20,
                 )
                 tavily_data = tavily_resp.json()
                 seen_urls = set()
-                for img_url in tavily_data.get("images", [])[:5]:
-                    if isinstance(img_url, str) and img_url.startswith("http") and img_url not in seen_urls:
-                        seen_urls.add(img_url)
-                        candidates.append({
-                            "url": img_url,
-                            "title": query,
-                            "source": "Web Search",
-                            "thumbnail_url": img_url,
-                        })
+
+                # Log Tavily response for debugging
+                img_count = len(tavily_data.get("images", []))
+                res_count = len(tavily_data.get("results", []))
+                logger.info("Tavily response for '%s': %d images, %d results, status=%d",
+                           query, img_count, res_count, tavily_resp.status_code)
+                if tavily_resp.status_code != 200:
+                    logger.warning("Tavily non-200 response: %s", tavily_data)
+
+                # Build domain → page URL map from results for source attribution
+                from urllib.parse import urlparse
+                result_pages = []  # list of (domain_base, full_page_url, title)
+                for res in tavily_data.get("results", []):
+                    page_url = res.get("url", "")
+                    title = res.get("title", "")
+                    if page_url:
+                        parsed_page = urlparse(page_url)
+                        # Extract base domain (remove 'www.', 'cdn.', 'images.' etc.)
+                        domain = parsed_page.netloc.lower()
+                        domain_base = '.'.join(domain.replace('www.', '').split('.')[-2:])
+                        result_pages.append((domain_base, page_url, title))
+                        logger.debug("Tavily result page: domain=%s url=%s", domain_base, page_url[:100])
+
+                if not result_pages:
+                    logger.warning("Tavily returned 0 result pages for query '%s' — no source URLs available", query)
+
+                # Helper: check if a URL is a raw image file URL (not a webpage)
+                _IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.tiff', '.ico')
+                def _is_image_url(url: str) -> bool:
+                    """Return True if url points to an image file, not a webpage."""
+                    if not url:
+                        return False
+                    # Parse and check path (ignore query params)
+                    path = urlparse(url).path.lower()
+                    return any(path.endswith(ext) for ext in _IMAGE_EXTENSIONS)
+
+                for i, img_item in enumerate(tavily_data.get("images", [])[:5]):
+                    # Tavily images can be strings or dicts with url+description
+                    if isinstance(img_item, dict):
+                        img_url = img_item.get("url", "")
+                    elif isinstance(img_item, str):
+                        img_url = img_item
+                    else:
+                        continue
+
+                    if not img_url or not img_url.startswith("http") or img_url in seen_urls:
+                        continue
+                    seen_urls.add(img_url)
+
+                    # Match image URL to its source page by domain similarity
+                    parsed_img = urlparse(img_url)
+                    img_domain = parsed_img.netloc.lower()
+                    # Strip ALL common CDN/media subdomains: image3., cdn., i0.wp., etc.
+                    import re as _re_domain
+                    img_domain_clean = _re_domain.sub(
+                        r'^(www\.|cdn\.|images?\d*\.|static\.|media\.|assets\.|i\d+\.wp\.)',
+                        '', img_domain
+                    )
+                    img_domain_base = '.'.join(img_domain_clean.split('.')[-2:])
+
+                    source_page = ""
+                    source_title = query
+                    for domain_base, page_url, title in result_pages:
+                        # Only accept page URLs that are actual webpages, NOT image files
+                        if _is_image_url(page_url):
+                            continue
+                        if img_domain_base == domain_base or img_domain_base in domain_base or domain_base in img_domain_base:
+                            source_page = page_url
+                            if title:
+                                source_title = title
+                            break
+
+                    # If no domain match, use the FIRST non-image result page URL
+                    if not source_page:
+                        for _, pg_url, pg_title in result_pages:
+                            if not _is_image_url(pg_url):
+                                source_page = pg_url
+                                if pg_title:
+                                    source_title = pg_title
+                                break
+
+                    # FINAL SAFETY CHECK: Never store an image URL as source_page_url
+                    if _is_image_url(source_page):
+                        logger.warning("Rejected image URL as source_page: %s", source_page[:100])
+                        source_page = ""
+
+                    candidates.append({
+                        "url": img_url,
+                        "title": source_title,
+                        "source": "Web Search",
+                        "thumbnail_url": img_url,
+                        "source_page_url": source_page,
+                    })
+                    logger.info("Tavily candidate: image=%s → source_page=%s",
+                                img_url[:80], source_page[:80] if source_page else "(none)")
             except Exception as e:
                 logger.warning("Tavily search failed for figure %d query '%s': %s", fig_num, query, e)
             return candidates
@@ -4267,6 +5071,7 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
         async def _search_nasa(query: str):
             candidates = []
             if not is_space_related:
+                logger.debug("NASA search skipped (not space-related) for figure %d", fig_num)
                 return candidates
             try:
                 params = {"q": query, "media_type": "image", "page_size": 5}
@@ -4275,7 +5080,10 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
                 resp = await http_client.get(
                     "https://images-api.nasa.gov/search", params=params, timeout=15
                 )
-                items = resp.json().get("collection", {}).get("items", [])
+                nasa_data = resp.json()
+                items = nasa_data.get("collection", {}).get("items", [])
+                logger.info("NASA response for '%s': %d items, status=%d",
+                           query, len(items), resp.status_code)
                 for item in items[:3]:
                     data = item.get("data", [{}])[0]
                     links = item.get("links", [{}])
@@ -4284,11 +5092,15 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
                         # Derive full-resolution URL from thumbnail
                         # NASA thumbnails: .../image~thumb.jpg → .../image~orig.jpg
                         full_url = thumb.replace("~thumb", "~orig").replace("~small", "~orig").replace("~medium", "~orig")
+                        # Construct NASA source page URL from nasa_id
+                        nasa_id = data.get("nasa_id", "")
+                        source_page = f"https://images.nasa.gov/details/{nasa_id}" if nasa_id else ""
                         candidates.append({
                             "url": full_url,
                             "title": data.get("title", ""),
                             "source": "NASA",
                             "thumbnail_url": thumb,
+                            "source_page_url": source_page,
                         })
             except Exception as e:
                 logger.warning("NASA search failed for figure %d: %s", fig_num, e)
@@ -4303,7 +5115,7 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
                     "action": "query", "format": "json",
                     "generator": "search", "gsrsearch": query,
                     "gsrnamespace": "6", "gsrlimit": "5",
-                    "prop": "imageinfo", "iiprop": "url|thumburl", "iiurlwidth": "1200",
+                    "prop": "imageinfo", "iiprop": "url|thumburl|extmetadata|descriptionurl", "iiurlwidth": "1200",
                 }
                 resp = await http_client.get(
                     "https://commons.wikimedia.org/w/api.php",
@@ -4316,11 +5128,18 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
                         info = ii[0]
                         img_url = info.get("thumburl") or info.get("url", "")
                         if img_url:
+                            page_title = page.get("title", "")
+                            # Construct Wikimedia Commons page URL
+                            source_page = info.get("descriptionurl") or ""
+                            if not source_page and page_title:
+                                from urllib.parse import quote
+                                source_page = f"https://commons.wikimedia.org/wiki/{quote(page_title)}"
                             candidates.append({
                                 "url": info.get("url", img_url),
-                                "title": page.get("title", "").replace("File:", ""),
+                                "title": page_title.replace("File:", ""),
                                 "source": "Wikimedia Commons",
                                 "thumbnail_url": img_url,
+                                "source_page_url": source_page,
                             })
             except Exception as e:
                 logger.warning("Wikimedia search failed for figure %d: %s", fig_num, e)
@@ -4580,20 +5399,26 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
         "single letters/symbols that are clearly a reference palette.\n\n"
         "For each REAL equation, classify it into one of three categories:\n\n"
         "1. **\"outdated\"** — ONLY for things that are WRONG or DEPRECATED:\n"
-        "   - \\text{} wrapping math functions: \\text{sin} must be \\sin, "
+        "   - \\text{} wrapping standard math functions: \\text{sin} must be \\sin, "
         "\\text{cos} must be \\cos, \\text{tan} must be \\tan, "
         "\\text{log} must be \\log, etc.\n"
-        "   - \\text{} wrapping numbers or operators inside math mode: "
-        "\\text{1} must be just 1, \\text{+} must be just +, "
-        "\\text{2} must be just 2. These are WRONG because \\text{} forces "
-        "text mode inside math mode.\n"
         "   - Missing spaces that create INVALID commands: \\partialx is not "
         "a valid LaTeX command (must be \\partial x), \\leqy is not valid "
         "(must be \\leq y)\n"
-        "   - Formulas that are mathematically superseded or incorrect\n"
-        "   IMPORTANT: Check EVERY part of the equation for \\text{} misuse. "
-        "Even if the main structure looks fine, \\text{+} or \\text{1} "
-        "buried inside makes it outdated.\n\n"
+        "   - Formulas that are mathematically superseded or incorrect\n\n"
+        "   CRITICAL — \\text{} on variable names and labels is NORMAL, NOT an error:\n"
+        "   These equations come from Word OMML conversion, which wraps ALL normal "
+        "text runs in \\text{}. The following uses of \\text{} are CORRECT and must "
+        "NOT be flagged as outdated or errors:\n"
+        "   - Variable names: \\text{V}, \\text{R}, \\text{a}, \\text{m}, \\text{TOF}\n"
+        "   - Descriptive labels: \\text{Earth}, \\text{mission}, \\text{boost}, "
+        "\\text{Sun}, \\text{Moon}, \\text{transfer}, \\text{target}, \\text{park}, "
+        "\\text{retro}, \\text{planet}, \\text{SOI}, \\text{lead}, \\text{final}\n"
+        "   - Units and text in equations: \\text{ km}, \\text{ and }, \\text{mass}\n"
+        "   - Numbers and operators: \\text{1}, \\text{+}, \\text{2}, \\text{=}\n"
+        "   - ANY other \\text{} wrapping letters, words, or short labels\n"
+        "   Do NOT suggest removing \\text{} from these — it is how OMML equations "
+        "are represented in LaTeX and is perfectly valid.\n\n"
         "2. **\"formatting\"** — for OPTIONAL style improvements:\n"
         "   - Style preferences (\\times vs \\cdot — both valid)\n"
         "   - Alternative valid notations (1/2 vs \\frac{1}{2} — both valid)\n"
@@ -4610,8 +5435,20 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
         "- \\times is NOT outdated (it is a valid multiplication symbol)\n"
         "- 1/2 inline is NOT outdated (it is valid inline fraction notation)\n"
         "- \\left(\\frac{a}{b}\\right) is NOT outdated (parentheses have meaning)\n"
-        "- \\text{sin}, \\text{cos}, \\text{+}, \\text{1} ARE outdated (wrong usage)\n"
-        "- Scan the ENTIRE equation for \\text{} misuse, not just the beginning\n\n"
+        "- \\text{sin} should be \\sin, \\text{cos} should be \\cos (math operator rule)\n"
+        "- \\text{} on variable names, labels, units, numbers, operators is NORMAL "
+        "and NOT an error — these come from Word OMML conversion. "
+        "Do NOT flag \\text{V}, \\text{Earth}, \\text{mass}, \\text{1}, \\text{+} etc.\n"
+        "- Only flag an equation as outdated if the MATH CONTENT itself is wrong, "
+        "deprecated, or uses incorrect formulas — NOT because of \\text{} wrappers\n"
+        "- NEVER spell out Greek letters — always use the original symbol: "
+        "use Δ not Delta, α not alpha, β not beta, γ not gamma, θ not theta, "
+        "λ not lambda, μ not mu, σ not sigma, Σ not Sigma, π not pi, Ω not Omega, "
+        "ε not epsilon, φ not phi, ψ not psi, ω not omega, ρ not rho, τ not tau, "
+        "η not eta, ξ not xi, ζ not zeta, χ not chi, ν not nu, κ not kappa. "
+        "In LaTeX use \\Delta, \\alpha, \\beta etc. — never the English name.\n"
+        "- NEVER convert subscripts/superscripts to plain text: "
+        "keep v₁ not v1, x² not x2, Δv not Delta v\n\n"
     )
 
     async def _analyze_batch(batch_lines, batch_offset):
@@ -5024,7 +5861,9 @@ async def table_analysis(session_id: str, user=Depends(get_current_user_dep)):
                         "missions replaced by known successors, factually wrong dates.\n"
                         "- Do NOT update cells that contain descriptions, requirements, "
                         "section references, or procedural text — these are NOT data.\n"
-                        "- Row 0 is usually the header row — never update headers.\n\n"
+                        "- Row 0 is usually the header row — never update headers.\n"
+                        "- Never spell out Greek letters — always preserve original symbols "
+                        "(Δ, α, β, θ, Σ, π, etc.) and subscripts/superscripts exactly as written.\n\n"
                         "Respond ONLY in JSON (no markdown code blocks):\n"
                         "{\n"
                         "  \"analysis\": \"Brief description of the table and findings\",\n"
@@ -5202,6 +6041,85 @@ async def review_media_patch(
         "session_id": session_id,
         "status": update_fields["status"],
         "message": f"Media patch {action}d successfully.",
+    }
+
+
+@router.post("/{session_id}/figure-upload/{patch_id}")
+async def upload_figure_replacement(
+    session_id: str,
+    patch_id: str,
+    request: Request,
+    user=Depends(get_current_user_dep),
+):
+    """Upload a user's own image as a figure replacement."""
+    db = get_database()
+    session_repo = SessionRepository(db)
+
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    existing = await db.media_patches.find_one({
+        "patch_id": patch_id,
+        "session_id": session_id,
+        "type": "figure",
+    })
+    if not existing:
+        raise HTTPException(404, "Figure patch not found")
+
+    # Parse multipart form data
+    form = await request.form()
+    file = form.get("file")
+    if file is None:
+        raise HTTPException(400, "No file uploaded")
+
+    # Validate file type
+    content_type = getattr(file, "content_type", "") or ""
+    allowed_types = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
+    if content_type and content_type not in allowed_types:
+        raise HTTPException(400, f"Invalid file type: {content_type}. Allowed: PNG, JPEG, WebP, GIF")
+
+    # Save file
+    upload_dir = os.path.join(settings.UPLOAD_DIR, "figure_uploads", session_id)
+    os.makedirs(upload_dir, exist_ok=True)
+
+    filename = getattr(file, "filename", "image.png") or "image.png"
+    ext = os.path.splitext(filename)[1] or ".png"
+    saved_filename = f"{patch_id}{ext}"
+    saved_path = os.path.join(upload_dir, saved_filename)
+
+    contents = await file.read()
+    with open(saved_path, "wb") as f:
+        f.write(contents)
+
+    # Build the URL for the frontend to display and export to use
+    image_url = f"/uploads/figures/{session_id}/{saved_filename}"
+
+    # Update the media patch with the user-uploaded replacement
+    user_replacement = {
+        "url": image_url,
+        "thumbnail_url": image_url,
+        "title": filename,
+        "source": "User Upload",
+        "is_user_upload": True,
+        "local_path": saved_path,
+    }
+
+    await db.media_patches.update_one(
+        {"patch_id": patch_id, "session_id": session_id},
+        {"$set": {
+            "selected_replacement": user_replacement,
+            "user_uploaded_replacement": user_replacement,
+        }},
+    )
+
+    return {
+        "patch_id": patch_id,
+        "session_id": session_id,
+        "replacement": user_replacement,
+        "message": "Image uploaded successfully",
     }
 
 

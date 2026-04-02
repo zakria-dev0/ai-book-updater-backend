@@ -272,6 +272,11 @@ class DOCXParser:
                 if self._is_junk_latex(latex):
                     continue
 
+                # Filter trivial inline math (standalone symbols, single variables with subscripts)
+                # These aren't real equations — just inline math fragments like Δv, μ, V∞
+                if self._is_trivial_equation(latex):
+                    continue
+
                 # Deduplicate by normalized LaTeX text (catches near-identical table cell copies)
                 latex_key = latex.strip().replace(' ', '')
                 if latex_key in seen_latex:
@@ -379,7 +384,38 @@ class DOCXParser:
                     return True
 
         return False
-    
+
+    @staticmethod
+    def _is_trivial_equation(latex: str) -> bool:
+        """Return True if the LaTeX is a trivial inline math fragment, not a real equation.
+
+        Catches standalone variables (Δv, μ, V∞), single variables with subscripts
+        (V_{Earth}), and other short fragments that aren't full formulas.
+        A real equation should contain a relational operator (=, <, >, ≤, ≥, ≈)
+        or be long enough to be a meaningful expression.
+        """
+        import re as _re
+
+        stripped = latex.strip()
+        if not stripped:
+            return True
+
+        # Remove \text{} wrappers for length/content checking
+        clean = _re.sub(r'\\(?:text|mathrm|mathbf)\{([^}]*)\}', r'\1', stripped)
+        clean = clean.replace(' ', '')
+
+        # Very short expressions without relational operators are trivial
+        # (e.g., "\\Delta v", "V_{\\infty}", "\\mu", "R_{SOI}")
+        has_relation = bool(_re.search(r'[=<>≤≥≈≠]|\\(?:eq|leq|geq|neq|approx|sim|equiv|le|ge)', stripped))
+
+        if not has_relation:
+            # No equals/comparison sign — only keep if it's long enough to be
+            # a meaningful standalone expression (like a summation or integral)
+            if len(clean) < 30:
+                return True
+
+        return False
+
     def _extract_figures(self) -> List[Figure]:
         """Extract images/figures from DOCX with full metadata for downstream analysis."""
         figures = []
@@ -413,6 +449,22 @@ class DOCXParser:
                 continue
             try:
                 image_data = rel.target_part.blob
+
+                # Convert non-standard formats (EMF, WMF, TIFF, BMP) to PNG
+                # so GPT Vision and browsers can display them
+                try:
+                    img = Image.open(BytesIO(image_data))
+                    fmt = (img.format or "").upper()
+                    if fmt not in ("PNG", "JPEG", "GIF", "WEBP"):
+                        # Convert to PNG
+                        if img.mode not in ("RGB", "RGBA", "L"):
+                            img = img.convert("RGB")
+                        buf = BytesIO()
+                        img.save(buf, format="PNG")
+                        image_data = buf.getvalue()
+                except Exception:
+                    pass  # If Pillow can't open it, keep original bytes
+
                 image_base64 = base64.b64encode(image_data).decode('utf-8')
                 info = embed_info.get(rel.rId, {})
                 para_pos = info.get("para_idx")

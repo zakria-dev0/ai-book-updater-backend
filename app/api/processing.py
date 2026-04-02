@@ -413,6 +413,32 @@ async def get_document(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
     if document["user_id"] != current_user["email"]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    # Correct the equation count — metadata may include trivial inline math fragments
+    # that the equation analysis endpoint filters out. Use the same filter for consistency.
+    metadata = document.get("metadata")
+    if metadata and metadata.get("total_equations", 0) > 0:
+        # If equations are in the response (non-lightweight), count directly
+        equations = document.get("equations")
+        if equations:
+            from app.api.sessions import _is_junk_equation_text
+            real_count = sum(
+                1 for eq in equations
+                if not _is_junk_equation_text(eq.get("latex", ""), eq.get("raw_omml", ""))
+            )
+            metadata["total_equations"] = real_count
+        else:
+            # Lightweight mode — fetch just equations to recount
+            full_doc = await repo.find_with_media(document_id)
+            if full_doc:
+                from app.api.sessions import _is_junk_equation_text
+                all_eqs = full_doc.get("equations", [])
+                real_count = sum(
+                    1 for eq in all_eqs
+                    if not _is_junk_equation_text(eq.get("latex", ""), eq.get("raw_omml", ""))
+                )
+                metadata["total_equations"] = real_count
+
     return document
 
 
