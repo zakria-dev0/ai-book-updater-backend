@@ -740,6 +740,16 @@ async def extract_outline(
                     "paragraph_index": idx,
                 })
 
+    # ── Final sort: by section number (e.g. 7.1 < 7.2 < 7.3), then paragraph_index ──
+    def _section_sort_key(item):
+        m = _re.match(r'^(\d+(?:\.\d+)*)', item.get("text", ""))
+        if m:
+            # Convert "7.2.1" → (7, 2, 1) for proper numeric sorting
+            return tuple(int(x) for x in m.group(1).split('.'))
+        return (item.get("paragraph_index", 0),)
+
+    outline_items.sort(key=_section_sort_key)
+
     await session_repo.update_session(session_id, {
         "outline": outline_items,
         "status": SessionStatus.OUTLINE_EXTRACTED.value,
@@ -2565,13 +2575,6 @@ def _is_junk_equation_text(latex: str, omml_xml: str = "") -> bool:
     # 7. Comma-separated single characters (symbol reference)
     parts = [p.strip() for p in stripped.split(',')]
     if len(parts) >= 15 and all(len(p) <= 2 for p in parts):
-        return True
-
-    # 8. Trivial inline math — no relational operator and too short to be a real formula
-    # Catches standalone symbols like Δv, μ, V∞, R_{SOI}, single variables with subscripts
-    clean = _re.sub(r'\\(?:text|mathrm|mathbf)\{([^}]*)\}', r'\1', stripped).replace(' ', '')
-    has_relation = bool(_re.search(r'[=<>≤≥≈≠]|\\(?:eq|leq|geq|neq|approx|sim|equiv|le|ge)', stripped))
-    if not has_relation and len(clean) < 30:
         return True
 
     return False
@@ -5304,15 +5307,186 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
         readable = eq.get("latex") or ""
         omml_xml = eq.get("raw_omml") or ""
 
-        if _is_junk_equation_text(readable, omml_xml):
-            logger.info("Equation pre-filter skipped (not a real equation): %s", readable[:60])
-            continue
-
         equations.append({
             "para_idx": pos.get("paragraph"),
             "omml_xml": omml_xml,
             "readable_text": readable,
         })
+
+    # ── Merge continuation lines, classify, filter & deduplicate ────────
+    def _merge_classify_filter(eqs):
+        """Full equation pipeline:
+        1. Merge continuation lines (=...) into the previous equation
+        2. Classify: equation / definition / invalid
+        3. Remove junk and pure-text fragments
+        4. Deduplicate identical equations
+        """
+        import re as _mre
+
+        # ── helpers ──────────────────────────────────────────────────
+        def _to_plain(latex):
+            """Convert LaTeX to plain readable text for analysis.
+            Strips ALL LaTeX commands, braces, wrappers → raw characters."""
+            s = latex
+            # Unwrap \text{}, \mathrm{}, \mathbf{}, \operatorname{}
+            for _ in range(3):
+                s = _mre.sub(r'\\(?:text|mathrm|mathbf|operatorname)\{([^}]*)\}', r'\1', s)
+            # Remove \begin{...}{...} and \end{...}
+            s = _mre.sub(r'\\begin\{[^}]+\}(?:\{[^}]*\})?', '', s)
+            s = _mre.sub(r'\\end\{[^}]+\}', '', s)
+            # Replace known LaTeX commands with readable equivalents
+            s = s.replace(r'\sqrt', '√').replace(r'\frac', '/')
+            s = s.replace(r'\times', '×').replace(r'\cdot', '·')
+            s = s.replace(r'\left', '').replace(r'\right', '')
+            s = s.replace(r'\pm', '±').replace(r'\mp', '∓')
+            s = s.replace(r'\infty', '∞').replace(r'\partial', '∂')
+            s = s.replace(r'\leq', '≤').replace(r'\geq', '≥')
+            s = s.replace(r'\neq', '≠').replace(r'\approx', '≈')
+            # Strip remaining \command sequences
+            s = _mre.sub(r'\\[a-zA-Z]+', '', s)
+            # Strip \; \, \: \! and other single-char escapes
+            s = _mre.sub(r'\\[^a-zA-Z\s]', '', s)
+            # Strip braces and excess whitespace
+            s = s.replace('{', '').replace('}', '')
+            # Strip LaTeX alignment character & (from \begin{aligned} environments)
+            s = s.replace('&', '')
+            s = _mre.sub(r'\s+', ' ', s).strip()
+            return s
+
+        def _is_continuation(latex):
+            """Check if this equation is a continuation line (starts with =).
+            Uses plain-text conversion to handle all LaTeX wrappings."""
+            plain = _to_plain(latex)
+            # After stripping everything, does it start with = ≈ ≡ ~ ?
+            if plain and plain[0] in '=≈≡~':
+                return True
+            # Also check for \approx, \equiv at the raw LaTeX start
+            # Strip leading &, whitespace, braces (alignment chars from aligned environments)
+            stripped = _mre.sub(r'^[\s{}&]+', '', latex)
+            if _mre.match(r'^\\(?:approx|equiv|sim)\b', stripped):
+                return True
+            return False
+
+        def _is_junk(latex):
+            """Filter out non-equation junk. CONSERVATIVE — only remove
+            things that are clearly NOT equations. Equations with long
+            variable names like 'V_transfer at Earth' must NOT be removed."""
+            plain = _to_plain(latex)
+            if not plain or len(plain) < 2:
+                return True
+            # "as above" placeholder
+            if _mre.search(r'as\s+above', plain, _mre.IGNORECASE):
+                return True
+            # Has ANY math operator or structure? Then it's NOT junk.
+            has_operator = bool(_mre.search(
+                r'[=<>+\-*/^√×·±∓≤≥≠≈≡∞∂∑∫∏()]|\\|[0-9]',
+                plain
+            ))
+            if has_operator:
+                return False
+            # No operators/numbers at all. Could be a Greek var name or pure text.
+            # If it's short (< 40 chars) with no operators, it's junk
+            # e.g., "planet", "εwith respect to the Sun"
+            if len(plain) < 40:
+                return True
+            return False
+
+        def _is_constant_definition(latex):
+            """Detect parameter/constant definitions like:
+            R = 1.496 × 10⁸ km, μMars = 43,050 km³/s²
+            Pattern: <variable> = <number> <optional unit> (nothing else)
+            """
+            plain = _to_plain(latex)
+            # Match: variable_name = number [unit]
+            # Variable: 1-30 chars (letters, digits, subscripts, Greek)
+            # Value: number with optional scientific notation
+            # Unit: optional short text (km, km/s, km³/s², rad/s, etc.)
+            m = _mre.match(
+                r'^[A-Za-zα-ωΑ-Ω∞μεδσρ][\w\s,α-ωΑ-Ω∞μεδσρ]{0,30}'  # variable part
+                r'\s*=\s*'                                               # equals
+                r'-?[\d,]+(?:\.[\d]+)?'                                  # number
+                r'(?:\s*[×x]\s*10[\^]?[\d{}\-]+)?'                     # optional ×10^n
+                r'\s*'
+                r'(?:[a-zA-Z/°³²\s]{0,15})?'                           # optional short unit
+                r'\s*$',
+                plain
+            )
+            return m is not None
+
+        def _normalize_for_dedup(latex):
+            """Normalize equation for duplicate detection."""
+            s = _to_plain(latex).lower()
+            # Remove all whitespace
+            s = _mre.sub(r'\s+', '', s)
+            # Remove parentheses variations
+            s = s.replace('(', '').replace(')', '')
+            s = s.replace('[', '').replace(']', '')
+            # Remove trailing units for comparison
+            s = _mre.sub(r'(?:km|m|s|rad|hrs?|hours?|days?|months?)[/\d³²]*$', '', s)
+            return s
+
+        # ══════════════════════════════════════════════════════════════
+        # Step 1: Merge continuation lines (=...) into previous equation
+        # ══════════════════════════════════════════════════════════════
+        merged = []
+        for idx, eq in enumerate(eqs):
+            latex = eq["readable_text"]
+            is_cont = _is_continuation(latex)
+            # Log every equation to debug merge issues
+            if not is_cont:
+                logger.debug("EQ[%d] PARENT: %.60s", idx, _to_plain(latex))
+            else:
+                logger.debug("EQ[%d] CONT  : %.60s", idx, _to_plain(latex))
+            if is_cont and merged:
+                prev = merged[-1]
+                prev["readable_text"] = prev["readable_text"] + " \\\\ " + latex
+                if eq.get("omml_xml"):
+                    prev["omml_xml"] = (prev.get("omml_xml") or "") + eq["omml_xml"]
+            else:
+                merged.append(dict(eq))
+
+        logger.info("Equation merge: %d → %d after merging continuations", len(eqs), len(merged))
+
+        # ══════════════════════════════════════════════════════════════
+        # Step 2: Classify & filter junk
+        # ══════════════════════════════════════════════════════════════
+        classified = []
+        for eq in merged:
+            latex = eq["readable_text"]
+
+            # Filter junk (text fragments, placeholders)
+            if _is_junk(latex):
+                logger.info("Equation JUNK removed: %s", _to_plain(latex)[:80])
+                continue
+
+            # Classify as constant definition
+            if _is_constant_definition(latex):
+                eq["eq_classification"] = "definition"
+                logger.info("Equation classified as DEFINITION: %s", _to_plain(latex)[:80])
+            else:
+                eq["eq_classification"] = "equation"
+
+            classified.append(eq)
+
+        logger.info("Equation classify: %d → %d after removing junk", len(merged), len(classified))
+
+        # ══════════════════════════════════════════════════════════════
+        # Step 3: Deduplicate
+        # ══════════════════════════════════════════════════════════════
+        seen = set()
+        deduped = []
+        for eq in classified:
+            norm = _normalize_for_dedup(eq["readable_text"])
+            if norm in seen:
+                logger.info("Equation DUPLICATE removed: %s", _to_plain(eq["readable_text"])[:80])
+                continue
+            seen.add(norm)
+            deduped.append(eq)
+
+        logger.info("Equation dedup: %d → %d after removing duplicates", len(classified), len(deduped))
+        return deduped
+
+    equations = _merge_classify_filter(equations)
 
     # ── If DB has no valid equations, re-extract from DOCX (picks up table cells) ──
     if not equations:
@@ -5341,8 +5515,6 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
                     eq_dicts.append(eq_dict)
 
                     readable = feq.latex or ""
-                    if _is_junk_equation_text(readable, feq.raw_omml or ""):
-                        continue
 
                     equations.append({
                         "para_idx": feq.position.paragraph if feq.position else 0,
@@ -5363,6 +5535,9 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
 
             except Exception as extract_err:
                 logger.warning("Live equation re-extraction failed: %s", extract_err)
+
+        # Apply merge-classify-filter to re-extracted equations too
+        equations = _merge_classify_filter(equations)
 
     if not equations:
         return {"session_id": session_id, "equations": [], "message": "No equations found in document."}
@@ -5503,29 +5678,14 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
     for eq_num, eq in enumerate(equations, start=1):
         analysis_item = gpt_analyses.get(eq_num, {})
 
-        # Skip items GPT identified as not real equations — but override if it looks real
+        # GPT may flag some items as not_equation — ignore that flag and show all
+        # equations to the user (the extraction already filters genuine junk)
         if analysis_item.get("not_equation", False):
-            readable = eq["readable_text"]
-            # Safety net: don't skip things that are clearly math
-            math_indicators = [
-                r'\frac', r'\int', r'\sum', r'\prod', r'\sqrt', r'\sin', r'\cos',
-                r'\tan', r'\log', r'\lim', r'\partial', r'\begin{', r'\left',
-                r'\leq', r'\geq', r'\pm', r'\infty', r'\hat', r'\bar', r'\vec',
-                r'\overline', r'\overbrace', r'\underset', r'\overset',
-                r'\pmatrix', r'\bmatrix', r'\matrix', '=', r'\neq', r'\approx',
-            ]
-            has_math = any(ind in readable for ind in math_indicators)
-            if has_math:
-                logger.info("Equation %d: GPT said not_equation but contains math indicators, keeping: %s",
-                            eq_num, readable[:80])
-                # Override GPT — keep it as "ok"
-                analysis_item["not_equation"] = False
-                if "category" not in analysis_item:
-                    analysis_item["category"] = "ok"
-            else:
-                logger.info("Equation %d skipped (GPT: not a real equation): %s",
-                            eq_num, readable[:60])
-                continue
+            logger.info("Equation %d: GPT said not_equation, keeping anyway: %s",
+                        eq_num, eq["readable_text"][:80])
+            analysis_item["not_equation"] = False
+            if "category" not in analysis_item:
+                analysis_item["category"] = "ok"
 
         category = analysis_item.get("category", "ok")
 
@@ -5592,6 +5752,7 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
             "suggested_update": analysis_item.get("suggested_update", "") if has_suggestion else "",
             "is_outdated": is_outdated,
             "category": category,
+            "eq_classification": eq.get("eq_classification", "equation"),
             "reason": analysis_item.get("reason", "") if has_suggestion else "",
             "para_idx": eq["para_idx"],
             "created_at": datetime.utcnow().isoformat(),

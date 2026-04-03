@@ -14,45 +14,29 @@ logger = get_logger(__name__)
 # Maximum concurrent Mathpix API calls
 MAX_CONCURRENT = 5
 
-# Figures larger than this (in bytes of base64 data) are likely photos, not equations
-# ~50KB of base64 ≈ 37KB image — most equations are smaller than this
-MAX_EQUATION_IMAGE_SIZE = 80_000
-
-# Minimum aspect ratio (width/height) for equation candidates
-# Equations tend to be wider than tall; photos are more square
-MIN_ASPECT_RATIO = 0.3
-
-
 def _is_likely_equation_image(fig: Figure) -> bool:
     """
-    Quick heuristic to check if a figure image could plausibly be an equation.
-    Filters out large photos, diagrams, and full-page images before calling Mathpix.
+    Check if a figure image is worth sending to Mathpix.
+    Only filters out images that definitely cannot contain equations:
+    empty images and tiny artifacts. All other images (including large
+    tables, diagrams, etc.) are sent to Mathpix because equations can
+    appear inside tables and complex figures.
     """
     if not fig.image_base64:
         return False
 
-    # Check raw base64 size — large images are almost certainly not equations
-    b64_size = len(fig.image_base64)
-    if b64_size > MAX_EQUATION_IMAGE_SIZE:
-        return False
-
-    # Try to check image dimensions
+    # Filter out tiny artifacts
     try:
         from PIL import Image as PILImage
         img_data = base64.b64decode(fig.image_base64)
         img = PILImage.open(BytesIO(img_data))
         w, h = img.size
 
-        # Very large images (> 800px in both dimensions) are likely photos
-        if w > 800 and h > 800:
-            return False
-
-        # Very small images (< 20px) are likely artifacts
+        # Very small images (< 20px) are likely artifacts / icons
         if w < 20 or h < 20:
             return False
 
     except Exception:
-        # If we can't check dimensions, allow it through
         pass
 
     return True
@@ -150,6 +134,121 @@ class MathpixService:
         match = re.search(r'\([\d][\d.\-]*\)', latex)
         return match.group(0) if match else None
 
+    @staticmethod
+    def _split_equations(content: str) -> List[str]:
+        """Split Mathpix response into individual equations.
+
+        Handles display math ($$...$$), inline math ($...$), and
+        newline-separated equations. Merges continuation lines (starting
+        with =) back into the previous equation so multiline derivations
+        stay as one equation.
+        """
+        raw_parts: List[str] = []
+
+        # 1. Extract display math blocks ($$...$$)
+        display_parts = re.split(r'\$\$', content)
+        remaining_text_parts = []
+        for i, part in enumerate(display_parts):
+            part_stripped = part.strip()
+            if i % 2 == 1 and part_stripped:
+                # Inside $$...$$ — split on \\ but merge continuations later
+                sub_eqs = re.split(r'\\\\', part_stripped)
+                for seq in sub_eqs:
+                    seq = seq.strip()
+                    if seq and len(seq) > 2:
+                        raw_parts.append(seq)
+            else:
+                remaining_text_parts.append(part_stripped)
+
+        # 2. Extract inline math ($...$)
+        remaining = ' '.join(remaining_text_parts)
+        inline_parts = re.split(r'\$', remaining)
+        leftover_text = []
+        for i, part in enumerate(inline_parts):
+            part_stripped = part.strip()
+            if i % 2 == 1 and part_stripped:
+                if len(part_stripped) > 2:
+                    raw_parts.append(part_stripped)
+            else:
+                leftover_text.append(part_stripped)
+
+        # 3. From leftover, split by newlines and look for equation-like lines
+        leftover = ' '.join(leftover_text)
+        for line in leftover.split('\n'):
+            line = line.strip()
+            if not line or len(line) < 3:
+                continue
+            has_math = bool(re.search(
+                r'[=<>≤≥≈≠]|\\(?:frac|sqrt|sum|int|alpha|beta|gamma|delta|mu|epsilon|sigma|omega|vec|hat|bar)',
+                line
+            ))
+            if has_math:
+                raw_parts.append(line)
+
+        if not raw_parts:
+            return [content] if content.strip() else []
+
+        # 4. Merge continuation lines — lines starting with = are part of
+        #    the previous equation (multiline derivations)
+        merged: List[str] = []
+        for part in raw_parts:
+            stripped = part.lstrip()
+            is_continuation = stripped.startswith('=') or stripped.startswith('\\approx') or stripped.startswith('\\equiv')
+            if is_continuation and merged:
+                # Append to previous equation with newline
+                merged[-1] = merged[-1] + ' \\\\ ' + part
+            else:
+                merged.append(part)
+
+        return merged
+
+    @staticmethod
+    def _is_junk_mathpix_equation(latex: str) -> bool:
+        """Filter out Mathpix results that are not real equations.
+
+        Catches: plain numbers with units, single variables, LaTeX table
+        markup, very short fragments, and text-only content.
+        """
+        stripped = latex.strip()
+
+        # Empty or very short
+        if len(stripped) < 4:
+            return True
+
+        # LaTeX table markup (multicolumn, hline, etc.)
+        if re.search(r'\\?multicolumn|\\hline|\\begin\{tabular\}', stripped):
+            return True
+
+        # Plain number with optional unit — e.g. "384,300 km", "=5.68 km/s"
+        # Remove leading = sign for check
+        check = re.sub(r'^[=\s]+', '', stripped)
+        # Pattern: optional minus, digits with commas/decimals, optional unit text
+        if re.match(
+            r'^-?[\d,]+(?:\.\d+)?(?:\s*(?:×|\\times)\s*10[\^{}\d]+)?\s*'
+            r'(?:km|m|s|kg|rad|hrs?|hours?|days?|months?|[a-z]{1,3}(?:\s*/\s*[a-z]{1,3})?(?:\s*\^?\s*\d)?)?'
+            r'(?:\s*/\s*[a-z]{1,3}(?:\s*\^?\s*\d)?)?\s*$',
+            check, re.IGNORECASE
+        ):
+            return True
+
+        # Just a variable name with no operator (e.g. "V∞Mars", "V∞", "planet")
+        # Must have at least one relational/math operator to be a real equation
+        clean = re.sub(r'\\(?:text|mathrm|mathbf)\{[^}]*\}', '', stripped)
+        clean = re.sub(r'[_^{}\\]', '', clean).strip()
+        has_operator = bool(re.search(
+            r'[=<>≤≥≈≠+\-*/]|\\(?:frac|sqrt|sum|int|cdot|times|div|pm|leq|geq|neq|approx)',
+            stripped
+        ))
+        if not has_operator and len(clean) < 20:
+            return True
+
+        # Pure text with no math symbols (e.g. "planet", "as above")
+        alpha_only = re.sub(r'[^a-zA-Z\s]', '', clean)
+        if alpha_only.strip() == clean and len(clean) < 30:
+            return True
+
+        return False
+
     async def _process_single_figure(
         self,
         client: httpx.AsyncClient,
@@ -157,15 +256,15 @@ class MathpixService:
         fig: Figure,
         idx: int,
         total: int,
-    ) -> Tuple[Equation | None, Figure | None]:
-        """Process a single figure through Mathpix, returning either an equation or the original figure."""
+    ) -> Tuple[List[Equation], Figure | None]:
+        """Process a single figure through Mathpix, returning equations found and/or the original figure."""
         async with semaphore:
             logger.info("Mathpix: processing figure %d/%d (%s)", idx + 1, total, fig.figure_id)
             result = await self._call_mathpix(client, fig.image_base64)
 
             if result is None:
                 logger.warning("  → Mathpix returned no result, keeping as figure")
-                return None, fig
+                return [], fig
 
             latex = result.get("latex_styled", "")
             text = result.get("text", "")
@@ -181,20 +280,30 @@ class MathpixService:
 
             if self._has_math(result):
                 content = latex or text
-                eq_number = self._extract_eq_number(content)
-                eq = Equation(
-                    equation_id=f"eq_mathpix_{fig.figure_id}",
-                    latex=content,
-                    image_base64=fig.image_base64,
-                    position=fig.position,
-                    number=eq_number,
-                )
-                logger.info("  → EQUATION detected: %s", content[:120])
-                return eq, None
+                # Split into individual equations (handles tables with many equations)
+                eq_parts = self._split_equations(content)
+                equations = []
+                for eq_idx, eq_latex in enumerate(eq_parts):
+                    # Filter junk: plain numbers, units, table markup, single variables
+                    if self._is_junk_mathpix_equation(eq_latex):
+                        logger.debug("  → Mathpix junk filtered: %s", eq_latex[:80])
+                        continue
+                    eq_number = self._extract_eq_number(eq_latex)
+                    eq = Equation(
+                        equation_id=f"eq_mathpix_{fig.figure_id}_{eq_idx}",
+                        latex=eq_latex,
+                        position=fig.position,
+                        number=eq_number,
+                    )
+                    equations.append(eq)
+                logger.info("  → %d equation(s) detected from figure %s", len(equations), fig.figure_id)
+                # Figure contained equations — still keep it as a figure too
+                # (it's an image with equations, not purely an equation)
+                return equations, fig
             else:
                 logger.info("  → not an equation (latex=%r, text=%r)",
                             latex[:60] if latex else "", text[:60] if text else "")
-                return None, fig
+                return [], fig
 
     async def extract_equations_from_figures(
         self, figures: List[Figure]
@@ -226,7 +335,7 @@ class MathpixService:
         skipped = len(figures) - len(candidates)
         if skipped > 0:
             logger.info(
-                "Pre-filter: %d/%d figures skipped (too large for equations), %d candidates remain",
+                "Pre-filter: %d/%d figures skipped (no image data or too small), %d candidates remain",
                 skipped, len(figures), len(candidates),
             )
 
@@ -238,7 +347,7 @@ class MathpixService:
         semaphore = asyncio.Semaphore(MAX_CONCURRENT)
         equations: List[Equation] = []
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             tasks = [
                 self._process_single_figure(client, semaphore, fig, idx, len(candidates))
                 for idx, fig in enumerate(candidates)
@@ -249,9 +358,8 @@ class MathpixService:
             if isinstance(result, Exception):
                 logger.error("Mathpix task failed: %s", result)
                 continue
-            eq, fig = result
-            if eq is not None:
-                equations.append(eq)
+            eqs, fig = result
+            equations.extend(eqs)
             if fig is not None:
                 remaining_figures.append(fig)
 

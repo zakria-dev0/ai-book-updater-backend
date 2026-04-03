@@ -272,11 +272,6 @@ class DOCXParser:
                 if self._is_junk_latex(latex):
                     continue
 
-                # Filter trivial inline math (standalone symbols, single variables with subscripts)
-                # These aren't real equations — just inline math fragments like Δv, μ, V∞
-                if self._is_trivial_equation(latex):
-                    continue
-
                 # Deduplicate by normalized LaTeX text (catches near-identical table cell copies)
                 latex_key = latex.strip().replace(' ', '')
                 if latex_key in seen_latex:
