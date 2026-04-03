@@ -87,9 +87,15 @@ class MathpixService:
         """
         latex = result.get("latex_styled", "")
         text = result.get("text", "")
+        confidence = result.get("confidence", None)
 
         # If no content at all, skip
         if not latex and not text:
+            return False
+
+        # If Mathpix returned empty latex_styled with zero confidence,
+        # it did not recognize any math — the text field is just raw OCR
+        if not latex and (confidence is None or confidence < 0.1):
             return False
 
         # Check the content to analyze (prefer latex_styled, fallback to text)
@@ -99,7 +105,18 @@ class MathpixService:
         if len(content.strip()) < 3:
             return False
 
+        # Reject table/tabular content — not equations
+        if re.search(r'\\begin\{(?:tabular|table|array)\}', content):
+            return False
+
+        # Reject pure \text{...} content — just text, not equations
+        text_stripped = re.sub(r'\\text\s*\{[^}]*\}', '', content).strip()
+        if not text_stripped or len(text_stripped) < 3:
+            return False
+
         # LaTeX-specific math commands — strong indicators
+        # (excludes structural commands like \begin, \end, \left, \right,
+        #  \mathrm, \mathbf which appear in tables and formatting)
         latex_commands = [
             '\\frac', '\\sum', '\\int', '\\sqrt', '\\alpha', '\\beta',
             '\\gamma', '\\delta', '\\theta', '\\pi', '\\omega', '\\lambda',
@@ -107,7 +124,6 @@ class MathpixService:
             '\\cdot', '\\times', '\\div', '\\pm', '\\mp',
             '\\leq', '\\geq', '\\neq', '\\approx', '\\infty',
             '\\partial', '\\nabla', '\\vec', '\\hat', '\\bar', '\\dot',
-            '\\left', '\\right', '\\begin', '\\end', '\\mathrm', '\\mathbf',
             '\\overline', '\\underline', '\\overbrace', '\\underbrace',
             '\\lim', '\\log', '\\ln', '\\sin', '\\cos', '\\tan',
         ]
