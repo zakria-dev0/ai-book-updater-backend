@@ -1,8 +1,10 @@
 # main.py
+import os
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -66,6 +68,11 @@ app.include_router(analysis.router, prefix=settings.API_V1_PREFIX)
 app.include_router(admin.router, prefix=settings.API_V1_PREFIX)
 app.include_router(export.router, prefix=settings.API_V1_PREFIX)
 app.include_router(sessions.router, prefix=settings.API_V1_PREFIX)
+
+# ── Static file serving for user-uploaded figure images ──────────────────────
+_FIGURE_UPLOADS_DIR = os.path.join(settings.UPLOAD_DIR, "figure_uploads")
+os.makedirs(_FIGURE_UPLOADS_DIR, exist_ok=True)
+app.mount("/uploads/figures", StaticFiles(directory=_FIGURE_UPLOADS_DIR), name="figure_uploads")
 
 # ── Utility endpoints ─────────────────────────────────────────────────────────
 @app.get("/health", tags=["Health"])

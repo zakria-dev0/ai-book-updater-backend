@@ -487,7 +487,10 @@ def _conv_limupper(el) -> str:
 
 def _conv_eqarr(el) -> str:
     rows = [_conv_children(e) for e in el.findall(_m("e"))]
-    body = r" \\ ".join(rows)
+    # Filter out single-character alignment markers (l=left, c=center, r=right)
+    # that Word sometimes includes as the first row of an equation array
+    cleaned = [r for r in rows if not (len(r.strip()) == 1 and r.strip() in "lcr")]
+    body = r" \\ ".join(cleaned if cleaned else rows)
     return r"\begin{aligned}" + body + r"\end{aligned}"
 
 

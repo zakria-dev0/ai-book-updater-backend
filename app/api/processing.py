@@ -112,8 +112,31 @@ async def _run_processing(document_id: str, db):
             )
             mathpix = MathpixService()
             mathpix_eqs, figures = await mathpix.extract_equations_from_figures(figures)
-            equations.extend(mathpix_eqs)
-            logger.info("Mathpix extracted %d equations from figures", len(mathpix_eqs))
+
+            # Deduplicate: only add Mathpix equations not already found via OMML
+            import re as _dedup_re
+            def _normalize_eq(latex: str) -> str:
+                """Normalize LaTeX for dedup comparison."""
+                s = latex.strip().lower()
+                s = _dedup_re.sub(r'\\(?:text|mathrm|mathbf)\{([^}]*)\}', r'\1', s)
+                s = _dedup_re.sub(r'\s+', '', s)
+                s = s.replace('{', '').replace('}', '').replace('\\left', '').replace('\\right', '')
+                return s
+
+            omml_normalized = set()
+            for eq in equations:
+                omml_normalized.add(_normalize_eq(eq.latex))
+
+            new_count = 0
+            for meq in mathpix_eqs:
+                norm = _normalize_eq(meq.latex)
+                if norm not in omml_normalized:
+                    equations.append(meq)
+                    omml_normalized.add(norm)  # prevent Mathpix-to-Mathpix dupes too
+                    new_count += 1
+                else:
+                    logger.debug("Mathpix equation deduplicated (already in OMML): %s", meq.latex[:60])
+            logger.info("Mathpix extracted %d equations from figures, %d new after dedup", len(mathpix_eqs), new_count)
         else:
             logger.info("Mathpix not configured — skipping image equation extraction")
 
@@ -413,6 +436,7 @@ async def get_document(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
     if document["user_id"] != current_user["email"]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
     return document
 
 
