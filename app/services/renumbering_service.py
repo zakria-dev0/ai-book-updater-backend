@@ -243,6 +243,65 @@ class RenumberingService:
         return text
 
     @staticmethod
+    def renumber_after_insertion(
+        text: str,
+        existing_numbers: list,
+        inserted_number: str,
+        ref_type: str = "figure",
+    ) -> tuple:
+        """Renumber references after a NEW item is inserted at a given position.
+
+        When a new Figure/Table is inserted at e.g. "3-2", all existing items
+        with number >= "3-2" in the same chapter are incremented by 1:
+            old 3-2 -> 3-3, old 3-3 -> 3-4, etc.
+
+        Args:
+            text: Full document text
+            existing_numbers: All current numbers in document e.g. ["3-1","3-2","3-3"]
+            inserted_number: Number at which new item is being inserted e.g. "3-2"
+            ref_type: "figure", "table", or "equation"
+
+        Returns:
+            (updated_text, number_map) where number_map is {old: new}
+        """
+        num_pat = re.compile(r'^(\d+)([\-\.])(\d+)$')
+        m = num_pat.match(inserted_number)
+        if not m:
+            return text, {}
+        ins_chap, ins_sep, ins_seq = m.group(1), m.group(2), int(m.group(3))
+
+        # Find items in the same chapter with seq >= inserted seq, in reverse
+        # (reverse so renaming 3-2 -> 3-3 doesn't collide with the real 3-3
+        #  which also needs to become 3-4)
+        affected = []
+        for num in existing_numbers:
+            nm = num_pat.match(num)
+            if not nm:
+                continue
+            chap, sep, seq = nm.group(1), nm.group(2), int(nm.group(3))
+            if chap == ins_chap and sep == ins_sep and seq >= ins_seq:
+                affected.append((seq, num))
+
+        # Sort descending so we rename 3-4 -> 3-5 first, then 3-3 -> 3-4, then 3-2 -> 3-3
+        affected.sort(key=lambda x: x[0], reverse=True)
+
+        number_map = {}
+        for seq, old_num in affected:
+            new_num = f"{ins_chap}{ins_sep}{seq + 1}"
+            number_map[old_num] = new_num
+            text = RenumberingService.renumber_after_changes(
+                text, old_num, new_num, ref_type
+            )
+
+        if number_map:
+            logger.info(
+                "Insertion renumbering (%s): inserted %s, shifted %d items — %s",
+                ref_type, inserted_number, len(number_map), number_map,
+            )
+
+        return text, number_map
+
+    @staticmethod
     def renumber_sequential(
         text: str,
         ref_type: str,

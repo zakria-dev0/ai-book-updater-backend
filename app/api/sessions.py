@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request, UploadFile, File, Form
 from typing import List, Optional, Dict
 from pydantic import BaseModel, Field
 from datetime import datetime
@@ -109,10 +109,27 @@ class DatedStatementResolveRequest(BaseModel):
 
 class CreateCustomIssueRequest(BaseModel):
     title: str
-    find_text: str
-    replace_with: str
+    # issue_kind: "find_replace" (default, legacy behaviour) or "research"
+    issue_kind: str = "find_replace"
+    # Find & Replace fields (required when issue_kind == "find_replace")
+    find_text: Optional[str] = ""
+    replace_with: Optional[str] = ""
+    # Research fields (required when issue_kind == "research")
+    research_prompt: Optional[str] = ""
     scope: str = "whole_document"  # "whole_document" or section name
     severity: str = "medium"  # "high", "medium", "low"
+
+
+class ApproveResearchRequest(BaseModel):
+    """Finalize placement for a research-type custom issue.
+    The user has reviewed + (optionally) edited the research draft and
+    chosen where in the document it should be inserted.
+    """
+    content: str  # final edited content
+    section_text: str  # heading of the target section
+    paragraph_index: int = -1  # -1 = section-level (insert after heading)
+    paragraph_text: str = ""  # for robustness: finds paragraph by text
+    position: str = "after"  # "before" | "after" | "replace"
 
 
 class ResetToStepRequest(BaseModel):
@@ -1076,7 +1093,14 @@ async def create_custom_issue(
     req: CreateCustomIssueRequest,
     user=Depends(get_current_user_dep),
 ):
-    """Create a custom issue (find-and-replace) added manually by the user."""
+    """Create a custom issue added manually by the user.
+
+    Two kinds:
+    - "find_replace" (default): legacy find-and-replace behaviour.
+    - "research": user provides a research prompt; the agent will later run
+      web research + LLM synthesis and save drafted content onto this
+      opportunity for the user to place in Step 7.
+    """
     db = get_database()
     session_repo = SessionRepository(db)
     session = await session_repo.find_session(session_id)
@@ -1085,24 +1109,60 @@ async def create_custom_issue(
     if session.get("user_id") != user["email"] and user.get("role") != "admin":
         raise HTTPException(403, "Not authorized")
 
-    custom_opp = {
-        "opportunity_id": str(uuid.uuid4())[:8],
-        "session_id": session_id,
-        "section_ref": req.scope if req.scope != "whole_document" else "Whole Document",
-        "original_sentence": req.find_text,
-        "issue_type": "custom_replacement",
-        "severity": req.severity,
-        "confidence": 1.0,
-        "brief_reason": req.title,
-        "selected": True,
-        "is_custom": True,
-        "replace_with": req.replace_with,
-        "scope": req.scope,
-    }
+    issue_kind = (req.issue_kind or "find_replace").lower()
+    if issue_kind not in ("find_replace", "research"):
+        raise HTTPException(400, "issue_kind must be 'find_replace' or 'research'")
+
+    if issue_kind == "find_replace":
+        if not (req.find_text or "").strip() or not (req.replace_with or "").strip():
+            raise HTTPException(400, "find_text and replace_with are required for find_replace")
+        custom_opp = {
+            "opportunity_id": str(uuid.uuid4())[:8],
+            "session_id": session_id,
+            "section_ref": req.scope if req.scope != "whole_document" else "Whole Document",
+            "original_sentence": req.find_text,
+            "issue_type": "custom_replacement",
+            "severity": req.severity,
+            "confidence": 1.0,
+            "brief_reason": req.title,
+            "selected": True,
+            "is_custom": True,
+            "custom_kind": "find_replace",
+            "replace_with": req.replace_with,
+            "scope": req.scope,
+        }
+    else:  # research
+        if not (req.research_prompt or "").strip():
+            raise HTTPException(400, "research_prompt is required for research")
+        custom_opp = {
+            "opportunity_id": str(uuid.uuid4())[:8],
+            "session_id": session_id,
+            "section_ref": "Research: " + req.title[:60],
+            "original_sentence": "",
+            "issue_type": "custom_research",
+            "severity": req.severity,
+            "confidence": 1.0,
+            "brief_reason": req.title,
+            "selected": True,
+            "is_custom": True,
+            "custom_kind": "research",
+            "research_prompt": req.research_prompt,
+            # filled in later by _plan_research_task:
+            "research_result": "",
+            "research_citations": [],
+            "research_status": "pending",
+            # filled in later when user approves placement:
+            "research_placement": None,
+            "scope": "research_insert",
+        }
 
     await session_repo.create_opportunities([custom_opp])
-    logger.info("Custom issue created for session %s: '%s' → '%s'",
-                session_id, req.find_text[:50], req.replace_with[:50])
+    if issue_kind == "find_replace":
+        logger.info("Custom find/replace created for session %s: '%s' → '%s'",
+                    session_id, (req.find_text or "")[:50], (req.replace_with or "")[:50])
+    else:
+        logger.info("Custom research issue created for session %s: '%s'",
+                    session_id, req.title[:60])
 
     # Remove MongoDB _id (ObjectId) before returning — FastAPI can't serialize it
     custom_opp.pop("_id", None)
@@ -1111,6 +1171,141 @@ async def create_custom_issue(
         "session_id": session_id,
         "opportunity": custom_opp,
         "message": "Custom issue created successfully.",
+    }
+
+
+@router.get("/{session_id}/custom-research-issues")
+async def list_custom_research_issues(
+    session_id: str,
+    user=Depends(get_current_user_dep),
+):
+    """Return all research-kind custom issues for a session, including the
+    current research_result / status so the Step 7 UI can render them.
+    """
+    db = get_database()
+    session_repo = SessionRepository(db)
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    opps = await session_repo.find_opportunities(session_id)
+    out = []
+    for opp in opps:
+        if not opp.get("is_custom"):
+            continue
+        if opp.get("custom_kind") != "research":
+            continue
+        opp.pop("_id", None)
+        out.append(opp)
+    return {"session_id": session_id, "issues": out, "total": len(out)}
+
+
+@router.post("/{session_id}/custom-research-issues/{opportunity_id}/approve")
+async def approve_custom_research_issue(
+    session_id: str,
+    opportunity_id: str,
+    req: ApproveResearchRequest,
+    user=Depends(get_current_user_dep),
+):
+    """Finalize a research-type custom issue: the user has reviewed (and
+    possibly edited) the drafted content and chosen where to insert it in
+    the document. We create a pending patch with `research_insert_meta`
+    that the clean + tracked exports apply at the chosen location.
+    """
+    db = get_database()
+    session_repo = SessionRepository(db)
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+    if req.position not in ("before", "after", "replace"):
+        raise HTTPException(400, "position must be 'before', 'after', or 'replace'")
+    if not (req.content or "").strip():
+        raise HTTPException(400, "content must not be empty")
+    if not (req.section_text or "").strip():
+        raise HTTPException(400, "section_text is required")
+
+    opps = await session_repo.find_opportunities(session_id)
+    opp = next(
+        (o for o in opps if o.get("opportunity_id") == opportunity_id and o.get("custom_kind") == "research"),
+        None,
+    )
+    if not opp:
+        raise HTTPException(404, "Research custom issue not found")
+
+    research_insert_meta = {
+        "content": req.content.strip(),
+        "section_text": req.section_text.strip(),
+        "paragraph_index": req.paragraph_index,
+        "paragraph_text": (req.paragraph_text or "").strip(),
+        "position": req.position,
+        "title": opp.get("brief_reason", ""),
+        "citations": opp.get("research_citations", []),
+    }
+
+    pos_label = {"before": "Before", "after": "After", "replace": "Replace"}[req.position]
+    label = opp.get("brief_reason", "Custom research")
+
+    # Remove any prior research-insert patches for this opportunity so repeat
+    # approvals replace rather than stack.
+    existing_patches = await session_repo.find_patches(session_id)
+    for p in existing_patches:
+        if (
+            p.get("opportunity_id") == opportunity_id
+            and p.get("research_insert_meta") is not None
+        ):
+            try:
+                await session_repo.delete_patch(session_id, p.get("patch_id"))
+            except Exception:
+                pass
+
+    patch = {
+        "patch_id": str(uuid.uuid4())[:8],
+        "opportunity_id": opportunity_id,
+        "session_id": session_id,
+        "original_sentence": f"[Research insert {pos_label.lower()} section: {req.section_text[:60]}]",
+        "revised_sentence": req.content.strip()[:400],
+        "citation": "; ".join(
+            f"[{c.get('index')}] {c.get('url', '')}"
+            for c in opp.get("research_citations", [])[:5]
+        ) or "User-directed research",
+        "rationale": f"User research: {label}",
+        "confidence": 1.0,
+        "change_pct": 100.0,
+        "status": PatchStatus.PENDING.value,
+        "editor_revision": None,
+        "reviewed_at": None,
+        "section_ref": f"{pos_label}: {req.section_text}",
+        "is_custom": True,
+        "custom_kind": "research",
+        "research_insert_meta": research_insert_meta,
+    }
+
+    await session_repo.create_patches([patch])
+
+    # Persist the placement on the opportunity so the user can see it was approved
+    await session_repo.update_opportunity(
+        session_id,
+        opportunity_id,
+        {
+            "research_placement": research_insert_meta,
+            "research_status": "approved",
+        },
+    )
+    patch.pop("_id", None)
+
+    logger.info(
+        "Custom research issue approved for session %s: opp=%s section='%s' position=%s",
+        session_id, opportunity_id, req.section_text[:40], req.position,
+    )
+
+    return {
+        "session_id": session_id,
+        "patch": patch,
+        "message": "Research content queued for insertion.",
     }
 
 
@@ -1149,6 +1344,145 @@ async def plan_research(
     }
 
 
+async def _run_custom_research(
+    client, research_prompt: str, title: str, allowed_sources: list,
+) -> tuple[str, list]:
+    """Run web research for a user-defined research topic and synthesize it
+    into drafted content suitable for insertion into a book chapter.
+
+    Returns (draft_content, citations). Draft is a single multi-paragraph
+    string. Citations is a list of {title, url, source_type} dicts.
+
+    Uses Tavily for web search (same provider as the automated research
+    pipeline) and GPT for synthesis. If Tavily is not configured, falls back
+    to pure GPT synthesis (user will see a note).
+    """
+    from app.services.research_service import TavilyResearchService
+    import json
+
+    tavily = TavilyResearchService()
+
+    # 1) Run 2-3 parallel searches to gather sources
+    search_plan_prompt = f"""The user wants the agent to research the following topic for a technical book update:
+Title: {title}
+Research request: {research_prompt}
+
+Generate 3 focused web search queries (English, specific, recent) that will
+find authoritative, up-to-date information. Return ONLY a JSON object with
+a single key "queries" containing a list of 3 query strings. No other text."""
+
+    try:
+        plan_resp = await client.chat.completions.create(
+            model=settings.GPT_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a research planner. Output strict JSON."},
+                {"role": "user", "content": search_plan_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=400,
+        )
+        raw = plan_resp.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+        queries = json.loads(raw).get("queries", [])[:3]
+    except Exception as exc:
+        logger.warning("Custom research: query planning failed: %s", exc)
+        queries = [research_prompt]
+
+    # 2) Execute searches in parallel
+    sources: list = []
+    if tavily.is_configured and queries:
+        tasks = [tavily.search(q, max_results=4) for q in queries]
+        batches = await asyncio.gather(*tasks, return_exceptions=True)
+        for batch in batches:
+            if isinstance(batch, Exception):
+                logger.warning("Custom research: search error: %s", batch)
+                continue
+            for r in batch or []:
+                # ResearchResult objects — dump to dict
+                try:
+                    sources.append({
+                        "title": getattr(r, "title", "") or "",
+                        "url": getattr(r, "url", "") or "",
+                        "excerpt": (getattr(r, "content", "") or "")[:600],
+                        "source_type": getattr(r, "source_type", "") or "",
+                    })
+                except Exception:
+                    pass
+        # Deduplicate by URL
+        seen = set()
+        deduped = []
+        for s in sources:
+            u = s.get("url", "")
+            if u and u not in seen:
+                seen.add(u)
+                deduped.append(s)
+        sources = deduped[:10]
+
+    # 3) Synthesize drafted content for the book
+    if sources:
+        evidence_block = "\n\n".join(
+            f"[{i + 1}] {s['title']}\n    {s['url']}\n    {s['excerpt']}"
+            for i, s in enumerate(sources)
+        )
+    else:
+        evidence_block = "(No external sources found — rely on general knowledge. Flag uncertainty.)"
+
+    synth_prompt = f"""You are drafting new content for a technical book update.
+The user has requested research on:
+Title: {title}
+Request: {research_prompt}
+Allowed source types: {', '.join(allowed_sources)}
+
+Web research gathered the following sources:
+{evidence_block}
+
+Write 2-4 concise paragraphs of book-ready prose that the editor can insert
+into a chapter. Requirements:
+- Match the measured, technical tone of a reference book (not a blog post).
+- Include concrete current facts, numbers, and dates from the sources where relevant.
+- Use inline citations as bracketed numbers [1], [2] matching the source list above.
+- Do NOT include headings, bullet lists, or markdown — plain paragraphs only.
+- CRITICAL: Do NOT include section numbers (1.3, 1.4, 2.1, etc.) or subsection headings at the start of paragraphs. The editor places the content at the right location. Start each paragraph directly with prose content.
+- Do NOT preface with 'Here is...' — output the content directly.
+- Preserve Greek symbols (Δ, α, β) and unit subscripts (v₁) as-is if used.
+
+Output only the drafted paragraphs. No numbering, no headings, no titles."""
+
+    synth_resp = await client.chat.completions.create(
+        model=settings.GPT_MODEL,
+        messages=[
+            {"role": "system", "content": "You are a precise technical editor writing reference-book content."},
+            {"role": "user", "content": synth_prompt},
+        ],
+        temperature=0.4,
+        max_tokens=1500,
+    )
+    draft = (synth_resp.choices[0].message.content or "").strip()
+
+    # Post-process: strip section numbers that GPT may insert despite instructions.
+    # Matches lines starting with "1.3", "1.4 Title", "2.1.", etc. and removes
+    # the number prefix so the paragraph starts with prose content.
+    _sec_num_re = re.compile(r"^\d+\.\d+\.?\s*", re.MULTILINE)
+    draft = _sec_num_re.sub("", draft)
+    # Also strip any markdown heading markers (## 1.3 Title → Title)
+    _md_heading_re = re.compile(r"^#{1,4}\s*(?:\d+\.\d+\.?\s*)?", re.MULTILINE)
+    draft = _md_heading_re.sub("", draft)
+    # Remove any leading/trailing blank lines that result from stripping
+    draft = "\n\n".join(p.strip() for p in draft.split("\n\n") if p.strip())
+
+    citations = [
+        {
+            "index": i + 1,
+            "title": s.get("title", ""),
+            "url": s.get("url", ""),
+            "source_type": s.get("source_type", ""),
+        }
+        for i, s in enumerate(sources)
+    ]
+    return draft, citations
+
+
 async def _plan_research_task(session_id: str, session: dict):
     """Background task: generate research plans for selected opportunities."""
     from openai import AsyncOpenAI
@@ -1177,8 +1511,57 @@ async def _plan_research_task(session_id: str, session: dict):
         for opp in selected:
             opp_id = opp.get("opportunity_id", opp.get("id", ""))
 
-            # Custom issues skip GPT research — auto-create a plan marked approved
+            # Custom issues: two sub-kinds
             if opp.get("is_custom"):
+                custom_kind = opp.get("custom_kind", "find_replace")
+
+                if custom_kind == "research":
+                    # Run real web research + LLM synthesis, save draft to the
+                    # opportunity so the user can review it in Step 7. Failures
+                    # are non-fatal — the user will see an error state in the UI.
+                    try:
+                        draft_content, citations = await _run_custom_research(
+                            client,
+                            opp.get("research_prompt", ""),
+                            opp.get("brief_reason", ""),
+                            allowed_sources,
+                        )
+                        await session_repo.update_opportunity(
+                            session_id,
+                            opp_id,
+                            {
+                                "research_result": draft_content,
+                                "research_citations": citations,
+                                "research_status": "ready",
+                            },
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Custom research failed for opp %s: %s", opp_id, exc,
+                        )
+                        await session_repo.update_opportunity(
+                            session_id,
+                            opp_id,
+                            {
+                                "research_status": "error",
+                                "research_error": str(exc)[:500],
+                            },
+                        )
+
+                    plans.append({
+                        "plan_id": str(uuid.uuid4())[:8],
+                        "opportunity_id": opp_id,
+                        "session_id": session_id,
+                        "search_queries": [],
+                        "target_sources": [],
+                        "facts_to_verify": [f"Custom research: {opp.get('brief_reason', '')}"],
+                        "approved": True,
+                        "is_custom": True,
+                        "custom_kind": "research",
+                    })
+                    continue
+
+                # Legacy find_replace fast-path
                 plans.append({
                     "plan_id": str(uuid.uuid4())[:8],
                     "opportunity_id": opp_id,
@@ -1188,6 +1571,7 @@ async def _plan_research_task(session_id: str, session: dict):
                     "facts_to_verify": [f"Custom replacement: '{opp.get('original_sentence', '')}' → '{opp.get('replace_with', '')}'"],
                     "approved": True,
                     "is_custom": True,
+                    "custom_kind": "find_replace",
                     "replace_with": opp.get("replace_with", ""),
                 })
                 continue
@@ -1598,6 +1982,12 @@ async def _generate_patches_task(session_id: str, session: dict):
 
             # Custom issues: create patch directly without GPT — user already provided replacement
             if opp.get("is_custom"):
+                custom_kind = opp.get("custom_kind", "find_replace")
+                # Research-kind custom issues have their own Step 7 review flow
+                # (user edits + chooses placement → approve-research endpoint
+                # creates the final patch). Skip auto-patch-gen here.
+                if custom_kind == "research":
+                    return None
                 return {
                     "patch_id": str(uuid.uuid4())[:8],
                     "opportunity_id": opp_id,
@@ -2012,6 +2402,202 @@ Return ONLY valid JSON. No other text."""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# INSERT NEW FIGURE / TABLE (with auto-renumbering at apply time)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/{session_id}/insert-media")
+async def insert_media_patch(
+    session_id: str,
+    file: UploadFile = File(...),
+    media_type: str = Form(...),  # "figure" or "table"
+    section_id: str = Form(...),
+    section_text: str = Form(""),
+    position: str = Form("after"),  # "before", "after", "replace"
+    paragraph_index: int = Form(-1),  # -1 = section-level
+    paragraph_text: str = Form(""),
+    caption: Optional[str] = Form(None),
+    user=Depends(get_current_user_dep),
+):
+    """Accept a user-uploaded figure or table and queue it as a patch
+    to be inserted into the document at apply-patches time. Downstream
+    figure/table numbers will auto-renumber."""
+    if media_type not in ("figure", "table"):
+        raise HTTPException(400, "media_type must be 'figure' or 'table'")
+    if position not in ("before", "after", "replace"):
+        raise HTTPException(400, "position must be 'before', 'after', or 'replace'")
+
+    db = get_database()
+    session_repo = SessionRepository(db)
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    # Persist the uploaded file
+    upload_dir = os.path.join(settings.PROCESSING_DIR, session_id, "media_inserts")
+    os.makedirs(upload_dir, exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", file.filename or "upload.bin")
+    stored_name = f"{uuid.uuid4().hex[:8]}_{safe_name}"
+    stored_path = os.path.join(upload_dir, stored_name)
+
+    try:
+        content = await file.read()
+        with open(stored_path, "wb") as fh:
+            fh.write(content)
+    except Exception as e:
+        logger.error("Failed to save uploaded media for session %s: %s", session_id, e)
+        raise HTTPException(500, "Failed to save upload")
+
+    file_size = len(content)
+
+    pos_label = {"before": "Before", "after": "After", "replace": "Replace"}[position]
+    label_type = "Figure" if media_type == "figure" else "Table"
+
+    insert_media_meta = {
+        "media_type": media_type,
+        "file_path": stored_path,
+        "file_name": safe_name,
+        "file_size": file_size,
+        "caption": (caption or "").strip(),
+        "section_id": section_id,
+        "section_text": section_text,
+        "position": position,
+        "paragraph_index": paragraph_index,
+        "paragraph_text": paragraph_text,
+    }
+
+    patch = {
+        "patch_id": str(uuid.uuid4())[:8],
+        "opportunity_id": "insert-media",
+        "session_id": session_id,
+        "original_sentence": f"[Insert {label_type} {pos_label.lower()} section: {section_text}]",
+        "revised_sentence": f"[New {label_type}: {safe_name}"
+                            + (f" — {caption.strip()}" if caption and caption.strip() else "")
+                            + "]",
+        "citation": "",
+        "rationale": f"User-uploaded {media_type} inserted {pos_label.lower()} "
+                     f"section '{section_text}'. Downstream {media_type}s are "
+                     f"auto-renumbered.",
+        "confidence": 1.0,
+        "change_pct": 100.0,
+        # PENDING: the uploaded file appears as a preview card in the Figures /
+        # Tables tab. The user must explicitly approve it before it is applied
+        # to the clean document and tracked-changes exports.
+        "status": PatchStatus.PENDING.value,
+        "editor_revision": None,
+        "reviewed_at": None,
+        "section_ref": f"{pos_label}: {section_text}",
+        "insert_media_meta": insert_media_meta,
+    }
+
+    await session_repo.create_patches([patch])
+    patch.pop("_id", None)
+    logger.info(
+        "Insert-media patch created for session %s: %s (%s, section=%s, position=%s, file=%s)",
+        session_id, patch["patch_id"], media_type, section_text, position, safe_name,
+    )
+
+    return {
+        "patch": patch,
+        "message": f"{label_type} uploaded. Approve the preview card to insert it.",
+    }
+
+
+@router.get("/{session_id}/insert-media-patches")
+async def list_insert_media_patches(
+    session_id: str,
+    user=Depends(get_current_user_dep),
+):
+    """Return all insert-media patches (pending/approved/rejected) for a session
+    so the frontend can render preview cards in the Figures/Tables tabs."""
+    db = get_database()
+    session_repo = SessionRepository(db)
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    all_patches = await session_repo.find_patches(session_id)
+    items = []
+    for p in all_patches:
+        meta = p.get("insert_media_meta")
+        if not meta:
+            continue
+        items.append({
+            "patch_id": p.get("patch_id"),
+            "status": p.get("status"),
+            "media_type": meta.get("media_type"),
+            "file_name": meta.get("file_name"),
+            "file_size": meta.get("file_size"),
+            "caption": meta.get("caption") or "",
+            "section_text": meta.get("section_text") or "",
+            "position": meta.get("position") or "after",
+            "paragraph_index": meta.get("paragraph_index", -1),
+            "paragraph_text": meta.get("paragraph_text") or "",
+            "preview_url": f"/sessions/{session_id}/insert-media-preview/{p.get('patch_id')}",
+            "created_at": p.get("created_at"),
+        })
+    return {"patches": items}
+
+
+@router.get("/{session_id}/insert-media-preview/{patch_id}")
+async def insert_media_preview(
+    session_id: str,
+    patch_id: str,
+    token: Optional[str] = None,
+    request: Request = None,
+):
+    """Serve the uploaded figure/table file so the frontend can show a preview.
+    Auth accepts either an Authorization header (fetch) or a ?token= query
+    param so <img src=...> tags can load the file directly."""
+    from fastapi.responses import FileResponse
+
+    # Auth: query-param token for <img> tags, or Authorization header for fetch
+    user = None
+    if token:
+        user = verify_download_token(token)
+        if not user:
+            # Fallback: some frontends pass the raw JWT directly as the token
+            try:
+                payload = decode_token(token)
+                user = {"email": payload.get("sub"), "role": payload.get("role", "user")}
+            except Exception:
+                user = None
+    else:
+        auth_header = request.headers.get("authorization", "") if request else ""
+        if auth_header.startswith("Bearer "):
+            jwt_token = auth_header[7:]
+            try:
+                payload = decode_token(jwt_token)
+                user = {"email": payload.get("sub"), "role": payload.get("role", "user")}
+            except Exception:
+                user = None
+    if not user:
+        raise HTTPException(401, "Authentication required")
+
+    db = get_database()
+    session_repo = SessionRepository(db)
+    session = await session_repo.find_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.get("user_id") != user["email"] and user.get("role") != "admin":
+        raise HTTPException(403, "Not authorized")
+
+    all_patches = await session_repo.find_patches(session_id)
+    patch = next((p for p in all_patches if p.get("patch_id") == patch_id), None)
+    if not patch or not patch.get("insert_media_meta"):
+        raise HTTPException(404, "Insert-media patch not found")
+
+    file_path = patch["insert_media_meta"].get("file_path")
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(404, "Uploaded file not found on disk")
+
+    return FileResponse(file_path, filename=patch["insert_media_meta"].get("file_name"))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # STAGE 8: APPLY PATCHES
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2037,8 +2623,10 @@ async def apply_patches(
 
     approved_patches = await session_repo.find_approved_patches(session_id)
     ask_ai_count = sum(1 for p in approved_patches if p.get("ask_ai_meta"))
-    logger.info("Session %s: %d approved patches (%d regular, %d ask-ai)",
-                session_id, len(approved_patches), len(approved_patches) - ask_ai_count, ask_ai_count)
+    insert_media_count = sum(1 for p in approved_patches if p.get("insert_media_meta"))
+    regular_count = len(approved_patches) - ask_ai_count - insert_media_count
+    logger.info("Session %s: %d approved patches (%d regular, %d ask-ai, %d insert-media)",
+                session_id, len(approved_patches), regular_count, ask_ai_count, insert_media_count)
 
     if not approved_patches:
         # No approved patches — skip application, just advance the session
@@ -2076,6 +2664,35 @@ async def apply_patches(
             for patch in approved_patches:
                 final_text = patch.get("editor_revision") or patch.get("revised_sentence", "")
                 ask_ai_meta = patch.get("ask_ai_meta")
+                insert_media_meta = patch.get("insert_media_meta")
+                research_insert_meta = patch.get("research_insert_meta")
+
+                # --- Research-insert patches: drop drafted content at chosen
+                # section/paragraph position ---
+                if research_insert_meta:
+                    try:
+                        ok = _apply_research_insert_patch(docx_doc, research_insert_meta)
+                        if ok:
+                            applied += 1
+                        else:
+                            skipped += 1
+                    except Exception as ri_err:
+                        logger.error("Research-insert patch failed: %s", ri_err)
+                        skipped += 1
+                    continue
+
+                # --- Insert Media patches: insert uploaded figure/table + renumber ---
+                if insert_media_meta:
+                    try:
+                        inserted = _apply_insert_media_patch(docx_doc, insert_media_meta)
+                        if inserted:
+                            applied += 1
+                        else:
+                            skipped += 1
+                    except Exception as im_err:
+                        logger.error("Insert-media patch failed: %s", im_err)
+                        skipped += 1
+                    continue
 
                 if not final_text:
                     skipped += 1
@@ -2474,6 +3091,581 @@ def _replace_section_content(docx_doc, heading_idx: int, text: str):
 
     logger.info("  Removed %d body paragraphs for replace", len(body_indices))
     _insert_text_near_paragraph(docx_doc, heading_idx, text, before=False)
+
+
+def _scan_existing_media_numbers(docx_doc, media_type: str) -> list:
+    """Scan the doc body text for existing 'Figure X-Y' / 'Table X-Y' numbers.
+    Handles Unicode dashes (U+2010–U+2015, U+2212) and normalizes to ASCII '-'.
+    Walks ALL paragraphs including those nested in tables via body.iter().
+    """
+    from docx.oxml.ns import qn as _qn
+    DASHES = "\u002d\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
+    dash_class = f"[{DASHES}.]"
+    if media_type == "figure":
+        pat = re.compile(
+            rf"\b(?:Figure|Fig\.?)\s+(\d+)({dash_class})(\d+)(?![0-9])", re.IGNORECASE,
+        )
+    else:
+        pat = re.compile(
+            rf"\b(?:Table|Tbl\.?)\s+(\d+)({dash_class})(\d+)(?![0-9])", re.IGNORECASE,
+        )
+    nums: set = set()
+    P_TAG = _qn("w:p")
+    body = docx_doc.element.body
+    for p_el in body.iter(P_TAG):
+        try:
+            text = "".join(p_el.itertext())
+        except Exception:
+            continue
+        for m in pat.finditer(text):
+            norm_sep = "." if m.group(2) == "." else "-"
+            nums.add(f"{m.group(1)}{norm_sep}{m.group(3)}")
+    return sorted(nums, key=lambda n: [int(x) for x in re.split(r"[-.]", n)])
+
+
+def _pick_next_media_number(existing: list, chapter_hint: str = "1") -> str:
+    """(Legacy) Pick next sequential number — kept for backwards compat."""
+    if not existing:
+        return f"{chapter_hint}-1"
+    last = existing[-1]
+    m = re.match(r"^(\d+)([\-\.])(\d+)$", last)
+    if not m:
+        return f"{chapter_hint}-1"
+    chap, sep, seq = m.group(1), m.group(2), int(m.group(3))
+    return f"{chap}{sep}{seq + 1}"
+
+
+def _determine_inserted_number(
+    target_el, chapter_hint: str, media_type: str, position: str, docx_doc=None,
+) -> tuple:
+    """Determine the correct new figure/table number based on the insertion
+    POSITION in the document body (not just "last + 1").
+
+    Walks ALL <w:p> descendants (including ones nested inside tables, which
+    is common in books where figure captions sit in layout table cells),
+    top-to-bottom, and finds the highest caption number in the target
+    chapter that appears BEFORE the insertion point. The new number is
+    that max + 1. Also returns the full set of existing numbers (used
+    later by RenumberingService.renumber_after_insertion to shift every
+    downstream item + in-text reference).
+
+    Args:
+        target_el: lxml element the new media will be inserted next to.
+        chapter_hint: chapter prefix from the section heading (e.g. "1").
+        media_type: "figure" or "table".
+        position: "before" or "after" — changes whether target_el's own
+                  caption counts as "before" or "at/after" the new number.
+        docx_doc: the Document object, used to fall back to document.body
+                  if the target element's parent isn't directly body.
+    """
+    from docx.oxml.ns import qn as _qn
+    P_TAG = _qn("w:p")
+
+    if media_type == "figure":
+        prefix = r"(?:Figure|Fig\.?)"
+    else:
+        prefix = r"(?:Table|Tbl\.?)"
+    # Match ALL Unicode dash variants — SMAD books use non-breaking hyphen
+    # (U+2011) inside caption numbers so they don't line-break.
+    DASH_CLASS = "[\\-\u2010\u2011\u2012\u2013\u2014\u2015\u2212.]"
+    # Caption = pattern at the very start of a paragraph's text
+    cap_pat = re.compile(rf"^\s*{prefix}\s+(\d+)({DASH_CLASS})(\d+)(?![0-9])", re.IGNORECASE)
+    # Any mention anywhere — used to collect the full "existing numbers" list
+    any_pat = re.compile(rf"\b{prefix}\s+(\d+)({DASH_CLASS})(\d+)(?![0-9])", re.IGNORECASE)
+
+    # Walk up to <w:body> so we can iterate every paragraph in the document
+    # in reading order, including those nested inside tables.
+    body = target_el.getparent()
+    while body is not None and body.tag != _qn("w:body"):
+        body = body.getparent()
+    if body is None and docx_doc is not None:
+        body = docx_doc.element.body
+    if body is None:
+        return f"{chapter_hint}-1", []
+
+    paragraphs_in_order = list(body.iter(P_TAG))
+    try:
+        target_pos = paragraphs_in_order.index(target_el)
+    except ValueError:
+        target_pos = len(paragraphs_in_order)
+
+    # "Before the new figure" cutoff:
+    #   position=before → new lands AT target_pos → count i < target_pos
+    #   position=after  → new lands AT target_pos+1 → count i <= target_pos
+    cutoff = target_pos if position == "before" else target_pos + 1
+
+    max_seq_before = 0
+    sep = "-"
+    all_numbers: set = set()
+
+    # Also build a looser pattern that searches ANYWHERE in the paragraph,
+    # not just at the start. Captions in SMAD books sometimes have invisible
+    # field codes (SEQ, STYLEREF) prepended to the visible text, making
+    # cap_pat.match() fail even though the paragraph IS a caption.
+    # We use this as a fallback for positional counting.
+    cap_search_pat = re.compile(
+        rf"(?:^|\s)(?:{prefix})\s+(\d+)({DASH_CLASS})(\d+)(?![0-9])", re.IGNORECASE,
+    )
+
+    captions_before: list = []  # for logging
+    captions_after: list = []
+
+    for i, p_el in enumerate(paragraphs_in_order):
+        try:
+            text = "".join(p_el.itertext())
+        except Exception:
+            continue
+        if not text:
+            continue
+
+        # Caption position check — find the FIRST figure/table mention that
+        # looks like a caption. Try cap_pat.match() first (strict: starts at
+        # paragraph beginning), fall back to cap_search_pat.search() for
+        # paragraphs with field-code or layout-table prefixes.
+        cm = cap_pat.match(text)
+        if not cm:
+            cm = cap_search_pat.search(text)
+        if cm and cm.group(1) == chapter_hint:
+            seq = int(cm.group(3))
+            raw_sep = cm.group(2)
+            norm_sep = "." if raw_sep == "." else "-"
+            num_label = f"{cm.group(1)}{norm_sep}{cm.group(3)}"
+            if i < cutoff:
+                if seq > max_seq_before:
+                    max_seq_before = seq
+                    sep = norm_sep
+                captions_before.append(num_label)
+            else:
+                captions_after.append(num_label)
+
+        # Collect all mentions in the whole doc (captions + in-text refs).
+        # Always store with ASCII "-" so number_map keys are consistent.
+        for m in any_pat.finditer(text):
+            raw_sep = m.group(2)
+            norm_sep = "." if raw_sep == "." else "-"
+            all_numbers.add(f"{m.group(1)}{norm_sep}{m.group(3)}")
+
+    new_number = f"{chapter_hint}{sep}{max_seq_before + 1}"
+
+    sorted_all = sorted(
+        all_numbers, key=lambda n: [int(x) for x in re.split(r"[-.]", n)]
+    )
+    logger.info(
+        "Insert-number: chapter=%s, captions_before=%s, captions_after=%s, "
+        "max_seq_before=%d, new_number=%s, all_numbers=%s",
+        chapter_hint, captions_before, captions_after,
+        max_seq_before, new_number, sorted_all,
+    )
+    return new_number, sorted_all
+
+
+def _apply_research_insert_patch(docx_doc, meta: dict, tracked: bool = False) -> bool:
+    """Insert user-approved drafted research content at the chosen location.
+
+    meta fields:
+        content:          final edited prose (may be multi-paragraph, \\n\\n separated)
+        section_text:     heading text of target section
+        paragraph_index:  -1 for section-level; otherwise index hint
+        paragraph_text:   for fuzzy paragraph lookup (robustness across edits)
+        position:         "before" | "after" | "replace"
+        title, citations: metadata (not used at apply-time)
+
+    When `tracked=True`, inserted paragraphs are highlighted yellow so the
+    editor can see them in the tracked-changes export (matches ask-ai style).
+    """
+    content = (meta.get("content") or "").strip()
+    if not content:
+        logger.warning("Research-insert: empty content")
+        return False
+
+    section_text = (meta.get("section_text") or "").strip()
+    position = meta.get("position", "after")
+    para_idx_hint = meta.get("paragraph_index", -1)
+    para_text = (meta.get("paragraph_text") or "").strip()
+
+    # Split into paragraphs on double newlines first, then single newlines as fallback.
+    raw_paras = [p.strip() for p in content.split("\n\n") if p.strip()]
+    if not raw_paras:
+        raw_paras = [line.strip() for line in content.split("\n") if line.strip()]
+    if not raw_paras:
+        return False
+
+    # Determine target paragraph index
+    target_idx = None
+    if para_idx_hint is not None and para_idx_hint >= 0 and para_text:
+        if para_idx_hint < len(docx_doc.paragraphs):
+            if para_text[:50] in (docx_doc.paragraphs[para_idx_hint].text or ""):
+                target_idx = para_idx_hint
+        if target_idx is None:
+            for search_idx, p in enumerate(docx_doc.paragraphs):
+                if para_text[:50] in (p.text or ""):
+                    target_idx = search_idx
+                    break
+
+    if target_idx is None:
+        # Section-level fallback: insert near the section heading
+        if not section_text:
+            logger.warning("Research-insert: no paragraph or section target")
+            return False
+        heading_idx = _find_heading_in_docx(docx_doc, section_text)
+        if heading_idx is None:
+            logger.warning("Research-insert: heading '%s' not found", section_text[:60])
+            return False
+        target_idx = heading_idx
+        # For section-level insert, "replace" means replace section content
+        if position == "replace":
+            joined = "\n\n".join(raw_paras)
+            _replace_section_content(docx_doc, heading_idx, joined)
+            logger.info(
+                "Research-insert: replaced section '%s' content (%d paragraphs)",
+                section_text[:40], len(raw_paras),
+            )
+            return True
+        # Otherwise fall through to paragraph-level insert
+
+    # Paragraph-level insertion
+    if tracked:
+        target_para = docx_doc.paragraphs[target_idx]
+        target_el = target_para._element
+        ref_para = _find_reference_body_paragraph(docx_doc, target_idx) or target_para
+
+        if position == "replace":
+            # Strike through target and insert highlighted paragraphs after
+            for run in target_para.runs:
+                rPr = run._element.find(_qn_w("rPr"))
+                if rPr is None:
+                    from docx.oxml import OxmlElement
+                    rPr = OxmlElement("w:rPr")
+                    run._element.insert(0, rPr)
+                _add_strikethrough_to_rPr(rPr)
+                _add_font_color_to_rPr(rPr, "FF0000")
+            insert_after = target_el
+            for para_text_line in raw_paras:
+                new_p = _make_highlighted_paragraph_xml(ref_para, para_text_line, "yellow")
+                insert_after.addnext(new_p)
+                insert_after = new_p
+        elif position == "before":
+            for para_text_line in reversed(raw_paras):
+                new_p = _make_highlighted_paragraph_xml(ref_para, para_text_line, "yellow")
+                target_el.addprevious(new_p)
+        else:  # after (default)
+            insert_after = target_el
+            for para_text_line in raw_paras:
+                new_p = _make_highlighted_paragraph_xml(ref_para, para_text_line, "yellow")
+                insert_after.addnext(new_p)
+                insert_after = new_p
+        logger.info(
+            "Research-insert (tracked): %d paragraph(s) %s idx %d",
+            len(raw_paras), position, target_idx,
+        )
+        return True
+
+    # Clean export — plain inserted paragraphs, matching document formatting
+    joined = "\n\n".join(raw_paras)
+    if position == "replace":
+        # Clear the target paragraph's text, then insert new content after it
+        target_para = docx_doc.paragraphs[target_idx]
+        target_el = target_para._element
+        prev_sibling = target_el.getprevious()
+        target_el.getparent().remove(target_el)
+        # Re-index after removal: the previous sibling anchors insertion
+        if prev_sibling is not None:
+            # Walk paragraphs list again to locate the new index
+            for i, p in enumerate(docx_doc.paragraphs):
+                if p._element is prev_sibling:
+                    _insert_text_near_paragraph(docx_doc, i, joined, before=False)
+                    break
+        else:
+            _insert_text_near_paragraph(docx_doc, 0, joined, before=True)
+    else:
+        _insert_text_near_paragraph(docx_doc, target_idx, joined, before=(position == "before"))
+    logger.info(
+        "Research-insert (clean): %d paragraph(s) %s idx %d",
+        len(raw_paras), position, target_idx,
+    )
+    return True
+
+
+def _qn_w(tag: str) -> str:
+    """Short helper for qn('w:tag') without importing at every use site."""
+    from docx.oxml.ns import qn
+    return qn(f"w:{tag}")
+
+
+def _apply_insert_media_patch(docx_doc, meta: dict) -> bool:
+    """Insert a user-uploaded figure/table into the DOCX at the chosen section,
+    then auto-renumber downstream figures/tables and their in-text references.
+
+    Returns True on success, False otherwise.
+    """
+    from docx.shared import Inches
+    from app.services.renumbering_service import RenumberingService
+
+    media_type = meta.get("media_type")
+    file_path = meta.get("file_path", "")
+    caption = (meta.get("caption") or "").strip()
+    section_text = (meta.get("section_text") or "").strip()
+    position = meta.get("position", "after")
+    para_idx_hint = meta.get("paragraph_index", -1)
+    para_text = (meta.get("paragraph_text") or "").strip()
+    is_paragraph_level = para_idx_hint is not None and para_idx_hint >= 0 and para_text
+
+    if not os.path.exists(file_path):
+        logger.warning("Insert-media: file not found at %s", file_path)
+        return False
+    if not section_text and not is_paragraph_level:
+        logger.warning("Insert-media: empty section_text")
+        return False
+
+    # Determine the target element (paragraph-level vs section-level)
+    target_el = None
+
+    if is_paragraph_level:
+        # Find the target paragraph by index hint, fall back to text search
+        target_idx = None
+        if para_idx_hint < len(docx_doc.paragraphs):
+            if para_text[:50] in (docx_doc.paragraphs[para_idx_hint].text or ""):
+                target_idx = para_idx_hint
+        if target_idx is None:
+            for search_idx, p in enumerate(docx_doc.paragraphs):
+                if para_text[:50] in (p.text or ""):
+                    target_idx = search_idx
+                    break
+        if target_idx is None:
+            logger.warning(
+                "Insert-media: paragraph '%s...' not found, falling back to section",
+                para_text[:40],
+            )
+            is_paragraph_level = False
+        else:
+            logger.info(
+                "Insert-media: found target paragraph at idx %d (position=%s)",
+                target_idx, position,
+            )
+            target_el = docx_doc.paragraphs[target_idx]._element
+            if position == "replace":
+                # Remove target paragraph — insertion will land where it was
+                parent = target_el.getparent()
+                # Insert a placeholder empty p to hold the position, then remove later
+                # Simpler: keep a reference to the previous sibling and insert after it
+                prev_sibling = target_el.getprevious()
+                parent.remove(target_el)
+                target_el = prev_sibling  # insert after prev
+                position = "after"
+                if target_el is None:
+                    # Edge case: target was the first element — insert at top of body
+                    target_el = parent[0] if len(parent) > 0 else None
+                    position = "before"
+
+    if target_el is None:
+        # Section-level targeting (fallback or explicit)
+        heading_idx = _find_heading_in_docx(docx_doc, section_text)
+        if heading_idx is None:
+            logger.warning("Insert-media: heading '%s' not found", section_text)
+            return False
+
+        target_el = docx_doc.paragraphs[heading_idx]._element
+
+        if position == "replace":
+            # Remove body paragraphs under this heading, then insert after heading
+            body_indices = []
+            for idx in range(heading_idx + 1, len(docx_doc.paragraphs)):
+                p = docx_doc.paragraphs[idx]
+                sname = p.style.name if p.style else ""
+                if sname.startswith("Heading"):
+                    break
+                body_indices.append(idx)
+            for idx in reversed(body_indices):
+                p = docx_doc.paragraphs[idx]
+                p._element.getparent().remove(p._element)
+            position = "after"
+
+    # Determine the correct new number based on where in the body the
+    # figure/table will actually land — NOT just "last existing + 1".
+    # Chapter hint comes from the selected section heading:
+    #   "1.3 Step 1: ..."  → "1"
+    #   "Chapter 3"        → "3"
+    chap_match = re.match(r"^\s*(?:Chapter\s+)?(\d+)\b", section_text)
+    chapter_hint = chap_match.group(1) if chap_match else "1"
+    new_number, existing_numbers = _determine_inserted_number(
+        target_el, chapter_hint, media_type, position, docx_doc=docx_doc,
+    )
+    logger.info(
+        "Insert-media: positional new number for %s = %s (chapter=%s, existing=%s)",
+        media_type, new_number, chapter_hint, existing_numbers,
+    )
+
+    # Build new paragraphs: image/table + caption
+    label = "Figure" if media_type == "figure" else "Table"
+    full_caption = f"{label} {new_number}" + (f". {caption}" if caption else "")
+
+    # Insert the media paragraph
+    media_para = docx_doc.add_paragraph()
+    try:
+        if media_type == "figure" or file_path.lower().endswith(
+            (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff")
+        ):
+            run = media_para.add_run()
+            run.add_picture(file_path, width=Inches(5.5))
+        else:
+            # Table uploaded as docx/xlsx/csv — embed as plain text fallback
+            media_para.add_run(f"[Embedded {label} file: {os.path.basename(file_path)}]")
+    except Exception as pic_err:
+        logger.error("Insert-media: failed to embed file: %s", pic_err)
+        # Leave the empty paragraph; caption will still show the number
+    media_el = media_para._element
+
+    # Caption paragraph
+    caption_para = docx_doc.add_paragraph()
+    cap_run = caption_para.add_run(full_caption)
+    cap_run.bold = True
+    caption_el = caption_para._element
+
+    # Move the two new elements from the end of doc to the target position
+    parent = media_el.getparent()
+    parent.remove(media_el)
+    parent = caption_el.getparent()
+    parent.remove(caption_el)
+
+    if position == "before":
+        target_el.addprevious(media_el)
+        media_el.addnext(caption_el)
+    else:
+        # "after" (replace has been normalized to after)
+        target_el.addnext(media_el)
+        media_el.addnext(caption_el)
+
+    logger.info(
+        "Insert-media: inserted %s %s (%s) %s %s '%s'",
+        media_type, new_number, os.path.basename(file_path), position,
+        "paragraph in" if is_paragraph_level else "section",
+        section_text,
+    )
+
+    # Auto-renumber downstream items and their in-text references
+    if existing_numbers:
+        full_text = "\n".join(p.text or "" for p in docx_doc.paragraphs)
+        _, number_map = RenumberingService.renumber_after_insertion(
+            full_text, existing_numbers, new_number, ref_type=media_type,
+        )
+        if number_map:
+            # Walk the body paragraphs and rewrite runs for shifted numbers.
+            # IMPORTANT: skip the newly-inserted caption so it doesn't get
+            # swept up by the regex rename (which would corrupt its number).
+            _apply_number_map_to_paragraphs(
+                docx_doc, number_map, media_type, skip_elements={caption_el},
+            )
+            logger.info("Insert-media: renumbered %d downstream %s(s): %s",
+                        len(number_map), media_type, number_map)
+        else:
+            logger.info("Insert-media: no downstream renumbering needed (number_map empty)")
+    else:
+        logger.info("Insert-media: no existing numbers found — skipping renumber")
+
+    # Post-renumber verification: scan all captions after insertion and check
+    # for duplicates or gaps (helps diagnose renumbering issues).
+    post_numbers = _scan_existing_media_numbers(docx_doc, media_type)
+    logger.info("Insert-media: post-renumber %s numbers in doc: %s", media_type, post_numbers)
+    # Check for duplicates
+    seen = set()
+    for n in post_numbers:
+        if n in seen:
+            logger.warning("Insert-media: DUPLICATE %s number found after renumber: %s", media_type, n)
+        seen.add(n)
+
+    return True
+
+
+def _apply_number_map_to_paragraphs(
+    docx_doc, number_map: dict, media_type: str, skip_elements: set = None,
+):
+    """Rewrite in-text 'Figure X-Y' / 'Table X-Y' references using number_map.
+    Order: renumber highest first to avoid collisions (3-3 -> 3-4 before 3-2 -> 3-3).
+
+    Iterates ALL <w:p> descendants in the document body, including
+    paragraphs nested inside tables (captions are often placed in layout
+    table cells in books). python-docx's `Document.paragraphs` only
+    returns top-level paragraphs, so we walk the XML tree directly.
+
+    skip_elements: set of XML elements to exclude from rewrite (e.g. a newly
+    inserted caption that should keep its fresh number).
+    """
+    from docx.oxml.ns import qn as _qn
+
+    skip_elements = skip_elements or set()
+    if media_type == "figure":
+        prefix_pat = r"(?:Figure|Fig\.?)"
+    else:
+        prefix_pat = r"(?:Table|Tbl\.?)"
+
+    P_TAG = _qn("w:p")
+    T_TAG = _qn("w:t")
+
+    # SMAD-style books use non-breaking hyphen (U+2011) or other Unicode
+    # dashes inside caption numbers ("Fig. 1‑4") to prevent line-breaking.
+    # We must match ALL dash variants, not just ASCII "-".
+    DASH_CHARS = "\u002d\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
+    dash_class = f"[{DASH_CHARS}]"
+    dash_split_re = re.compile(f"[{DASH_CHARS}]")
+
+    # Sort: old_nums descending by sequence so renames don't collide
+    def sort_key(item):
+        m = re.match(r"^(\d+)[\-\.](\d+)$", item[0])
+        return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+    ordered = sorted(number_map.items(), key=sort_key, reverse=True)
+
+    body = docx_doc.element.body
+    all_paragraphs = list(body.iter(P_TAG))
+
+    total_hits = 0
+    for old_num, new_num in ordered:
+        old_parts = dash_split_re.split(old_num)
+        new_parts = dash_split_re.split(new_num)
+        if len(old_parts) != 2 or len(new_parts) != 2:
+            logger.warning("Renumber %s: skipping malformed %s → %s", media_type, old_num, new_num)
+            continue
+        # Build pattern that matches the old number with ANY unicode dash
+        # between the chapter and sequence parts, and captures that dash so
+        # replacement can preserve it (keeping non-breaking behaviour).
+        pattern = re.compile(
+            rf"\b({prefix_pat}\s+){re.escape(old_parts[0])}({dash_class}){re.escape(old_parts[1])}(?![0-9])",
+            re.IGNORECASE,
+        )
+        repl = rf"\g<1>{new_parts[0]}\g<2>{new_parts[1]}"
+        hits = 0
+        for p_el in all_paragraphs:
+            if p_el in skip_elements:
+                continue
+            # Collect ALL <w:t> descendants of this paragraph — this reaches
+            # runs nested inside <w:hyperlink>, <w:smartTag>, <w:fldSimple>,
+            # <mc:AlternateContent>, etc., which `findall('w:r')` would miss.
+            # In SMAD-style books, figure captions often use REF/SEQ fields
+            # or hyperlinks, so nested traversal is required.
+            t_refs = list(p_el.iter(T_TAG))
+            if not t_refs:
+                continue
+            full = "".join(t.text or "" for t in t_refs)
+            if not pattern.search(full):
+                continue
+            new_full = pattern.sub(repl, full)
+            if new_full == full:
+                continue
+            # Place the rewritten text in the first <w:t>, blank the rest.
+            # This may merge differently-styled runs but keeps text correct.
+            t_refs[0].text = new_full
+            for t in t_refs[1:]:
+                t.text = ""
+            hits += 1
+        total_hits += hits
+        logger.info(
+            "Renumber %s: %s → %s applied to %d paragraph(s)",
+            media_type, old_num, new_num, hits,
+        )
+    logger.info(
+        "Renumber %s: total %d paragraph rewrites across %d number map entries",
+        media_type, total_hits, len(ordered),
+    )
 
 
 # ── Visual Diff / Tracked Changes Helpers ─────────────────────────────────
@@ -3809,11 +5001,50 @@ def _build_tracked_changes_docx(original_path: str, approved_patches: list, outp
 
     regular_applied = 0
     ai_applied = 0
+    media_inserted = 0
     regular_patches = []  # collect for grouped-per-paragraph application
 
     for patch in approved_patches:
         final_text = patch.get("editor_revision") or patch.get("revised_sentence", "")
         ask_ai_meta = patch.get("ask_ai_meta")
+        insert_media_meta = patch.get("insert_media_meta")
+        research_insert_meta = patch.get("research_insert_meta")
+
+        # --- Research-insert patches: drop drafted content at chosen location
+        # (highlighted as tracked-insert). Content field holds the final edited
+        # prose. Placement fields mirror insert-media / ask-ai semantics.
+        if research_insert_meta:
+            try:
+                if _apply_research_insert_patch(
+                    docx_doc, research_insert_meta, tracked=True,
+                ):
+                    ai_applied += 1
+                    logger.info(
+                        "TRACKED: research-insert applied (section=%s, position=%s)",
+                        (research_insert_meta.get("section_text") or "")[:40],
+                        research_insert_meta.get("position"),
+                    )
+            except Exception as ri_err:
+                logger.error(
+                    "TRACKED: research-insert failed (patch_id=%s): %s",
+                    patch.get("patch_id"), ri_err,
+                )
+            continue
+
+        # --- Insert Media patches: insert uploaded figure/table + renumber ---
+        if insert_media_meta:
+            try:
+                if _apply_insert_media_patch(docx_doc, insert_media_meta):
+                    media_inserted += 1
+                    logger.info(
+                        "TRACKED: insert-media applied (%s, section=%s)",
+                        insert_media_meta.get("media_type"),
+                        (insert_media_meta.get("section_text") or "")[:40],
+                    )
+            except Exception as im_err:
+                logger.error("TRACKED: insert-media failed (patch_id=%s): %s",
+                             patch.get("patch_id"), im_err)
+            continue
 
         if not final_text:
             continue
@@ -3951,7 +5182,10 @@ def _build_tracked_changes_docx(original_path: str, approved_patches: list, outp
             logger.warning("TRACKED: original text not found: '%s...'", rp["original_text"][:50])
 
     docx_doc.save(output_path)
-    logger.info("TRACKED: visual diff DOCX saved — %d regular, %d AI patches applied", regular_applied, ai_applied)
+    logger.info(
+        "TRACKED: visual diff DOCX saved — %d regular, %d AI, %d insert-media patches applied",
+        regular_applied, ai_applied, media_inserted,
+    )
 
 
 def _make_highlighted_paragraph_xml(ref_para, text: str, highlight_color: str):

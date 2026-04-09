@@ -29,6 +29,8 @@ class ChangeType(str, Enum):
     LANDSCAPE_UPDATE = "landscape_update"
     PREDICTION_UPDATE = "prediction_update"
     AI_PROMPT = "ai_prompt"
+    INSERT_FIGURE = "insert_figure"
+    INSERT_TABLE = "insert_table"
 
 
 class ApprovalAction(str, Enum):

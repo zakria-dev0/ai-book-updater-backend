@@ -683,9 +683,13 @@ class ExportService:
                    and not c.get("old_content", "").startswith("[AI Prompt:")
                    or c.get("change_type") == "ai_prompt"
             ]
+            insert_media_changes = [
+                c for c in approved_changes
+                if c.get("change_type") in ("insert_figure", "insert_table")
+            ]
             regular_changes = [
                 c for c in approved_changes
-                if c.get("change_type") != "ai_prompt"
+                if c.get("change_type") not in ("ai_prompt", "insert_figure", "insert_table")
             ]
 
             # Sort regular changes by paragraph index (descending) so that
@@ -909,6 +913,186 @@ class ExportService:
                     style_ref = global_style_ref
                     count = _append_to_body_end(doc, new_content, hl_color, style_ref)
                     insertions_made += count
+
+            # 3. Apply figure/table insertions (media uploads with auto-renumbering)
+            if insert_media_changes:
+                from docx.shared import Inches
+
+                # Sort descending by paragraph_idx so earlier insertions don't
+                # shift the positions of later ones
+                sorted_media_changes = sorted(
+                    insert_media_changes,
+                    key=lambda c: c.get("paragraph_idx", 0),
+                    reverse=True,
+                )
+
+                for change in sorted_media_changes:
+                    meta = change.get("insert_media_metadata", {}) or {}
+                    media_type = meta.get("media_type", "figure")
+                    file_path_media = meta.get("file_path", "")
+                    caption_text = meta.get("caption", "")
+                    proposed_number = meta.get("proposed_number", "")
+                    placement_m = meta.get("placement", "at_end")
+                    section_title_m = meta.get("section_title", "")
+
+                    if not file_path_media or not os.path.exists(file_path_media):
+                        logger.warning(
+                            "insert-media: file not found, skipping: %s", file_path_media,
+                        )
+                        continue
+
+                    label = "Figure" if media_type == "figure" else "Table"
+                    full_caption = f"{label} {proposed_number}: {caption_text}" if proposed_number else f"{label}: {caption_text}"
+
+                    # Find the insertion target element in the body
+                    insert_target = None
+                    para_idx = change.get("paragraph_idx", 0)
+
+                    if placement_m == "at_end":
+                        body = doc.element.body
+                        sect_prs = [child for child in body if child.tag == qn("w:sectPr")]
+                        last_sect_pr = sect_prs[-1] if sect_prs else None
+                        insert_before_el = last_sect_pr
+                    else:
+                        if section_title_m:
+                            heading_el = _find_text_in_body(doc, section_title_m)
+                            if heading_el is not None:
+                                insert_target = _find_section_end_in_body(doc, heading_el)
+                        if insert_target is None and para_idx < len(doc.paragraphs):
+                            target_para = doc.paragraphs[min(para_idx, len(doc.paragraphs) - 1)]
+                            insert_target = target_para._element
+                        insert_before_el = None
+
+                    # Create a new paragraph, insert the picture, then the caption
+                    try:
+                        style_ref = (
+                            _find_body_style_ref(doc, near_element=insert_target)
+                            if insert_target is not None
+                            else global_style_ref
+                        )
+
+                        # Build the image paragraph via docx's add_picture (it
+                        # creates a paragraph at the end). We then move it to
+                        # the right spot.
+                        from docx.text.paragraph import Paragraph
+
+                        img_para = doc.add_paragraph()
+                        img_run = img_para.add_run()
+                        ext = os.path.splitext(file_path_media)[1].lower()
+                        if ext in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif"}:
+                            try:
+                                img_run.add_picture(file_path_media, width=Inches(5.5))
+                            except Exception as e:
+                                logger.warning(
+                                    "Could not add image %s: %s — inserting as text reference",
+                                    file_path_media, e,
+                                )
+                                img_run.text = f"[{label}: {os.path.basename(file_path_media)}]"
+                        else:
+                            # Non-image (e.g. .docx/.xlsx/.csv) — insert a placeholder text
+                            img_run.text = f"[{label} attachment: {os.path.basename(file_path_media)}]"
+
+                        # Build the caption paragraph
+                        cap_para = doc.add_paragraph()
+                        cap_run = cap_para.add_run(full_caption)
+                        cap_run.bold = True
+                        if highlighted:
+                            _add_highlight(cap_run, "green")
+
+                        img_el = img_para._element
+                        cap_el = cap_para._element
+
+                        # Remove them from their appended position and place them
+                        # at the right spot
+                        img_el.getparent().remove(img_el)
+                        cap_el.getparent().remove(cap_el)
+
+                        if placement_m == "at_end":
+                            if insert_before_el is not None:
+                                insert_before_el.addprevious(img_el)
+                                insert_before_el.addprevious(cap_el)
+                            else:
+                                doc.element.body.append(img_el)
+                                doc.element.body.append(cap_el)
+                            insertions_made += 2
+                        else:
+                            if insert_target is not None:
+                                # Insert caption first, then image (both via addnext),
+                                # so final order is: target, img, caption
+                                insert_target.addnext(cap_el)
+                                insert_target.addnext(img_el)
+                                insertions_made += 2
+                            else:
+                                # Fallback: append at end
+                                doc.element.body.append(img_el)
+                                doc.element.body.append(cap_el)
+                                insertions_made += 2
+
+                        logger.info(
+                            "Inserted %s %s (%s) at %s",
+                            media_type, proposed_number, caption_text[:40], placement_m,
+                        )
+
+                        # ── Auto-renumber downstream figures/tables in text ──
+                        # Rewrite text_content in document_data so downstream
+                        # reference validation sees the new numbering. Also
+                        # rewrite references in the DOCX body paragraphs.
+                        existing_numbers = []
+                        items = document_data.get(
+                            "figures" if media_type == "figure" else "tables", []
+                        ) or []
+                        for item in items:
+                            num = item.get("number") if isinstance(item, dict) else getattr(item, "number", None)
+                            if num:
+                                existing_numbers.append(num)
+
+                        if proposed_number and existing_numbers:
+                            current_text = document_data.get("text_content", "") or ""
+                            updated_text, number_map = RenumberingService.renumber_after_insertion(
+                                current_text,
+                                existing_numbers,
+                                proposed_number,
+                                ref_type=media_type,
+                            )
+                            if number_map:
+                                document_data["text_content"] = updated_text
+
+                                # Also apply to DOCX body paragraphs — scan
+                                # every paragraph's runs and replace matched
+                                # Figure/Table references.
+                                for para in doc.paragraphs:
+                                    para_text = para.text
+                                    if not para_text:
+                                        continue
+                                    new_para_text = para_text
+                                    for old_num, new_num in number_map.items():
+                                        new_para_text = RenumberingService.renumber_after_changes(
+                                            new_para_text, old_num, new_num, media_type,
+                                        )
+                                    if new_para_text != para_text:
+                                        # Replace runs with the updated text
+                                        if para.runs:
+                                            para.runs[0].text = new_para_text
+                                            for r in para.runs[1:]:
+                                                r.text = ""
+
+                                # Update the figures/tables collection in
+                                # document_data so reference validation and
+                                # any downstream users see the new numbers.
+                                for item in items:
+                                    cur_num = item.get("number") if isinstance(item, dict) else None
+                                    if cur_num in number_map:
+                                        item["number"] = number_map[cur_num]
+
+                                logger.info(
+                                    "Renumbered %d %s references after insertion of %s %s",
+                                    len(number_map), media_type, label, proposed_number,
+                                )
+                    except Exception as e:
+                        logger.error(
+                            "Failed to insert %s from %s: %s",
+                            media_type, file_path_media, e,
+                        )
 
             # Save to output directory
             os.makedirs(settings.OUTPUT_DIR, exist_ok=True)
