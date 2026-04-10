@@ -1275,9 +1275,11 @@ async def approve_custom_research_issue(
         "rationale": f"User research: {label}",
         "confidence": 1.0,
         "change_pct": 100.0,
-        "status": PatchStatus.PENDING.value,
+        # Already approved by user in the research review card — no second
+        # review needed in the regular patch list.
+        "status": PatchStatus.APPROVED.value,
         "editor_revision": None,
-        "reviewed_at": None,
+        "reviewed_at": datetime.utcnow().isoformat(),
         "section_ref": f"{pos_label}: {req.section_text}",
         "is_custom": True,
         "custom_kind": "research",
@@ -1437,8 +1439,9 @@ Allowed source types: {', '.join(allowed_sources)}
 Web research gathered the following sources:
 {evidence_block}
 
-Write 2-4 concise paragraphs of book-ready prose that the editor can insert
-into a chapter. Requirements:
+Write exactly 3 to 4 SHORT paragraphs (4-6 sentences each) of book-ready
+prose that the editor can insert into a chapter. Keep total length under
+800 words. Requirements:
 - Match the measured, technical tone of a reference book (not a blog post).
 - Include concrete current facts, numbers, and dates from the sources where relevant.
 - Use inline citations as bracketed numbers [1], [2] matching the source list above.
@@ -1447,16 +1450,17 @@ into a chapter. Requirements:
 - Do NOT preface with 'Here is...' — output the content directly.
 - Preserve Greek symbols (Δ, α, β) and unit subscripts (v₁) as-is if used.
 
-Output only the drafted paragraphs. No numbering, no headings, no titles."""
+Output only the drafted paragraphs. No numbering, no headings, no titles.
+IMPORTANT: Maximum 4 paragraphs. Be concise and focused."""
 
     synth_resp = await client.chat.completions.create(
         model=settings.GPT_MODEL,
         messages=[
-            {"role": "system", "content": "You are a precise technical editor writing reference-book content."},
+            {"role": "system", "content": "You are a precise technical editor writing reference-book content. Keep your output concise — maximum 4 short paragraphs, under 800 words total."},
             {"role": "user", "content": synth_prompt},
         ],
         temperature=0.4,
-        max_tokens=1500,
+        max_tokens=1000,
     )
     draft = (synth_resp.choices[0].message.content or "").strip()
 
@@ -2933,34 +2937,75 @@ def _normalize_text(text: str) -> str:
 
 
 def _find_heading_in_docx(docx_doc, section_text: str):
-    """Find a heading paragraph index using multiple matching strategies."""
-    normalized_target = _normalize_text(section_text)
+    """Find a heading paragraph index using multiple matching strategies.
 
-    # Strategy 1: Exact substring match
-    for idx, para in enumerate(docx_doc.paragraphs):
-        if section_text in para.text:
-            return idx
-
-    # Strategy 2: Normalized (whitespace + case-insensitive) match
-    for idx, para in enumerate(docx_doc.paragraphs):
-        if normalized_target in _normalize_text(para.text):
-            return idx
-
-    # Strategy 3: Match by stripping leading numbers (e.g., "1.2 Title" -> "Title")
+    Prioritises paragraphs whose style starts with 'Heading' so that body
+    paragraphs that merely *reference* a section title are not picked up
+    instead of the real heading.
+    """
     import re
+
+    normalized_target = _normalize_text(section_text)
     core_text = re.sub(r'^[\d.]+\s*', '', section_text).strip()
-    if core_text and len(core_text) > 3:
-        core_lower = core_text.lower()
+    core_lower = core_text.lower() if core_text and len(core_text) > 3 else ""
+    target_words = set(normalized_target.split())
+
+    def _is_heading(para) -> bool:
+        style_name = para.style.name if para.style else ""
+        return style_name.lower().startswith("heading")
+
+    # ---------- helpers for each strategy ----------
+    def _exact_match(para) -> bool:
+        return section_text in para.text
+
+    def _normalized_match(para) -> bool:
+        return normalized_target in _normalize_text(para.text)
+
+    def _core_match(para) -> bool:
+        if not core_lower:
+            return False
+        para_core = re.sub(r'^[\d.]+\s*', '', para.text).strip().lower()
+        return core_lower in para_core or para_core in core_lower
+
+    # ---------- Pass 1: only heading-styled paragraphs ----------
+    for strategy in (_exact_match, _normalized_match, _core_match):
         for idx, para in enumerate(docx_doc.paragraphs):
-            para_core = re.sub(r'^[\d.]+\s*', '', para.text).strip().lower()
-            if core_lower in para_core or para_core in core_lower:
+            if _is_heading(para) and strategy(para):
+                logger.info("_find_heading_in_docx: matched heading idx %d (style=%s) text=%r",
+                            idx, para.style.name if para.style else "?", para.text[:80])
                 return idx
 
-    # Strategy 4: Check if section_text contains most words of any paragraph
-    target_words = set(normalized_target.split())
+    # Word-overlap strategy — heading-styled only
     if len(target_words) >= 3:
-        best_idx = None
-        best_overlap = 0
+        best_idx, best_overlap = None, 0
+        for idx, para in enumerate(docx_doc.paragraphs):
+            if not _is_heading(para):
+                continue
+            para_text = para.text.strip()
+            if not para_text:
+                continue
+            para_words = set(_normalize_text(para_text).split())
+            overlap = len(target_words & para_words)
+            ratio = overlap / max(len(target_words), 1)
+            if ratio > 0.7 and overlap > best_overlap:
+                best_overlap = overlap
+                best_idx = idx
+        if best_idx is not None:
+            logger.info("_find_heading_in_docx: word-overlap heading idx %d", best_idx)
+            return best_idx
+
+    # ---------- Pass 2: fallback — any paragraph ----------
+    logger.warning("_find_heading_in_docx: no heading-styled match for %r, falling back to all paragraphs",
+                   section_text[:60])
+    for strategy in (_exact_match, _normalized_match, _core_match):
+        for idx, para in enumerate(docx_doc.paragraphs):
+            if strategy(para):
+                logger.info("_find_heading_in_docx: fallback matched idx %d text=%r",
+                            idx, para.text[:80])
+                return idx
+
+    if len(target_words) >= 3:
+        best_idx, best_overlap = None, 0
         for idx, para in enumerate(docx_doc.paragraphs):
             para_text = para.text.strip()
             if not para_text:
@@ -2972,18 +3017,35 @@ def _find_heading_in_docx(docx_doc, section_text: str):
                 best_overlap = overlap
                 best_idx = idx
         if best_idx is not None:
+            logger.info("_find_heading_in_docx: fallback word-overlap idx %d", best_idx)
             return best_idx
 
     return None
 
 
 def _find_reference_body_paragraph(docx_doc, heading_idx: int):
-    """Find the nearest body (non-heading) paragraph after the heading to copy formatting from."""
+    """Find the nearest body (non-heading) paragraph to copy formatting from.
+
+    Searches BEFORE the heading first (same visual section), then AFTER.
+    This ensures the inserted content matches the surrounding body text
+    font, size, and spacing — not the next section's potentially different
+    style.
+    """
+    # Prefer a body paragraph BEFORE (same section context)
+    for idx in range(heading_idx - 1, -1, -1):
+        para = docx_doc.paragraphs[idx]
+        style_name = para.style.name if para.style else ""
+        if style_name.startswith("Heading"):
+            break  # hit a preceding heading — stop, don't cross sections
+        if para.text.strip():
+            return para
+    # Fallback: search AFTER the heading
     for idx in range(heading_idx + 1, len(docx_doc.paragraphs)):
         para = docx_doc.paragraphs[idx]
         style_name = para.style.name if para.style else ""
         if not style_name.startswith("Heading") and para.text.strip():
             return para
+    # Last resort: any body paragraph anywhere before
     for idx in range(heading_idx - 1, -1, -1):
         para = docx_doc.paragraphs[idx]
         style_name = para.style.name if para.style else ""
@@ -3058,7 +3120,10 @@ def _insert_text_near_paragraph(docx_doc, para_idx: int, text: str, before: bool
     lines = [line.strip() for line in text.split("\n") if line.strip()]
 
     if before:
-        for line in reversed(lines):
+        # Each addprevious() inserts directly before target_element, so later
+        # inserts land between earlier inserts and target. Iterating in
+        # original order produces correct top-to-bottom reading order.
+        for line in lines:
             new_para = _build_formatted_paragraph(docx_doc, ref_para, line)
             target_element.addprevious(new_para._element)
             logger.info("  Inserted paragraph BEFORE idx %d: '%s...'", para_idx, line[:60])
@@ -3345,7 +3410,10 @@ def _apply_research_insert_patch(docx_doc, meta: dict, tracked: bool = False) ->
                 insert_after.addnext(new_p)
                 insert_after = new_p
         elif position == "before":
-            for para_text_line in reversed(raw_paras):
+            # Each addprevious() inserts directly before target_el, so later
+            # inserts land between earlier inserts and target. Iterating in
+            # original order produces correct top-to-bottom reading order.
+            for para_text_line in raw_paras:
                 new_p = _make_highlighted_paragraph_xml(ref_para, para_text_line, "yellow")
                 target_el.addprevious(new_p)
         else:  # after (default)
