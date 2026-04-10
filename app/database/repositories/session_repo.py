@@ -123,6 +123,17 @@ class SessionRepository:
         result = await self.opportunities.delete_many({"session_id": session_id})
         return result.deleted_count
 
+    async def update_opportunity(self, session_id: str, opportunity_id: str, updates: dict) -> int:
+        """Set arbitrary fields on a single opportunity.
+        Matches by (session_id, opportunity_id) — the short UUID used in code,
+        not the Mongo _id. Returns modified_count.
+        """
+        result = await self.opportunities.update_one(
+            {"session_id": session_id, "opportunity_id": opportunity_id},
+            {"$set": updates},
+        )
+        return result.modified_count
+
     # ------------------------------------------------------------------ #
     # Research Plans                                                       #
     # ------------------------------------------------------------------ #
@@ -273,6 +284,12 @@ class SessionRepository:
 
     async def delete_patches(self, session_id: str) -> int:
         result = await self.patches.delete_many({"session_id": session_id})
+        return result.deleted_count
+
+    async def delete_patch(self, session_id: str, patch_id: str) -> int:
+        result = await self.patches.delete_one(
+            {"session_id": session_id, "patch_id": patch_id}
+        )
         return result.deleted_count
 
     # ------------------------------------------------------------------ #

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, BackgroundTasks, Request, UploadFile, File, Form
 from typing import List, Optional
 from pydantic import BaseModel, Field
 from datetime import datetime
@@ -1140,4 +1140,207 @@ async def generate_ai_prompt(
     return {
         "change": response_change,
         "message": f"AI content generated: {summary}",
+    }
+
+
+# ------------------------------------------------------------------ #
+# Insert figure / table (multipart upload)                             #
+# ------------------------------------------------------------------ #
+
+@router.post(
+    "/{document_id}/insert-media",
+    summary="Insert a new figure or table into the document",
+    responses={
+        200: {"description": "Insert-media change proposal created"},
+        400: {"description": "Invalid request"},
+        403: {"description": "Not authorized"},
+        404: {"description": "Document not found"},
+    },
+)
+@limiter.limit("10/minute")
+async def insert_media(
+    request: Request,
+    document_id: str,
+    file: UploadFile = File(..., description="Image file for figure, or image/docx for table"),
+    media_type: str = Form(..., description="'figure' or 'table'"),
+    placement: str = Form(..., description="'after_section', 'at_end', or 'replace_section'"),
+    section_index: Optional[int] = Form(default=None),
+    caption: Optional[str] = Form(default=None),
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """
+    Insert a new figure or table at the chosen section. Creates a change
+    proposal that, when approved and exported, inserts the media and
+    auto-renumbers all downstream figures/tables (and in-text references).
+    """
+    import os
+    import shutil
+    from app.core.config import settings
+
+    if media_type not in ("figure", "table"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="media_type must be 'figure' or 'table'",
+        )
+
+    if placement not in ("after_section", "at_end", "replace_section"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="placement must be 'after_section', 'at_end', or 'replace_section'",
+        )
+
+    if placement in ("after_section", "replace_section") and section_index is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="section_index is required for 'after_section' and 'replace_section' placement",
+        )
+
+    # Validate file extension
+    filename = file.filename or ""
+    ext = os.path.splitext(filename)[1].lower()
+    allowed_img = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
+    allowed_table = allowed_img | {".docx", ".xlsx", ".csv"}
+    allowed = allowed_img if media_type == "figure" else allowed_table
+    if ext not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported file type '{ext}' for {media_type}. Allowed: {sorted(allowed)}",
+        )
+
+    doc_repo = DocumentRepository(db)
+    document = await _get_owned_document(document_id, current_user, doc_repo, lightweight=False)
+
+    text_content = document.get("text_content", "")
+    paragraphs = text_content.split("\n")
+    sections = _extract_sections(text_content)
+
+    # Determine target paragraph index + human-readable placement description
+    target_para_idx = len(paragraphs) - 1
+    section_title: Optional[str] = None
+
+    if placement == "at_end":
+        target_para_idx = len(paragraphs) - 1
+    elif placement in ("after_section", "replace_section"):
+        if section_index is not None and section_index < len(sections):
+            section = sections[section_index]
+            target_para_idx = section["paragraph_idx"]
+            section_title = section["title"]
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid section_index",
+            )
+
+    # Save uploaded file to a dedicated media_inserts directory
+    media_dir = os.path.join(settings.UPLOAD_DIR, "media_inserts", document_id)
+    os.makedirs(media_dir, exist_ok=True)
+    unique_name = f"{uuid.uuid4().hex[:12]}{ext}"
+    saved_path = os.path.abspath(os.path.join(media_dir, unique_name))
+    with open(saved_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    file_size = os.path.getsize(saved_path)
+
+    # Determine the number the new figure/table should take. We insert it
+    # as the FIRST item of its type in the target section (if any existing
+    # figure/table is in or after that section, it gets bumped). Numbering
+    # follows "chapter-sequence" from the existing items' prefix.
+    existing_items = document.get("figures" if media_type == "figure" else "tables", []) or []
+    existing_numbers = [
+        (item.get("number") if isinstance(item, dict) else getattr(item, "number", None))
+        for item in existing_items
+    ]
+    existing_numbers = [n for n in existing_numbers if n]
+
+    # Guess chapter prefix — use the numeric prefix from the first existing
+    # item, or fall back to "1"
+    chapter_prefix = "1"
+    separator = "-"
+    if existing_numbers:
+        m = _re.match(r"^(\d+)([\-\.])(\d+)$", existing_numbers[0])
+        if m:
+            chapter_prefix = m.group(1)
+            separator = m.group(2)
+
+    # Determine the proposed insertion number: next sequence in the chapter
+    # (actual renumbering of downstream items happens on export)
+    proposed_seq = 1
+    if existing_numbers:
+        same_chap_seqs = []
+        for n in existing_numbers:
+            m = _re.match(r"^(\d+)([\-\.])(\d+)$", n)
+            if m and m.group(1) == chapter_prefix and m.group(2) == separator:
+                same_chap_seqs.append(int(m.group(3)))
+        if same_chap_seqs:
+            proposed_seq = min(same_chap_seqs)  # insert at the top of the chapter
+    proposed_number = f"{chapter_prefix}{separator}{proposed_seq}"
+
+    label = "Figure" if media_type == "figure" else "Table"
+    caption_text = caption.strip() if caption else f"{label} {proposed_number}"
+
+    change_type_value = (
+        ChangeType.INSERT_FIGURE.value if media_type == "figure" else ChangeType.INSERT_TABLE.value
+    )
+
+    change_data = {
+        "change_id": f"change_{uuid.uuid4().hex[:12]}",
+        "document_id": document_id,
+        "claim_id": f"insert_{media_type}_{uuid.uuid4().hex[:8]}",
+        "old_content": f"[Insert {label}: {caption_text[:80]}]",
+        "new_content": f"{label} {proposed_number}: {caption_text}",
+        "change_type": change_type_value,
+        "confidence": "high",
+        "sources": [],
+        "paragraph_idx": target_para_idx,
+        "page": None,
+        "status": ChangeStatus.PENDING.value,
+        "created_at": datetime.utcnow(),
+        "reviewer_note": f"Insert new {media_type}: {caption_text}",
+        "core_claim_status": None,
+        "approval_action": None,
+        "user_edited_content": None,
+        "insert_media_metadata": {
+            "media_type": media_type,
+            "file_path": saved_path,
+            "file_name": filename,
+            "file_size": file_size,
+            "caption": caption_text,
+            "proposed_number": proposed_number,
+            "placement": placement,
+            "section_index": section_index,
+            "section_title": section_title,
+        },
+    }
+
+    change_repo = ChangeRepository(db)
+    await change_repo.create(change_data)
+
+    logger.info(
+        "Insert-media change created for document %s (%s %s) by user %s",
+        document_id, media_type, proposed_number, current_user["email"],
+    )
+
+    response_change = {
+        "change_id": change_data["change_id"],
+        "document_id": change_data["document_id"],
+        "claim_id": change_data["claim_id"],
+        "old_content": change_data["old_content"],
+        "new_content": change_data["new_content"],
+        "change_type": change_data["change_type"],
+        "confidence": change_data["confidence"],
+        "sources": change_data["sources"],
+        "paragraph_idx": change_data["paragraph_idx"],
+        "page": change_data["page"],
+        "status": change_data["status"],
+        "created_at": change_data["created_at"].isoformat(),
+        "reviewer_note": change_data["reviewer_note"],
+        "core_claim_status": change_data["core_claim_status"],
+        "approval_action": change_data["approval_action"],
+        "user_edited_content": change_data["user_edited_content"],
+    }
+
+    return {
+        "change": response_change,
+        "message": f"{label} {proposed_number} queued for insertion",
     }
