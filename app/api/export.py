@@ -2,10 +2,11 @@ import os
 import csv
 import io
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Header
 from fastapi.responses import FileResponse, StreamingResponse
 from bson import ObjectId
-from app.core.security import get_current_user_dep
+from app.core.security import get_current_user_dep, verify_download_token
 from app.database.connection import get_database
 from app.database.repositories.change_repo import ChangeRepository
 from app.services.export_service import ExportService
@@ -181,14 +182,26 @@ async def preview_highlighted(
 )
 async def download_original(
     document_id: str,
-    current_user: dict = Depends(get_current_user_dep),
+    token: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
     db=Depends(get_database),
 ):
     """Download the original uploaded DOCX file before any changes."""
+    # Auth: accept either query param token (direct browser download) or Authorization header
+    if token:
+        current_user = verify_download_token(token)
+    elif authorization:
+        from app.core.security import decode_token
+        _, _, tok = authorization.partition(" ")
+        payload = decode_token(tok)
+        current_user = {"email": payload.get("sub"), "role": payload.get("role", "user")}
+    else:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+
     doc = await db.documents.find_one({"_id": ObjectId(document_id)})
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-    if doc.get("user_id") != current_user["email"]:
+    if current_user.get("role") != "admin" and doc.get("user_id") != current_user["email"]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your document")
 
     file_path = doc.get("file_path")

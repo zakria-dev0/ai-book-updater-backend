@@ -90,6 +90,7 @@ class OpportunitySelectRequest(BaseModel):
 class PlanApproveRequest(BaseModel):
     plan_id: str
     approved: bool = True
+    rejected: bool = False
 
 
 class EvidenceDecisionRequest(BaseModel):
@@ -1266,7 +1267,11 @@ async def approve_custom_research_issue(
         "patch_id": str(uuid.uuid4())[:8],
         "opportunity_id": opportunity_id,
         "session_id": session_id,
-        "original_sentence": f"[Research insert {pos_label.lower()} section: {req.section_text[:60]}]",
+        "original_sentence": (
+            f"[Research insert {pos_label.lower()} paragraph: {req.paragraph_text[:60]}]"
+            if req.paragraph_index >= 0 and req.paragraph_text.strip()
+            else f"[Research insert {pos_label.lower()} section: {req.section_text[:60]}]"
+        ),
         "revised_sentence": req.content.strip()[:400],
         "citation": "; ".join(
             f"[{c.get('index')}] {c.get('url', '')}"
@@ -1280,7 +1285,11 @@ async def approve_custom_research_issue(
         "status": PatchStatus.APPROVED.value,
         "editor_revision": None,
         "reviewed_at": datetime.utcnow().isoformat(),
-        "section_ref": f"{pos_label}: {req.section_text}",
+        "section_ref": (
+            f"{pos_label} paragraph in section: {req.section_text}"
+            if req.paragraph_index >= 0 and req.paragraph_text.strip()
+            else f"{pos_label} section: {req.section_text}"
+        ),
         "is_custom": True,
         "custom_kind": "research",
         "research_insert_meta": research_insert_meta,
@@ -1348,12 +1357,16 @@ async def plan_research(
 
 async def _run_custom_research(
     client, research_prompt: str, title: str, allowed_sources: list,
+    chapter_text: str = "",
 ) -> tuple[str, list]:
     """Run web research for a user-defined research topic and synthesize it
     into drafted content suitable for insertion into a book chapter.
 
     Returns (draft_content, citations). Draft is a single multi-paragraph
     string. Citations is a list of {title, url, source_type} dicts.
+
+    When *chapter_text* is provided, GPT receives an excerpt of the chapter
+    so that generated content is relevant to the document (not generic).
 
     Uses Tavily for web search (same provider as the automated research
     pipeline) and GPT for synthesis. If Tavily is not configured, falls back
@@ -1364,14 +1377,30 @@ async def _run_custom_research(
 
     tavily = TavilyResearchService()
 
+    # Sanitize chapter text: remove control characters and null bytes that
+    # break JSON serialization when sent to the OpenAI API.
+    if chapter_text:
+        import unicodedata
+        chapter_text = "".join(
+            ch for ch in chapter_text
+            if ch in ("\n", "\r", "\t") or (not unicodedata.category(ch).startswith("C"))
+        )
+
+    # Build a short chapter summary hint for search planning
+    chapter_hint = ""
+    if chapter_text and chapter_text.strip():
+        # Use first ~500 chars to give GPT a sense of the chapter topic
+        chapter_hint = f"\nChapter context (the book chapter this is for):\n\"{chapter_text.strip()[:500]}...\"\n"
+
     # 1) Run 2-3 parallel searches to gather sources
     search_plan_prompt = f"""The user wants the agent to research the following topic for a technical book update:
 Title: {title}
 Research request: {research_prompt}
-
+{chapter_hint}
 Generate 3 focused web search queries (English, specific, recent) that will
-find authoritative, up-to-date information. Return ONLY a JSON object with
-a single key "queries" containing a list of 3 query strings. No other text."""
+find authoritative, up-to-date information RELEVANT TO THE CHAPTER TOPIC.
+Do NOT generate generic queries — tailor them to the chapter's specific domain.
+Return ONLY a JSON object with a single key "queries" containing a list of 3 query strings. No other text."""
 
     try:
         plan_resp = await client.chat.completions.create(
@@ -1430,18 +1459,37 @@ a single key "queries" containing a list of 3 query strings. No other text."""
     else:
         evidence_block = "(No external sources found — rely on general knowledge. Flag uncertainty.)"
 
+    # Build chapter context excerpt — truncate to ~3000 chars to fit within
+    # token budget while giving GPT enough context about the chapter topic.
+    chapter_context_block = ""
+    if chapter_text and chapter_text.strip():
+        excerpt = chapter_text.strip()[:3000]
+        if len(chapter_text.strip()) > 3000:
+            excerpt += "\n... [truncated]"
+        chapter_context_block = f"""
+CHAPTER CONTEXT (the chapter this content will be inserted into):
+\"\"\"
+{excerpt}
+\"\"\"
+
+CRITICAL: The drafted content MUST be directly relevant to this chapter's
+subject matter. Do NOT write generic content. Tailor every paragraph to
+the specific topic, domain, and systems discussed in the chapter above.
+"""
+
     synth_prompt = f"""You are drafting new content for a technical book update.
 The user has requested research on:
 Title: {title}
 Request: {research_prompt}
 Allowed source types: {', '.join(allowed_sources)}
-
+{chapter_context_block}
 Web research gathered the following sources:
 {evidence_block}
 
 Write exactly 3 to 4 SHORT paragraphs (4-6 sentences each) of book-ready
 prose that the editor can insert into a chapter. Keep total length under
 800 words. Requirements:
+- The content MUST be relevant to the chapter's specific topic — not generic.
 - Match the measured, technical tone of a reference book (not a blog post).
 - Include concrete current facts, numbers, and dates from the sources where relevant.
 - Use inline citations as bracketed numbers [1], [2] matching the source list above.
@@ -1508,8 +1556,33 @@ async def _plan_research_task(session_id: str, session: dict):
             })
             return
 
+        # Fetch chapter text from the document (already stored in DB from
+        # initial parsing) so research content is tailored to the chapter.
+        chapter_text = ""
+        try:
+            doc_id = session.get("document_id", "")
+            if doc_id:
+                doc_repo = DocumentRepository(db)
+                doc_with_text = await doc_repo.find_with_paragraphs(doc_id)
+                if doc_with_text:
+                    chapter_text = doc_with_text.get("text_content", "") or ""
+                    logger.info("Custom research: loaded chapter text (%d chars) from document %s",
+                                len(chapter_text), doc_id)
+        except Exception as ctx_err:
+            logger.warning("Custom research: could not load chapter text: %s", ctx_err)
+
         # Delete old plans for re-run
         await session_repo.delete_research_plans(session_id)
+
+        # Helper to strip control characters that break OpenAI JSON serialization
+        def _sanitize_for_api(text: str) -> str:
+            if not text:
+                return ""
+            import unicodedata
+            return "".join(
+                ch for ch in text
+                if ch in ("\n", "\r", "\t") or not unicodedata.category(ch).startswith("C")
+            )
 
         plans = []
         for opp in selected:
@@ -1529,6 +1602,7 @@ async def _plan_research_task(session_id: str, session: dict):
                             opp.get("research_prompt", ""),
                             opp.get("brief_reason", ""),
                             allowed_sources,
+                            chapter_text=chapter_text,
                         )
                         await session_repo.update_opportunity(
                             session_id,
@@ -1580,9 +1654,13 @@ async def _plan_research_task(session_id: str, session: dict):
                 })
                 continue
 
+            # Sanitize text that may contain control characters from the DOCX
+            _claim = _sanitize_for_api(opp.get('original_sentence', ''))
+            _issue = _sanitize_for_api(opp.get('brief_reason', ''))
+
             prompt = f"""Given this outdated claim from a technical document:
-Claim: "{opp.get('original_sentence', '')}"
-Issue: {opp.get('brief_reason', '')}
+Claim: "{_claim}"
+Issue: {_issue}
 Allowed source types: {', '.join(allowed_sources)}
 
 Generate a research plan to verify/update this claim. Return JSON with:
@@ -1679,8 +1757,8 @@ async def approve_plan(
     if not session:
         raise HTTPException(404, "Session not found")
 
-    updated = await session_repo.approve_research_plan(plan_id, req.approved)
-    return {"plan_id": plan_id, "approved": req.approved, "updated": updated}
+    updated = await session_repo.approve_research_plan(plan_id, req.approved, req.rejected)
+    return {"plan_id": plan_id, "approved": req.approved, "rejected": req.rejected, "updated": updated}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1786,6 +1864,12 @@ async def _run_research_task(session_id: str, session: dict, approved_plans: lis
                 if tavily_resp.status_code != 200:
                     err_body = tavily_resp.text[:300]
                     logger.warning("Tavily returned %d for plan %s: %s", tavily_resp.status_code, plan_id, err_body)
+                    # Detect API key expiry / auth errors — raise to abort all research
+                    if tavily_resp.status_code in (401, 403):
+                        raise RuntimeError(
+                            f"Tavily API key expired or invalid (HTTP {tavily_resp.status_code}). "
+                            "Please update your TAVILY_API_KEY in the server configuration."
+                        )
                     return evidence
                 results = tavily_resp.json().get("results", [])
                 logger.info("Tavily returned %d results for plan %s", len(results), plan_id)
@@ -1953,6 +2037,15 @@ async def _generate_patches_task(session_id: str, session: dict):
     """Background task: generate sentence-level patches using AI."""
     from openai import AsyncOpenAI
     import json
+    import unicodedata as _ucd
+
+    def _sanitize(text: str) -> str:
+        if not text:
+            return ""
+        return "".join(
+            ch for ch in text
+            if ch in ("\n", "\r", "\t") or not _ucd.category(ch).startswith("C")
+        )
 
     db = get_database()
     session_repo = SessionRepository(db)
@@ -2034,18 +2127,19 @@ async def _generate_patches_task(session_id: str, session: dict):
 
             prompt = f"""Given this original sentence from a technical document and the research evidence, write a replacement sentence.
 
-Original: "{opp.get('original_sentence', '')}"
-Section: {opp.get('section_ref', '')}
-Issue: {opp.get('brief_reason', '')}
+Original: "{_sanitize(opp.get('original_sentence', ''))}"
+Section: {_sanitize(opp.get('section_ref', ''))}
+Issue: {_sanitize(opp.get('brief_reason', ''))}
 
 Evidence:
-{evidence_text}
+{_sanitize(evidence_text)}
 
 {style_instructions}
 
 Return ONLY valid JSON with:
-- "revised_sentence": the replacement text
-- "citation": proper citation for the source used
+- "revised_sentence": the replacement text (do NOT add citation numbers like [N])
+- "citation": short inline citation for the source used
+- "reference_entry": ONE properly formatted bibliography entry for the PRIMARY source. Format MUST match this academic style: 'Last, First. Year. "Article Title." Organization/Publisher. URL' — ONLY use the ACTUAL source_url from the evidence above (do NOT invent or guess URLs). If no real URL exists in the evidence, omit the URL. Do NOT include raw excerpts, garbled text, or placeholder URLs. If no clear source, return empty string "".
 - "rationale": brief explanation of why this change is needed
 - "confidence": float 0.0-1.0
 - "change_pct": estimated percentage of the sentence that changed
@@ -2080,6 +2174,7 @@ Return ONLY valid JSON. No other text."""
                     "original_sentence": opp.get("original_sentence", ""),
                     "revised_sentence": patch_data.get("revised_sentence", ""),
                     "citation": patch_data.get("citation", ""),
+                    "reference_entry": patch_data.get("reference_entry", ""),
                     "rationale": patch_data.get("rationale", ""),
                     "confidence": patch_data.get("confidence", 0.5),
                     "change_pct": change_pct,
@@ -2356,10 +2451,10 @@ Return ONLY valid JSON. No other text."""
 
         if is_paragraph_level:
             short_para = req.paragraph_text[:60] + ("..." if len(req.paragraph_text) > 60 else "")
-            section_ref = f"{position_labels_short[req.position]} paragraph in: {req.section_text}"
+            section_ref = f"{position_labels_short[req.position]} paragraph in section: {req.section_text}"
             original = f"[{position_labels_short[req.position]} paragraph: {short_para}]" if req.position != "replace" else req.paragraph_text
         else:
-            section_ref = f"{position_labels_short[req.position]}: {req.section_text}"
+            section_ref = f"{position_labels_short[req.position]} section: {req.section_text}"
             original = f"[{position_labels_short[req.position]} section: {req.section_text}]" if req.position != "replace" else req.section_text
 
         ask_ai_meta = {
@@ -2675,7 +2770,10 @@ async def apply_patches(
                 # section/paragraph position ---
                 if research_insert_meta:
                     try:
-                        ok = _apply_research_insert_patch(docx_doc, research_insert_meta)
+                        ok = _apply_research_insert_patch(
+                            docx_doc, research_insert_meta,
+                            outline=session.get("outline", []),
+                        )
                         if ok:
                             applied += 1
                         else:
@@ -2784,14 +2882,94 @@ async def apply_patches(
 
                 found = False
                 replace_count = 0
+
+                # Helper: normalize whitespace & common unicode variants for matching
+                import re as _re_ws
+
+                def _norm_ws(s: str) -> str:
+                    # Normalize various dashes/hyphens to standard hyphen
+                    s = s.replace('\u2013', '-').replace('\u2014', '-').replace('\u2012', '-')
+                    # Normalize various quotes
+                    s = s.replace('\u201c', '"').replace('\u201d', '"')
+                    s = s.replace('\u2018', "'").replace('\u2019', "'")
+                    # Collapse all whitespace (newlines, tabs, multiple spaces) to single space
+                    return _re_ws.sub(r'\s+', ' ', s).strip()
+
+                norm_orig = _norm_ws(original_text)
+
                 for para in docx_doc.paragraphs:
-                    if original_text in para.text:
+                    para_text = para.text
+                    # Try exact match first
+                    if original_text in para_text:
                         _replace_text_in_paragraph(para, original_text, final_text, replace_all_in_para=replace_all)
                         found = True
                         replace_count += 1
                         if not replace_all:
                             applied += 1
                             break
+                    # Fallback: normalized whitespace/unicode match
+                    elif not found and norm_orig in _norm_ws(para_text):
+                        # The original_text is in the paragraph but with different whitespace/unicode chars.
+                        # Directly rewrite the runs since _replace_text_in_paragraph needs exact match.
+                        if para.runs:
+                            full_run_text = "".join(r.text for r in para.runs)
+                            # If original is ~the whole paragraph, replace entirely
+                            if len(norm_orig) >= len(_norm_ws(full_run_text)) * 0.7:
+                                para.runs[0].text = final_text
+                                for r in para.runs[1:]:
+                                    r.text = ""
+                            else:
+                                # Substring case: replace the best-matching window
+                                para.runs[0].text = full_run_text.replace(original_text, final_text, 1) if original_text in full_run_text else final_text
+                                for r in para.runs[1:]:
+                                    r.text = ""
+                        found = True
+                        replace_count += 1
+                        if not replace_all:
+                            applied += 1
+                            logger.info("Patch applied via normalized match: '%s...'", original_text[:50])
+                            break
+
+                # Fallback 2: if still not found, try matching first N significant words
+                if not found and not replace_all:
+                    orig_words = _norm_ws(original_text).split()
+                    if len(orig_words) >= 6:
+                        # Match on first 6+ words as a prefix search
+                        prefix_phrase = " ".join(orig_words[:6])
+                        for para in docx_doc.paragraphs:
+                            if prefix_phrase in _norm_ws(para.text):
+                                # Direct run replacement — safer than _replace_text_in_paragraph
+                                if para.runs:
+                                    para.runs[0].text = final_text
+                                    for r in para.runs[1:]:
+                                        r.text = ""
+                                found = True
+                                applied += 1
+                                logger.info("Patch applied via prefix match (%d words): '%s...'",
+                                            len(orig_words[:6]), prefix_phrase[:50])
+                                break
+
+                # Fallback 3: difflib similarity match (>80% similar)
+                if not found and not replace_all:
+                    from difflib import SequenceMatcher
+                    best_ratio = 0.0
+                    best_para = None
+                    for para in docx_doc.paragraphs:
+                        pt = para.text.strip()
+                        if not pt or len(pt) < 20:
+                            continue
+                        ratio = SequenceMatcher(None, _norm_ws(original_text), _norm_ws(pt)).ratio()
+                        if ratio > best_ratio:
+                            best_ratio = ratio
+                            best_para = para
+                    if best_ratio >= 0.80 and best_para and best_para.runs:
+                        best_para.runs[0].text = final_text
+                        for r in best_para.runs[1:]:
+                            r.text = ""
+                        found = True
+                        applied += 1
+                        logger.info("Patch applied via similarity match (%.0f%%): '%s...'",
+                                    best_ratio * 100, original_text[:50])
 
                 # Also search in table cells for whole-document custom patches
                 if replace_all:
@@ -2810,7 +2988,14 @@ async def apply_patches(
                                 original_text[:40], final_text[:40], replace_count)
 
                 if not found:
+                    logger.warning("Patch SKIPPED — text not found: '%s...' (patch_id=%s)",
+                                   original_text[:60], patch.get("patch_id", "?"))
                     skipped += 1
+
+            # --- Append new references to the References/Bibliography section ---
+            refs_added = _append_references_to_docx(docx_doc, approved_patches, tracked=False)
+            if refs_added:
+                logger.info("Added %d new reference entries to References section", refs_added)
 
             para_count_after = len(docx_doc.paragraphs)
             logger.info("DOCX after patches: %d paragraphs (was %d, diff=%d)",
@@ -2942,13 +3127,31 @@ def _find_heading_in_docx(docx_doc, section_text: str):
     Prioritises paragraphs whose style starts with 'Heading' so that body
     paragraphs that merely *reference* a section title are not picked up
     instead of the real heading.
+
+    Handles field-code numbering: Word auto-numbered headings may have
+    para.text = "Step 2: Title" while section_text = "1.4 Step 2: Title".
+    We strip the leading number from BOTH sides for robust matching.
     """
     import re
 
     normalized_target = _normalize_text(section_text)
+    # Strip leading section number (e.g. "1.4 " or "1.4.1 ") from the search text
     core_text = re.sub(r'^[\d.]+\s*', '', section_text).strip()
     core_lower = core_text.lower() if core_text and len(core_text) > 3 else ""
     target_words = set(normalized_target.split())
+    # Also build word set from core text (without section number)
+    core_words = set(_normalize_text(core_text).split()) if core_lower else set()
+
+    # Log all heading-styled paragraphs for debugging
+    heading_paras = []
+    for idx, para in enumerate(docx_doc.paragraphs):
+        style_name = para.style.name if para.style else ""
+        if style_name.lower().startswith("heading"):
+            heading_paras.append((idx, style_name, (para.text or "")[:80]))
+    logger.info("_find_heading_in_docx: searching for %r", section_text[:80])
+    logger.info("_find_heading_in_docx: document has %d heading-styled paragraphs", len(heading_paras))
+    for idx, style, txt in heading_paras[:30]:
+        logger.info("  heading[%d] style=%s text=%r", idx, style, txt)
 
     def _is_heading(para) -> bool:
         style_name = para.style.name if para.style else ""
@@ -2962,21 +3165,43 @@ def _find_heading_in_docx(docx_doc, section_text: str):
         return normalized_target in _normalize_text(para.text)
 
     def _core_match(para) -> bool:
+        """Match by stripping leading numbers from BOTH target and paragraph.
+        Handles field-code numbering where para.text lacks section numbers."""
         if not core_lower:
             return False
         para_core = re.sub(r'^[\d.]+\s*', '', para.text).strip().lower()
+        if not para_core:
+            return False
         return core_lower in para_core or para_core in core_lower
 
+    def _core_startswith_match(para) -> bool:
+        """Looser match: paragraph text (with numbers stripped) starts with
+        a significant prefix of the core target text, or vice-versa.
+        Useful when the outline text has slight variations."""
+        if not core_lower or len(core_lower) < 10:
+            return False
+        para_core = re.sub(r'^[\d.]+\s*', '', para.text).strip().lower()
+        if not para_core or len(para_core) < 5:
+            return False
+        # Check if either starts with the other's first 30 chars
+        prefix_len = min(30, len(core_lower), len(para_core))
+        return (core_lower[:prefix_len] == para_core[:prefix_len])
+
     # ---------- Pass 1: only heading-styled paragraphs ----------
-    for strategy in (_exact_match, _normalized_match, _core_match):
+    for strategy_name, strategy in [
+        ("exact", _exact_match),
+        ("normalized", _normalized_match),
+        ("core", _core_match),
+        ("core_startswith", _core_startswith_match),
+    ]:
         for idx, para in enumerate(docx_doc.paragraphs):
             if _is_heading(para) and strategy(para):
-                logger.info("_find_heading_in_docx: matched heading idx %d (style=%s) text=%r",
-                            idx, para.style.name if para.style else "?", para.text[:80])
+                logger.info("_find_heading_in_docx: MATCHED heading idx %d via '%s' (style=%s) text=%r",
+                            idx, strategy_name, para.style.name if para.style else "?", para.text[:80])
                 return idx
 
     # Word-overlap strategy — heading-styled only
-    if len(target_words) >= 3:
+    if len(core_words) >= 3:
         best_idx, best_overlap = None, 0
         for idx, para in enumerate(docx_doc.paragraphs):
             if not _is_heading(para):
@@ -2984,24 +3209,31 @@ def _find_heading_in_docx(docx_doc, section_text: str):
             para_text = para.text.strip()
             if not para_text:
                 continue
+            # Compare using core words (without section number) for robustness
             para_words = set(_normalize_text(para_text).split())
-            overlap = len(target_words & para_words)
-            ratio = overlap / max(len(target_words), 1)
-            if ratio > 0.7 and overlap > best_overlap:
+            overlap = len(core_words & para_words)
+            ratio = overlap / max(len(core_words), 1)
+            if ratio > 0.6 and overlap > best_overlap:
                 best_overlap = overlap
                 best_idx = idx
         if best_idx is not None:
-            logger.info("_find_heading_in_docx: word-overlap heading idx %d", best_idx)
+            logger.info("_find_heading_in_docx: word-overlap heading idx %d (overlap=%d/%d)",
+                        best_idx, best_overlap, len(core_words))
             return best_idx
 
     # ---------- Pass 2: fallback — any paragraph ----------
     logger.warning("_find_heading_in_docx: no heading-styled match for %r, falling back to all paragraphs",
                    section_text[:60])
-    for strategy in (_exact_match, _normalized_match, _core_match):
+    for strategy_name, strategy in [
+        ("exact", _exact_match),
+        ("normalized", _normalized_match),
+        ("core", _core_match),
+        ("core_startswith", _core_startswith_match),
+    ]:
         for idx, para in enumerate(docx_doc.paragraphs):
             if strategy(para):
-                logger.info("_find_heading_in_docx: fallback matched idx %d text=%r",
-                            idx, para.text[:80])
+                logger.info("_find_heading_in_docx: fallback matched idx %d via '%s' text=%r",
+                            idx, strategy_name, para.text[:80])
                 return idx
 
     if len(target_words) >= 3:
@@ -3023,33 +3255,68 @@ def _find_heading_in_docx(docx_doc, section_text: str):
     return None
 
 
+def _is_body_text_paragraph(para) -> bool:
+    """Check if a paragraph looks like real body text (not a heading, caption,
+    page header, or short label). Used to find good reference paragraphs
+    for formatting.
+    """
+    style_name = para.style.name if para.style else ""
+    style_lower = style_name.lower()
+    # Skip headings, captions, TOC, header/footer styles
+    if any(kw in style_lower for kw in ("heading", "caption", "toc", "header", "footer", "title")):
+        return False
+    text = para.text.strip()
+    if not text:
+        return False
+    # Skip very short paragraphs (page numbers, labels, figure refs)
+    if len(text) < 40:
+        return False
+    return True
+
+
 def _find_reference_body_paragraph(docx_doc, heading_idx: int):
     """Find the nearest body (non-heading) paragraph to copy formatting from.
 
     Searches BEFORE the heading first (same visual section), then AFTER.
-    This ensures the inserted content matches the surrounding body text
-    font, size, and spacing — not the next section's potentially different
-    style.
+    Prefers paragraphs that are genuine body text (long enough, not captions
+    or page headers). This ensures the inserted content matches the
+    surrounding body text font, size, and spacing.
     """
-    # Prefer a body paragraph BEFORE (same section context)
+    import re as _re
+
+    # Prefer a real body paragraph BEFORE (same section context)
     for idx in range(heading_idx - 1, -1, -1):
         para = docx_doc.paragraphs[idx]
         style_name = para.style.name if para.style else ""
-        if style_name.startswith("Heading"):
-            break  # hit a preceding heading — stop, don't cross sections
-        if para.text.strip():
+        # Stop if we hit a heading (don't cross sections) — check both
+        # style-based headings and numbered headings like "1.2 Title"
+        if style_name.lower().startswith("heading"):
+            break
+        if _is_body_text_paragraph(para):
             return para
+
     # Fallback: search AFTER the heading
+    for idx in range(heading_idx + 1, min(heading_idx + 20, len(docx_doc.paragraphs))):
+        para = docx_doc.paragraphs[idx]
+        if _is_body_text_paragraph(para):
+            return para
+
+    # Wider fallback: any body text paragraph before (cross section boundaries)
+    for idx in range(heading_idx - 1, -1, -1):
+        para = docx_doc.paragraphs[idx]
+        if _is_body_text_paragraph(para):
+            return para
+
+    # Last resort: any non-empty non-heading paragraph
+    for idx in range(heading_idx - 1, -1, -1):
+        para = docx_doc.paragraphs[idx]
+        style_name = para.style.name if para.style else ""
+        if not style_name.lower().startswith("heading") and para.text.strip():
+            return para
     for idx in range(heading_idx + 1, len(docx_doc.paragraphs)):
         para = docx_doc.paragraphs[idx]
         style_name = para.style.name if para.style else ""
-        if not style_name.startswith("Heading") and para.text.strip():
-            return para
-    # Last resort: any body paragraph anywhere before
-    for idx in range(heading_idx - 1, -1, -1):
-        para = docx_doc.paragraphs[idx]
-        style_name = para.style.name if para.style else ""
-        if not style_name.startswith("Heading") and para.text.strip():
+        if not style_name.lower().startswith("heading") and para.text.strip():
             return para
     return None
 
@@ -3097,6 +3364,32 @@ def _build_formatted_paragraph(docx_doc, ref_para, text_content: str):
             if existing_rPr is not None:
                 run._element.remove(existing_rPr)
             run._element.insert(0, deepcopy(source_rPr))
+
+    # If font name/size still not set (run inherited from style), resolve from style hierarchy
+    if ref_para and not run.font.name:
+        try:
+            style = ref_para.style
+            checked = set()
+            while style and style.name not in checked:
+                checked.add(style.name)
+                if style.font and style.font.name:
+                    run.font.name = style.font.name
+                    break
+                style = style.base_style
+        except Exception:
+            pass
+    if ref_para and not run.font.size:
+        try:
+            style = ref_para.style
+            checked = set()
+            while style and style.name not in checked:
+                checked.add(style.name)
+                if style.font and style.font.size:
+                    run.font.size = style.font.size
+                    break
+                style = style.base_style
+        except Exception:
+            pass
 
     # Copy paragraph alignment
     if ref_para:
@@ -3156,6 +3449,439 @@ def _replace_section_content(docx_doc, heading_idx: int, text: str):
 
     logger.info("  Removed %d body paragraphs for replace", len(body_indices))
     _insert_text_near_paragraph(docx_doc, heading_idx, text, before=False)
+
+
+def _find_references_section_idx(docx_doc) -> int | None:
+    """Find the paragraph index of the 'References' heading in the DOCX."""
+    ref_keywords = ("references", "bibliography", "works cited")
+    for idx, para in enumerate(docx_doc.paragraphs):
+        text = para.text.strip().lower()
+        style_name = (para.style.name if para.style else "").lower()
+        if text in ref_keywords:
+            # Prefer heading-styled paragraphs
+            if "heading" in style_name or not text.endswith("."):
+                return idx
+    # Looser fallback: any paragraph starting with "References"
+    for idx, para in enumerate(docx_doc.paragraphs):
+        text = para.text.strip()
+        if text.lower().startswith("references"):
+            return idx
+    return None
+
+
+def _find_last_reference_number(docx_doc, ref_heading_idx: int) -> int:
+    """Scan paragraphs after the References heading to find the highest [N] reference number."""
+    import re as _re
+    max_num = 0
+    for idx in range(ref_heading_idx + 1, len(docx_doc.paragraphs)):
+        para = docx_doc.paragraphs[idx]
+        text = para.text.strip()
+        if not text:
+            continue
+        # Stop if we hit another heading (next section)
+        style_name = (para.style.name if para.style else "").lower()
+        if "heading" in style_name and text:
+            break
+        # Look for [N] at start of line or standalone
+        matches = _re.findall(r"\[(\d+)\]", text)
+        for m in matches:
+            num = int(m)
+            if num > max_num:
+                max_num = num
+    return max_num
+
+
+def _is_valid_reference_text(text: str) -> bool:
+    """Check if a reference entry is valid readable text (not garbled binary data)."""
+    if not text or len(text) < 10:
+        return False
+    # Count printable ASCII + common Unicode letters vs total chars
+    import unicodedata
+    readable = 0
+    total = 0
+    for ch in text:
+        total += 1
+        cat = unicodedata.category(ch)
+        # Letters, numbers, punctuation, spaces, symbols
+        if cat.startswith(("L", "N", "P", "Z", "S")):
+            readable += 1
+    if total == 0:
+        return False
+    ratio = readable / total
+    # Reject if less than 80% readable characters
+    if ratio < 0.80:
+        return False
+    # Reject if too many backslashes, pipes, or braces (binary artifacts)
+    junk_chars = sum(1 for c in text if c in "\\|{}[]^~`@#$%&*_=<>")
+    if len(text) > 0 and junk_chars / len(text) > 0.15:
+        return False
+    return True
+
+
+def _normalize_reference_key(text: str) -> str:
+    """Create an aggressively normalized key for deduplication.
+    Strips URLs, years, punctuation, publisher names, and common words
+    to match near-duplicate references that differ only in formatting."""
+    import re as _re
+    key = text.lower().strip()
+    # Remove URLs
+    key = _re.sub(r'https?://\S+', '', key)
+    # Remove years
+    key = _re.sub(r'\b(19|20)\d{2}\b', '', key)
+    # Remove common publisher/source labels
+    for noise in ("nasa", "url", "faa", "page", "retrieved", "accessed",
+                   "available at", "available from", "space.com", "spacenews"):
+        key = key.replace(noise, "")
+    # Remove all punctuation
+    key = _re.sub(r'[^\w\s]', '', key)
+    # Collapse whitespace and sort words for order-independent matching
+    words = sorted(set(key.split()))
+    return " ".join(words)
+
+
+def _split_reference_parts(entry: str) -> list:
+    """Split a reference entry into segments: normal and italic (quoted titles).
+    Returns list of (text, is_italic) tuples.
+    E.g. 'Smith. 2024. "Article Title." NASA.' →
+         [('Smith. 2024. ', False), ('Article Title.', True), (' NASA.', False)]
+    """
+    import re as _re
+    parts = []
+    # Match text within quotes (both straight and curly)
+    pattern = _re.compile(r'["\u201c]([^"\u201d]+)["\u201d]')
+    last_end = 0
+    for m in pattern.finditer(entry):
+        # Text before the quoted part
+        if m.start() > last_end:
+            parts.append((entry[last_end:m.start()], False))
+        # The quoted text (italic)
+        parts.append((m.group(1), True))
+        last_end = m.end()
+    # Remaining text after last quote
+    if last_end < len(entry):
+        parts.append((entry[last_end:], False))
+    # If no quotes found, return the whole thing as non-italic
+    if not parts:
+        parts = [(entry, False)]
+    return parts
+
+
+def _build_reference_paragraph_xml(ref_para, entry: str, highlight_color: str):
+    """Build a reference paragraph with italic titles and optional highlight (for tracked export)."""
+    from copy import deepcopy
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    new_p = OxmlElement("w:p")
+
+    # Copy paragraph properties from reference (includes hanging indent, spacing, etc.)
+    pPr_copied = False
+    if ref_para:
+        source_pPr = ref_para._element.find(qn("w:pPr"))
+        if source_pPr is not None:
+            new_pPr = deepcopy(source_pPr)
+            # Remove any style reference that might conflict — keep only formatting
+            pStyle = new_pPr.find(qn("w:pStyle"))
+            # Keep the style — it carries the hanging indent and spacing
+            new_p.append(new_pPr)
+            pPr_copied = True
+
+    # If no pPr was copied, create a basic one with hanging indent
+    if not pPr_copied:
+        pPr = OxmlElement("w:pPr")
+        ind = OxmlElement("w:ind")
+        ind.set(qn("w:left"), "720")       # 0.5 inch left margin
+        ind.set(qn("w:hanging"), "720")    # 0.5 inch hanging indent
+        pPr.append(ind)
+        new_p.append(pPr)
+
+    # Get base run properties from reference paragraph
+    base_rPr = OxmlElement("w:rPr")
+    if ref_para:
+        source_runs = ref_para._element.findall(qn("w:r"))
+        if source_runs:
+            source_rPr = source_runs[0].find(qn("w:rPr"))
+            if source_rPr is not None:
+                base_rPr = deepcopy(source_rPr)
+
+        # Resolve font from style if needed
+        has_font = base_rPr.find(qn("w:rFonts")) is not None
+        has_size = base_rPr.find(qn("w:sz")) is not None
+        if not has_font or not has_size:
+            try:
+                style = ref_para.style
+                checked = set()
+                font_name, font_size = None, None
+                while style and style.name not in checked:
+                    checked.add(style.name)
+                    if style.font:
+                        if not font_name and style.font.name:
+                            font_name = style.font.name
+                        if not font_size and style.font.size:
+                            font_size = style.font.size
+                    if font_name and font_size:
+                        break
+                    style = style.base_style
+                if font_name and not has_font:
+                    rFonts = OxmlElement("w:rFonts")
+                    rFonts.set(qn("w:ascii"), font_name)
+                    rFonts.set(qn("w:hAnsi"), font_name)
+                    rFonts.set(qn("w:cs"), font_name)
+                    base_rPr.insert(0, rFonts)
+                if font_size and not has_size:
+                    half_pts = str(int(font_size / 6350))
+                    sz = OxmlElement("w:sz")
+                    sz.set(qn("w:val"), half_pts)
+                    base_rPr.append(sz)
+                    szCs = OxmlElement("w:szCs")
+                    szCs.set(qn("w:val"), half_pts)
+                    base_rPr.append(szCs)
+            except Exception:
+                pass
+
+    # Split entry into normal and italic parts
+    parts = _split_reference_parts(entry)
+
+    for text, is_italic in parts:
+        new_r = OxmlElement("w:r")
+        rPr = deepcopy(base_rPr)
+
+        # Add italic for quoted titles
+        if is_italic:
+            i_elem = OxmlElement("w:i")
+            i_elem.set(qn("w:val"), "true")
+            rPr.append(i_elem)
+            iCs = OxmlElement("w:iCs")
+            iCs.set(qn("w:val"), "true")
+            rPr.append(iCs)
+
+        # Add highlight if tracked
+        if highlight_color:
+            _add_highlight_to_rPr(rPr, highlight_color)
+
+        new_r.append(rPr)
+
+        new_t = OxmlElement("w:t")
+        new_t.set(qn("xml:space"), "preserve")
+        new_t.text = text
+        new_r.append(new_t)
+
+        new_p.append(new_r)
+
+    return new_p
+
+
+def _build_reference_paragraph_clean(docx_doc, ref_para, entry: str):
+    """Build a reference paragraph with italic titles (for clean export)."""
+    from copy import deepcopy
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    style_name = None
+    if ref_para and ref_para.style:
+        style_name = ref_para.style.name
+
+    new_para = docx_doc.add_paragraph("", style=style_name)
+
+    # Copy paragraph-level XML properties (hanging indent, spacing, etc.)
+    pPr_copied = False
+    if ref_para:
+        source_pPr = ref_para._element.find(qn("w:pPr"))
+        if source_pPr is not None:
+            existing_pPr = new_para._element.find(qn("w:pPr"))
+            if existing_pPr is not None:
+                new_para._element.remove(existing_pPr)
+            new_para._element.insert(0, deepcopy(source_pPr))
+            pPr_copied = True
+
+    # If no pPr was copied, add hanging indent to match reference style
+    if not pPr_copied:
+        pPr = OxmlElement("w:pPr")
+        ind = OxmlElement("w:ind")
+        ind.set(qn("w:left"), "720")
+        ind.set(qn("w:hanging"), "720")
+        pPr.append(ind)
+        new_para._element.insert(0, pPr)
+
+    # Copy paragraph alignment
+    if ref_para:
+        new_para.alignment = ref_para.alignment
+
+    # Split entry into parts and add runs
+    parts = _split_reference_parts(entry)
+
+    for text, is_italic in parts:
+        run = new_para.add_run(text)
+
+        # Copy font from reference
+        if ref_para and ref_para.runs:
+            src_run = ref_para.runs[0]
+            if src_run.font.name:
+                run.font.name = src_run.font.name
+            if src_run.font.size:
+                run.font.size = src_run.font.size
+
+        # Resolve from style if needed
+        if ref_para and not run.font.name:
+            try:
+                style = ref_para.style
+                checked = set()
+                while style and style.name not in checked:
+                    checked.add(style.name)
+                    if style.font and style.font.name:
+                        run.font.name = style.font.name
+                        break
+                    style = style.base_style
+            except Exception:
+                pass
+        if ref_para and not run.font.size:
+            try:
+                style = ref_para.style
+                checked = set()
+                while style and style.name not in checked:
+                    checked.add(style.name)
+                    if style.font and style.font.size:
+                        run.font.size = style.font.size
+                        break
+                    style = style.base_style
+            except Exception:
+                pass
+
+        if is_italic:
+            run.font.italic = True
+
+    return new_para._element
+
+
+def _append_references_to_docx(docx_doc, patches: list, tracked: bool = False,
+                                highlight_color: str = "cyan"):
+    """Append new reference entries to the References/Bibliography section.
+
+    Deduplicates entries (same source only appears once), filters out
+    garbled/corrupted text, and does NOT add [N] numbering.
+
+    In tracked mode, entries are highlighted to show they are new additions.
+    Returns the number of references appended.
+    """
+
+    # Collect reference entries from patches
+    raw_entries = []
+    for patch in patches:
+        raw = patch.get("reference_entry", "")
+        if not raw:
+            continue
+        # Support multiple entries separated by ||
+        for entry in raw.split("||"):
+            entry = entry.strip()
+            if entry:
+                raw_entries.append(entry)
+
+    if not raw_entries:
+        return 0
+
+    # Filter out garbled/corrupted entries
+    valid_entries = [e for e in raw_entries if _is_valid_reference_text(e)]
+    filtered_count = len(raw_entries) - len(valid_entries)
+    if filtered_count:
+        logger.info("REFERENCES: Filtered out %d garbled/corrupted entries", filtered_count)
+
+    # Deduplicate: keep first occurrence of each unique reference
+    seen_keys = set()
+    unique_entries = []
+    for entry in valid_entries:
+        key = _normalize_reference_key(entry)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_entries.append(entry)
+        else:
+            logger.debug("REFERENCES: Skipping duplicate: %s", entry[:60])
+
+    dedup_count = len(valid_entries) - len(unique_entries)
+    if dedup_count:
+        logger.info("REFERENCES: Deduplicated %d duplicate entries", dedup_count)
+
+    if not unique_entries:
+        return 0
+
+    # Also check against existing references in the document to avoid
+    # duplicating references that are already present
+    ref_heading_idx = _find_references_section_idx(docx_doc)
+    if ref_heading_idx is None:
+        logger.info("REFERENCES: No References section found — skipping reference append")
+        return 0
+
+    logger.info("REFERENCES: Found References heading at paragraph %d", ref_heading_idx)
+
+    # Collect existing reference text for deduplication
+    existing_ref_keys = set()
+    last_ref_idx = ref_heading_idx
+    for idx in range(ref_heading_idx + 1, len(docx_doc.paragraphs)):
+        para = docx_doc.paragraphs[idx]
+        style_name = (para.style.name if para.style else "").lower()
+        if "heading" in style_name and para.text.strip():
+            break
+        text = para.text.strip()
+        if text:
+            last_ref_idx = idx
+            existing_ref_keys.add(_normalize_reference_key(text))
+
+    # Remove entries that already exist in the References section
+    new_entries = []
+    for entry in unique_entries:
+        key = _normalize_reference_key(entry)
+        if key not in existing_ref_keys:
+            new_entries.append(entry)
+        else:
+            logger.debug("REFERENCES: Already in document: %s", entry[:60])
+
+    if not new_entries:
+        logger.info("REFERENCES: All entries already exist in document — nothing to add")
+        return 0
+
+    # Find an existing reference paragraph to copy formatting from.
+    # Look for paragraphs that look like real references (contain a year + author pattern).
+    import re as _ref_re
+    ref_para = None
+    for idx in range(ref_heading_idx + 1, len(docx_doc.paragraphs)):
+        para = docx_doc.paragraphs[idx]
+        style_name = (para.style.name if para.style else "").lower()
+        if "heading" in style_name and para.text.strip():
+            break
+        text = para.text.strip()
+        # Look for reference-like text: has a year (19xx or 20xx) and is long enough
+        if text and len(text) > 30 and _ref_re.search(r'\b(19|20)\d{2}\b', text):
+            ref_para = para
+            logger.info("REFERENCES: Using formatting from existing ref: '%s'", text[:80])
+            break
+    if not ref_para:
+        # Fallback to any non-empty paragraph in references section
+        for idx in range(last_ref_idx, ref_heading_idx, -1):
+            para = docx_doc.paragraphs[idx]
+            if para.text.strip() and len(para.text.strip()) > 10:
+                ref_para = para
+                break
+    if not ref_para:
+        ref_para = _find_reference_body_paragraph(docx_doc, ref_heading_idx)
+
+    # Insert each new reference entry (no [N] numbering)
+    # Format with italic title to match existing reference style
+    insert_after = docx_doc.paragraphs[last_ref_idx]._element
+    count = 0
+
+    for entry in new_entries:
+        if tracked:
+            new_p = _build_reference_paragraph_xml(ref_para, entry, highlight_color)
+        else:
+            new_p = _build_reference_paragraph_clean(docx_doc, ref_para, entry)
+
+        insert_after.addnext(new_p)
+        insert_after = new_p
+        count += 1
+        logger.info("REFERENCES: Appended '%s'", entry[:80])
+
+    logger.info("REFERENCES: Appended %d new reference entries (from %d raw, %d valid, %d unique)",
+                count, len(raw_entries), len(valid_entries), len(unique_entries))
+    return count
 
 
 def _scan_existing_media_numbers(docx_doc, media_type: str) -> list:
@@ -3324,7 +4050,52 @@ def _determine_inserted_number(
     return new_number, sorted_all
 
 
-def _apply_research_insert_patch(docx_doc, meta: dict, tracked: bool = False) -> bool:
+def _find_heading_from_outline(outline: list, section_text: str, total_paras: int) -> int | None:
+    """Look up a heading's paragraph_index from the stored outline data.
+
+    The outline was built during extract-outline and stores the correct
+    paragraph indices from the original DOCX. This is far more reliable than
+    re-searching the document text (which can fail due to field codes, tabs,
+    duplicate text, or non-standard styles).
+    """
+    if not outline or not section_text:
+        return None
+
+    section_lower = _normalize_text(section_text)
+    import re
+    section_core = re.sub(r'^[\d.]+\s*', '', section_text).strip().lower()
+
+    for item in outline:
+        item_text = item.get("text", "")
+        item_idx = item.get("paragraph_index")
+        if item_idx is None:
+            continue
+        # Must be a valid index
+        if item_idx < 0 or item_idx >= total_paras:
+            continue
+
+        # Strategy 1: exact text match
+        if item_text == section_text:
+            logger.info("Research-insert: outline exact match -> idx %d text=%r", item_idx, item_text[:60])
+            return item_idx
+
+        # Strategy 2: normalized match
+        item_lower = _normalize_text(item_text)
+        if section_lower == item_lower or section_lower in item_lower or item_lower in section_lower:
+            logger.info("Research-insert: outline normalized match -> idx %d text=%r", item_idx, item_text[:60])
+            return item_idx
+
+        # Strategy 3: core match (strip section numbers)
+        item_core = re.sub(r'^[\d.]+\s*', '', item_text).strip().lower()
+        if section_core and item_core and (section_core in item_core or item_core in section_core):
+            logger.info("Research-insert: outline core match -> idx %d text=%r", item_idx, item_text[:60])
+            return item_idx
+
+    return None
+
+
+def _apply_research_insert_patch(docx_doc, meta: dict, tracked: bool = False,
+                                  outline: list | None = None) -> bool:
     """Insert user-approved drafted research content at the chosen location.
 
     meta fields:
@@ -3334,6 +4105,10 @@ def _apply_research_insert_patch(docx_doc, meta: dict, tracked: bool = False) ->
         paragraph_text:   for fuzzy paragraph lookup (robustness across edits)
         position:         "before" | "after" | "replace"
         title, citations: metadata (not used at apply-time)
+
+    outline:  the session's stored outline items (from extract-outline step).
+              Used to find heading paragraph indices reliably, since the
+              outline already resolved the correct indices during extraction.
 
     When `tracked=True`, inserted paragraphs are highlighted yellow so the
     editor can see them in the tracked-changes export (matches ask-ai style).
@@ -3355,10 +4130,12 @@ def _apply_research_insert_patch(docx_doc, meta: dict, tracked: bool = False) ->
     if not raw_paras:
         return False
 
+    total_paras = len(docx_doc.paragraphs)
+
     # Determine target paragraph index
     target_idx = None
     if para_idx_hint is not None and para_idx_hint >= 0 and para_text:
-        if para_idx_hint < len(docx_doc.paragraphs):
+        if para_idx_hint < total_paras:
             if para_text[:50] in (docx_doc.paragraphs[para_idx_hint].text or ""):
                 target_idx = para_idx_hint
         if target_idx is None:
@@ -3372,7 +4149,14 @@ def _apply_research_insert_patch(docx_doc, meta: dict, tracked: bool = False) ->
         if not section_text:
             logger.warning("Research-insert: no paragraph or section target")
             return False
-        heading_idx = _find_heading_in_docx(docx_doc, section_text)
+
+        # Primary: use stored outline indices (most reliable)
+        heading_idx = _find_heading_from_outline(outline or [], section_text, total_paras)
+
+        # Fallback: search the DOCX paragraphs directly
+        if heading_idx is None:
+            logger.info("Research-insert: outline lookup failed, falling back to _find_heading_in_docx")
+            heading_idx = _find_heading_in_docx(docx_doc, section_text)
         if heading_idx is None:
             logger.warning("Research-insert: heading '%s' not found", section_text[:60])
             return False
@@ -5051,7 +5835,8 @@ def _preserve_headers_footers(source_doc, target_doc):
         logger.warning("Headers/footers preservation failed (non-fatal): %s", e)
 
 
-def _build_tracked_changes_docx(original_path: str, approved_patches: list, output_path: str):
+def _build_tracked_changes_docx(original_path: str, approved_patches: list, output_path: str,
+                                 outline: list | None = None):
     """Build a visual diff DOCX from the original + approved patches.
 
     Visual format (no Review tab needed — visible immediately):
@@ -5085,6 +5870,7 @@ def _build_tracked_changes_docx(original_path: str, approved_patches: list, outp
             try:
                 if _apply_research_insert_patch(
                     docx_doc, research_insert_meta, tracked=True,
+                    outline=outline or [],
                 ):
                     ai_applied += 1
                     logger.info(
@@ -5249,6 +6035,11 @@ def _build_tracked_changes_docx(original_path: str, approved_patches: list, outp
         if pid and pid not in applied_patch_ids and not (rp.get("is_custom") and rp.get("scope") == "whole_document"):
             logger.warning("TRACKED: original text not found: '%s...'", rp["original_text"][:50])
 
+    # --- Append new references to the References/Bibliography section (cyan highlight) ---
+    refs_added = _append_references_to_docx(docx_doc, approved_patches, tracked=True, highlight_color="cyan")
+    if refs_added:
+        logger.info("TRACKED: added %d new reference entries to References section", refs_added)
+
     docx_doc.save(output_path)
     logger.info(
         "TRACKED: visual diff DOCX saved — %d regular, %d AI, %d insert-media patches applied",
@@ -5283,6 +6074,49 @@ def _make_highlighted_paragraph_xml(ref_para, text: str, highlight_color: str):
             source_rPr = source_runs[0].find(qn("w:rPr"))
             if source_rPr is not None:
                 rPr = deepcopy(source_rPr)
+
+        # If rPr is still empty (run inherits from style), resolve font from
+        # the paragraph style so highlighted text matches the document body.
+        has_font = rPr.find(qn("w:rFonts")) is not None
+        has_size = rPr.find(qn("w:sz")) is not None
+        if not has_font or not has_size:
+            try:
+                style = ref_para.style
+                # Walk up style hierarchy to find font info
+                font_name = None
+                font_size = None
+                checked = set()
+                while style and style.name not in checked:
+                    checked.add(style.name)
+                    if style.font:
+                        if not font_name and style.font.name:
+                            font_name = style.font.name
+                        if not font_size and style.font.size:
+                            font_size = style.font.size
+                    if font_name and font_size:
+                        break
+                    style = style.base_style
+
+                if font_name and not has_font:
+                    rFonts = OxmlElement("w:rFonts")
+                    rFonts.set(qn("w:ascii"), font_name)
+                    rFonts.set(qn("w:hAnsi"), font_name)
+                    rFonts.set(qn("w:cs"), font_name)
+                    rPr.insert(0, rFonts)
+                    logger.debug("_make_highlighted_paragraph_xml: resolved font '%s' from style", font_name)
+
+                if font_size and not has_size:
+                    # python-docx font.size is in EMU; Word XML sz is in half-points
+                    half_points = str(int(font_size / 6350))
+                    sz = OxmlElement("w:sz")
+                    sz.set(qn("w:val"), half_points)
+                    rPr.append(sz)
+                    szCs = OxmlElement("w:szCs")
+                    szCs.set(qn("w:val"), half_points)
+                    rPr.append(szCs)
+                    logger.debug("_make_highlighted_paragraph_xml: resolved size %s half-pts from style", half_points)
+            except Exception as exc:
+                logger.debug("_make_highlighted_paragraph_xml: style font resolve failed: %s", exc)
 
     # Add the highlight color
     _add_highlight_to_rPr(rPr, highlight_color)
@@ -5842,7 +6676,8 @@ async def export_tracked_docx(session_id: str, token: Optional[str] = None, requ
     # Build tracked changes DOCX using approved patches
     approved_patches = await session_repo.find_approved_patches(session_id)
     try:
-        _build_tracked_changes_docx(original_path, approved_patches, output_path)
+        _build_tracked_changes_docx(original_path, approved_patches, output_path,
+                                    outline=session.get("outline", []))
         logger.info("EXPORT: tracked changes DOCX built at %s", output_path)
     except Exception as e:
         logger.error("EXPORT: tracked changes build failed: %s", e)
@@ -7557,8 +8392,13 @@ async def upload_figure_replacement(
     with open(saved_path, "wb") as f:
         f.write(contents)
 
-    # Build the URL for the frontend to display and export to use
-    image_url = f"/uploads/figures/{session_id}/{saved_filename}"
+    # Build the URL for the frontend to display and export to use.
+    # Append a cache-busting timestamp so re-uploads of the same patch_id
+    # (same filename on disk) force the browser to fetch the new image
+    # instead of serving from cache.
+    import time as _time
+    cache_bust = int(_time.time())
+    image_url = f"/uploads/figures/{session_id}/{saved_filename}?t={cache_bust}"
 
     # Update the media patch with the user-uploaded replacement
     user_replacement = {

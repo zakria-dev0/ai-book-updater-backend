@@ -156,11 +156,12 @@ class SessionRepository:
             doc = await self.research_plans.find_one({"plan_id": plan_id})
             return self._serialize(doc) if doc else None
 
-    async def approve_research_plan(self, plan_id: str, approved: bool = True) -> bool:
+    async def approve_research_plan(self, plan_id: str, approved: bool = True, rejected: bool = False) -> bool:
+        fields = {"approved": approved, "rejected": rejected}
         try:
             result = await self.research_plans.update_one(
                 {"_id": ObjectId(plan_id)},
-                {"$set": {"approved": approved}},
+                {"$set": fields},
             )
             if result.matched_count > 0:
                 return result.modified_count > 0
@@ -168,7 +169,7 @@ class SessionRepository:
             pass
         result = await self.research_plans.update_one(
             {"plan_id": plan_id},
-            {"$set": {"approved": approved}},
+            {"$set": fields},
         )
         return result.modified_count > 0
 
