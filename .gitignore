@@ -45,7 +45,6 @@ storage/logs/*
 *.sqlite3
 
 # IDE
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -68,3 +67,7 @@ htmlcov/
 
 # MyPy
 .mypy_cache/
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
