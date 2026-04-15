@@ -1297,13 +1297,14 @@ async def approve_custom_research_issue(
 
     await session_repo.create_patches([patch])
 
-    # Persist the placement on the opportunity so the user can see it was approved
+    # Persist the placement + edited content on the opportunity
     await session_repo.update_opportunity(
         session_id,
         opportunity_id,
         {
             "research_placement": research_insert_meta,
             "research_status": "approved",
+            "research_result": req.content.strip(),
         },
     )
     patch.pop("_id", None)
