@@ -227,14 +227,36 @@ def _extract_author_from_content(raw_content: str) -> str | None:
     return None
 
 
+async def get_tavily_api_key() -> str:
+    """Get Tavily API key: check MongoDB first, fall back to .env config."""
+    try:
+        from app.database.connection import get_database
+        db = get_database()
+        doc = await db.settings.find_one({"key": "tavily_api_key"})
+        if doc and doc.get("value"):
+            return doc["value"]
+    except Exception:
+        pass
+    return settings.TAVILY_API_KEY or ""
+
+
 class TavilyResearchService:
     def __init__(self):
-        self.client = AsyncTavilyClient(api_key=settings.TAVILY_API_KEY)
+        self.client = None
         self.max_results = settings.MAX_RESEARCH_RESULTS
+        self._api_key = None
+
+    async def _ensure_client(self):
+        """Lazily initialize the Tavily client with the latest API key from DB or .env."""
+        api_key = await get_tavily_api_key()
+        if api_key != self._api_key:
+            self._api_key = api_key
+            self.client = AsyncTavilyClient(api_key=api_key) if api_key else None
 
     @property
     def is_configured(self) -> bool:
-        return bool(settings.TAVILY_API_KEY)
+        # Synchronous check for quick guard — actual key is resolved in _ensure_client
+        return bool(self._api_key or settings.TAVILY_API_KEY)
 
     async def search(
         self,
@@ -246,7 +268,8 @@ class TavilyResearchService:
         """Run a Tavily search and return structured ResearchResult objects.
         Filters out low-quality sources and prioritizes authoritative ones.
         Uses fast regex-based metadata extraction instead of GPT API calls."""
-        if not self.is_configured:
+        await self._ensure_client()
+        if not self._api_key:
             logger.warning("Tavily API key not configured — skipping search")
             return []
 
