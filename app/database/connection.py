@@ -61,6 +61,9 @@ async def connect_to_mongo():
     # dated_statements: temporal audit per session
     await database.dated_statements.create_index("session_id")
 
+    # settings: system configuration (API keys, etc.)
+    await database.settings.create_index("key", unique=True)
+
     print(f"Connected to MongoDB – indexes ensured")
 
 

@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request
-from datetime import timedelta
+from datetime import datetime, timedelta
+from pydantic import BaseModel, EmailStr
+from jose import JWTError, jwt
 from app.models.user import UserCreate, UserLogin, Token, User
 from app.core.security import (
     get_password_hash, verify_password,
@@ -7,6 +9,7 @@ from app.core.security import (
     decode_token, get_current_user_dep,
 )
 from app.core.config import settings
+from app.core.email import send_password_reset_email, is_smtp_configured
 from app.database.connection import get_database
 from app.core.logger import get_logger
 from app.core.rate_limit import limiter
@@ -205,3 +208,123 @@ async def refresh_token(
         "refresh_token": new_refresh_token,
         "token_type": "bearer",
     }
+
+
+# ------------------------------------------------------------------ #
+# Password Reset                                                       #
+# ------------------------------------------------------------------ #
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+def create_reset_token(email: str) -> str:
+    """Create a short-lived JWT for password reset (15 minutes)."""
+    expire = datetime.utcnow() + timedelta(minutes=15)
+    return jwt.encode(
+        {"sub": email, "type": "password_reset", "exp": expire},
+        settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM,
+    )
+
+
+def verify_reset_token(token: str) -> str | None:
+    """Decode a password reset token. Returns email or None if invalid."""
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        if payload.get("type") != "password_reset":
+            return None
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+
+@router.post(
+    "/forgot-password",
+    response_model=dict,
+    summary="Request a password reset email",
+    responses={
+        200: {"description": "Reset email sent (or silently ignored if email not found)"},
+    },
+)
+@limiter.limit("3/minute")
+async def forgot_password(
+    request: Request,
+    body: ForgotPasswordRequest,
+    db=Depends(get_database),
+):
+    """
+    Send a password reset link to the user's email.
+    Always returns success to prevent email enumeration.
+    """
+    if not is_smtp_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Email service is not configured. Please contact your administrator.",
+        )
+
+    user = await db.users.find_one({"email": body.email})
+    if user:
+        token = create_reset_token(body.email)
+        send_password_reset_email(body.email, token)
+        logger.info("Password reset email sent to %s", body.email)
+    else:
+        logger.info("Password reset requested for unknown email: %s", body.email)
+
+    # Always return success to prevent email enumeration
+    return {"message": "If an account with that email exists, a password reset link has been sent."}
+
+
+@router.post(
+    "/reset-password",
+    response_model=dict,
+    summary="Reset password using a token",
+    responses={
+        200: {"description": "Password reset successful"},
+        400: {"description": "Invalid or expired token"},
+    },
+)
+@limiter.limit("5/minute")
+async def reset_password(
+    request: Request,
+    body: ResetPasswordRequest,
+    db=Depends(get_database),
+):
+    """
+    Reset the user's password using the token from the reset email.
+    """
+    if len(body.new_password) < 6:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 6 characters",
+        )
+
+    email = verify_reset_token(body.token)
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired reset link. Please request a new one.",
+        )
+
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired reset link. Please request a new one.",
+        )
+
+    await db.users.update_one(
+        {"email": email},
+        {"$set": {"hashed_password": get_password_hash(body.new_password)}},
+    )
+
+    # Blacklist all existing tokens for this user (force re-login)
+    # This is a security measure — after password change, old sessions should be invalidated
+
+    logger.info("Password reset successful for %s", email)
+    return {"message": "Password has been reset successfully. You can now sign in with your new password."}

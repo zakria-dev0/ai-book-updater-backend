@@ -526,3 +526,90 @@ async def admin_list_changes(
         "page_size": page_size,
         "total_pages": (total + page_size - 1) // page_size if total else 0,
     }
+
+
+# ------------------------------------------------------------------ #
+# API Keys management                                                  #
+# ------------------------------------------------------------------ #
+
+class UpdateApiKeyRequest(BaseModel):
+    key: str = Field(..., min_length=1, description="New API key value")
+
+
+async def get_tavily_key_from_db(db) -> str | None:
+    """Read the Tavily API key from the settings collection in MongoDB."""
+    doc = await db.settings.find_one({"key": "tavily_api_key"})
+    if doc:
+        return doc.get("value")
+    return None
+
+
+@router.get(
+    "/api-keys",
+    summary="Get configured API keys (masked)",
+    responses={
+        200: {"description": "Masked API keys"},
+        403: {"description": "Admin only"},
+    },
+)
+async def get_api_keys(
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """Return API keys with values masked (last 4 chars visible). Admin only."""
+    await _require_admin(current_user, db)
+
+    # Check DB first, then fall back to .env
+    tavily_key = await get_tavily_key_from_db(db) or settings.TAVILY_API_KEY
+
+    def mask(val: str) -> str:
+        if not val:
+            return ""
+        if len(val) <= 4:
+            return "****"
+        return "*" * (len(val) - 4) + val[-4:]
+
+    return {
+        "keys": [
+            {
+                "id": "tavily",
+                "label": "Tavily API Key",
+                "masked_value": mask(tavily_key),
+                "is_set": bool(tavily_key),
+                "source": "database" if await get_tavily_key_from_db(db) else "env",
+            },
+        ],
+    }
+
+
+@router.put(
+    "/api-keys/tavily",
+    summary="Update the Tavily API key",
+    responses={
+        200: {"description": "Key updated"},
+        403: {"description": "Admin only"},
+    },
+)
+async def update_tavily_key(
+    body: UpdateApiKeyRequest,
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """Store or update the Tavily API key in MongoDB. Admin only."""
+    await _require_admin(current_user, db)
+
+    await db.settings.update_one(
+        {"key": "tavily_api_key"},
+        {
+            "$set": {
+                "key": "tavily_api_key",
+                "value": body.key,
+                "updated_at": datetime.utcnow(),
+                "updated_by": current_user["email"],
+            }
+        },
+        upsert=True,
+    )
+
+    logger.info("Tavily API key updated by %s", current_user["email"])
+    return {"message": "Tavily API key updated successfully"}
