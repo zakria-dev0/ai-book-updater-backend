@@ -1810,6 +1810,12 @@ async def _run_research_task(session_id: str, session: dict, approved_plans: lis
     session_repo = SessionRepository(db)
 
     try:
+        # Resolve Tavily API key: check MongoDB first, fall back to .env
+        tavily_key = settings.TAVILY_API_KEY
+        db_key_doc = await db.settings.find_one({"key": "tavily_api_key"})
+        if db_key_doc and db_key_doc.get("value"):
+            tavily_key = db_key_doc["value"]
+
         # Delete old evidence for re-run
         await session_repo.delete_evidence_items(session_id)
 
@@ -1848,7 +1854,7 @@ async def _run_research_task(session_id: str, session: dict, approved_plans: lis
             try:
                 logger.info("Tavily search for plan %s: %s", plan_id, query[:80])
                 payload = {
-                    "api_key": settings.TAVILY_API_KEY,
+                    "api_key": tavily_key,
                     "query": query,
                     "max_results": 2,
                     "search_depth": "basic",
@@ -1865,8 +1871,18 @@ async def _run_research_task(session_id: str, session: dict, approved_plans: lis
                 if tavily_resp.status_code != 200:
                     err_body = tavily_resp.text[:300]
                     logger.warning("Tavily returned %d for plan %s: %s", tavily_resp.status_code, plan_id, err_body)
-                    # Detect API key expiry / auth errors — raise to abort all research
-                    if tavily_resp.status_code in (401, 403):
+                    # Detect API key expiry, auth errors, or usage limit exceeded — raise to abort all research
+                    if tavily_resp.status_code in (401, 403, 432):
+                        detail_msg = ""
+                        try:
+                            detail_msg = tavily_resp.json().get("detail", {}).get("error", "")
+                        except Exception:
+                            pass
+                        if tavily_resp.status_code == 432:
+                            raise RuntimeError(
+                                "Tavily API usage limit exceeded. "
+                                "Please upgrade your Tavily plan or update your API key."
+                            )
                         raise RuntimeError(
                             f"Tavily API key expired or invalid (HTTP {tavily_resp.status_code}). "
                             "Please update your TAVILY_API_KEY in the server configuration."
@@ -1900,6 +1916,8 @@ async def _run_research_task(session_id: str, session: dict, approved_plans: lis
                         "accepted": None,
                     })
 
+            except RuntimeError:
+                raise  # Let API key / usage limit errors propagate to abort all research
             except Exception as e:
                 logger.warning("Research query failed for plan %s: %s", plan_id, e)
 
@@ -6930,6 +6948,12 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
 
     client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
+    # Resolve Tavily API key: check MongoDB first, fall back to .env
+    _fig_tavily_key = settings.TAVILY_API_KEY
+    _fig_db_key_doc = await db.settings.find_one({"key": "tavily_api_key"})
+    if _fig_db_key_doc and _fig_db_key_doc.get("value"):
+        _fig_tavily_key = _fig_db_key_doc["value"]
+
     async def _analyze_single_figure(fig_num: int, fig: dict, http_client: httpx.AsyncClient):
         """Analyze one figure with GPT-4o Vision + search for replacements concurrently."""
         thumb_b64 = fig["image_b64"]
@@ -7087,13 +7111,13 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
         # ── Primary: Tavily web image search (best for technical diagrams) ──
         async def _search_tavily(query: str):
             candidates = []
-            if not settings.TAVILY_API_KEY:
+            if not _fig_tavily_key:
                 return candidates
             try:
                 tavily_resp = await http_client.post(
                     "https://api.tavily.com/search",
                     json={
-                        "api_key": settings.TAVILY_API_KEY,
+                        "api_key": _fig_tavily_key,
                         "query": f"{query} diagram",
                         "search_depth": "advanced",
                         "include_images": True,
