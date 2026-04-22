@@ -26,6 +26,7 @@ app = FastAPI(
     openapi_url=f"{settings.API_V1_PREFIX}/openapi.json",
     docs_url="/docs",
     redoc_url="/redoc",
+    redirect_slashes=False,
 )
 
 # ── Rate Limiting ─────────────────────────────────────────────────────────────

@@ -15,7 +15,7 @@ router = APIRouter(prefix="/upload", tags=["Upload"])
 
 
 @router.post(
-    "/",
+    "",
     summary="Upload a DOCX document",
     responses={
         200: {"description": "Document uploaded successfully"},

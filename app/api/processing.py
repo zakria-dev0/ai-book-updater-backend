@@ -350,7 +350,7 @@ async def get_document_status(
 # ------------------------------------------------------------------ #
 
 @router.get(
-    "/",
+    "",
     summary="List all documents for the current user",
     responses={200: {"description": "Paginated list of documents"}},
 )
