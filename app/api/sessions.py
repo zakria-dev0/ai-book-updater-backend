@@ -141,7 +141,7 @@ class ResetToStepRequest(BaseModel):
 # SESSION CRUD
 # ══════════════════════════════════════════════════════════════════════════════
 
-@router.post("/", response_model=CreateSessionResponse)
+@router.post("", response_model=CreateSessionResponse)
 async def create_session(
     req: CreateSessionRequest,
     user=Depends(get_current_user_dep),
