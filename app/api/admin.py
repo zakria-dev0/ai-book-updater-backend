@@ -2,9 +2,9 @@ import os
 from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 from bson import ObjectId
-from app.core.security import get_current_user_dep
+from app.core.security import get_current_user_dep, get_password_hash
 from app.database.connection import get_database
 from app.core.logger import get_logger
 from app.core.config import settings
@@ -12,6 +12,8 @@ from app.core.config import settings
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
+
+ADMIN_ROLES = {"admin", "super_admin"}
 
 
 @router.get(
@@ -34,7 +36,7 @@ async def get_admin_stats(
     """
     # Check admin role
     user = await db.users.find_one({"email": current_user["email"]})
-    if not user or user.get("role", "user") != "admin":
+    if not user or user.get("role", "user") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required",
@@ -95,7 +97,7 @@ async def get_token_usage(
     Requires admin role.
     """
     user = await db.users.find_one({"email": current_user["email"]})
-    if not user or user.get("role", "user") != "admin":
+    if not user or user.get("role", "user") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required",
@@ -152,11 +154,23 @@ async def get_token_usage(
 # ------------------------------------------------------------------ #
 
 async def _require_admin(current_user: dict, db) -> dict:
+    """Allow admin or super_admin."""
     user = await db.users.find_one({"email": current_user["email"]})
-    if not user or user.get("role", "user") != "admin":
+    if not user or user.get("role", "user") not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required",
+        )
+    return user
+
+
+async def _require_super_admin(current_user: dict, db) -> dict:
+    """Allow super_admin only."""
+    user = await db.users.find_one({"email": current_user["email"]})
+    if not user or user.get("role", "user") != "super_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Super admin access required",
         )
     return user
 
@@ -196,6 +210,7 @@ async def list_users(
             "id": str(u["_id"]),
             "email": u.get("email", ""),
             "role": u.get("role", "user"),
+            "is_active": u.get("is_active", True),
             "created_at": u.get("created_at").isoformat() if u.get("created_at") else None,
         })
 
@@ -270,8 +285,66 @@ async def get_user_activity(
     }
 
 
+VALID_ROLES = {"user", "admin", "super_admin"}
+
+
 class UpdateRoleRequest(BaseModel):
-    role: str = Field(..., description="New role: 'user' or 'admin'")
+    role: str = Field(..., description="New role: 'user', 'admin', or 'super_admin'")
+
+
+class CreateUserRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+    role: str = Field(default="user", description="Role for the new user")
+
+
+@router.post(
+    "/users",
+    summary="Create a new user account (super_admin only)",
+    responses={
+        201: {"description": "User created"},
+        400: {"description": "Email already registered or invalid role"},
+        403: {"description": "Super admin only"},
+    },
+)
+async def create_user(
+    body: CreateUserRequest,
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """Create a new user account. Super admin only. Role is limited to 'admin' or 'user'."""
+    await _require_super_admin(current_user, db)
+
+    CREATABLE_ROLES = {"user", "admin"}
+    if body.role not in CREATABLE_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Role must be 'user' or 'admin'",
+        )
+
+    existing = await db.users.find_one({"email": body.email})
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered",
+        )
+
+    new_user = {
+        "email": body.email,
+        "hashed_password": get_password_hash(body.password),
+        "role": body.role,
+        "is_active": True,
+        "created_at": datetime.utcnow(),
+    }
+    result = await db.users.insert_one(new_user)
+
+    logger.info("User %s created by super_admin %s", body.email, current_user["email"])
+    return {
+        "id": str(result.inserted_id),
+        "email": body.email,
+        "role": body.role,
+        "message": "User created successfully",
+    }
 
 
 @router.put(
@@ -290,13 +363,20 @@ async def update_user_role(
     current_user: dict = Depends(get_current_user_dep),
     db=Depends(get_database),
 ):
-    """Change a user's role (admin/user). Admin only."""
-    await _require_admin(current_user, db)
+    """Change a user's role. Admin or super_admin only."""
+    caller = await _require_admin(current_user, db)
 
-    if body.role not in ("admin", "user"):
+    if body.role not in VALID_ROLES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Role must be 'admin' or 'user'",
+            detail=f"Role must be one of: {', '.join(sorted(VALID_ROLES))}",
+        )
+
+    # Only super_admin can assign the super_admin role
+    if body.role == "super_admin" and caller.get("role") != "super_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only super admins can assign the super_admin role",
         )
 
     # Prevent self-demotion: admins cannot change their own role
@@ -320,6 +400,86 @@ async def update_user_role(
 
     logger.info("User %s role updated to %s by %s", user_id, body.role, current_user["email"])
     return {"user_id": user_id, "role": body.role, "message": "Role updated"}
+
+
+@router.patch(
+    "/users/{user_id}/status",
+    summary="Activate or deactivate a user (super_admin only)",
+    responses={
+        200: {"description": "Status updated"},
+        400: {"description": "Cannot deactivate yourself or another super_admin"},
+        403: {"description": "Super admin only"},
+        404: {"description": "User not found"},
+    },
+)
+async def update_user_status(
+    user_id: str,
+    body: dict,
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """Toggle a user's active status. Super admin only. Cannot deactivate super_admin accounts."""
+    await _require_super_admin(current_user, db)
+
+    is_active = body.get("is_active")
+    if not isinstance(is_active, bool):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="is_active must be a boolean")
+
+    try:
+        target = await db.users.find_one({"_id": ObjectId(user_id)})
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    if not target:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    if target.get("email") == current_user["email"]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You cannot deactivate your own account")
+
+    if target.get("role") == "super_admin":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot change status of a super_admin account")
+
+    await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"is_active": is_active}})
+    action = "activated" if is_active else "deactivated"
+    logger.info("User %s %s by %s", user_id, action, current_user["email"])
+    return {"user_id": user_id, "is_active": is_active, "message": f"User {action}"}
+
+
+@router.delete(
+    "/users/{user_id}",
+    summary="Delete a user account (super_admin only)",
+    responses={
+        200: {"description": "User deleted"},
+        400: {"description": "Cannot delete yourself or a super_admin"},
+        403: {"description": "Super admin only"},
+        404: {"description": "User not found"},
+    },
+)
+async def delete_user(
+    user_id: str,
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """Permanently delete a user. Super admin only. Cannot delete super_admin accounts."""
+    await _require_super_admin(current_user, db)
+
+    try:
+        target = await db.users.find_one({"_id": ObjectId(user_id)})
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    if not target:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    if target.get("email") == current_user["email"]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You cannot delete your own account")
+
+    if target.get("role") == "super_admin":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot delete a super_admin account")
+
+    await db.users.delete_one({"_id": ObjectId(user_id)})
+    logger.info("User %s deleted by %s", user_id, current_user["email"])
+    return {"user_id": user_id, "message": "User deleted"}
 
 
 # ------------------------------------------------------------------ #
