@@ -6,15 +6,21 @@ class User(BaseModel):
     id: Optional[str] = Field(default=None, alias="_id")
     email: EmailStr
     hashed_password: str
-    role: str = "user"  # "user" or "admin"
+    role: str = "user"  # "user", "admin", or "super_admin"
+    is_active: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
-    
+
     class Config:
         populate_by_name = True
 
 class UserCreate(BaseModel):
     email: EmailStr
     password: str
+
+class AdminCreateUser(BaseModel):
+    email: EmailStr
+    password: str
+    role: str = "user"
 
 class UserLogin(BaseModel):
     email: EmailStr

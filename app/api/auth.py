@@ -86,6 +86,12 @@ async def login(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    if not user.get("is_active", True):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is deactivated. Please contact an administrator.",
+        )
+
     access_token = create_access_token(
         data={"sub": user["email"], "role": user.get("role", "user")},
         expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
