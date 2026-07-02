@@ -61,6 +61,10 @@ async def connect_to_mongo():
     # dated_statements: temporal audit per session
     await database.dated_statements.create_index("session_id")
 
+    # figures: separate collection for image data (avoids 16 MB doc limit)
+    await database.figures.create_index("document_id")
+    await database.figures.create_index([("document_id", 1), ("figure_id", 1)], unique=True)
+
     # settings: system configuration (API keys, etc.)
     await database.settings.create_index("key", unique=True)
 

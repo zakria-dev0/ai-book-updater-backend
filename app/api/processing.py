@@ -5,6 +5,7 @@ from datetime import datetime
 from app.core.security import get_current_user_dep
 from app.database.connection import get_database
 from app.database.repositories.document_repo import DocumentRepository
+from app.database.repositories.figure_repo import FigureRepository
 from app.models.document import DocumentStatus
 from app.services.document_service import DOCXParser
 from app.services.equation_service import MathpixService
@@ -148,11 +149,25 @@ async def _run_processing(document_id: str, db):
 
         para_to_page = {str(k): v for k, v in parser._para_to_page.items()}
 
+        # Store figures in a separate collection to avoid the MongoDB
+        # 16 MB document-size limit (large docs can have 80+ images).
+        fig_repo = FigureRepository(db)
+        fig_dicts = [fig.model_dump() for fig in figures]
+        await fig_repo.replace_all(document_id, fig_dicts)
+
+        # Store lightweight figure references (no image_base64) in the
+        # main document so metadata queries still work without a join.
+        figures_meta = []
+        for fig in figures:
+            d = fig.model_dump()
+            d.pop("image_base64", None)
+            figures_meta.append(d)
+
         await repo.update_fields(document_id, {
             "text_content": text,
             "paragraphs": paragraphs,
             "equations": [eq.model_dump() for eq in equations],
-            "figures": [fig.model_dump() for fig in figures],
+            "figures": figures_meta,
             "tables": [tbl.model_dump() for tbl in tables],
             "metadata": metadata.model_dump(),
             "para_to_page": para_to_page,
@@ -283,6 +298,10 @@ async def reprocess_document(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Document is currently being processed",
         )
+
+    # Clear figures from separate collection
+    fig_repo = FigureRepository(db)
+    await fig_repo.delete_by_document(document_id)
 
     # Reset extraction data
     await repo.update_fields(document_id, {
@@ -469,6 +488,10 @@ async def delete_document(
     if file_path:
         delete_file(file_path)
 
+    # Remove figures from separate collection
+    fig_repo = FigureRepository(db)
+    await fig_repo.delete_by_document(document_id)
+
     await repo.delete(document_id)
     logger.info("Document %s deleted by %s", document_id, current_user["email"])
     return {"message": "Document deleted successfully", "document_id": document_id}
@@ -534,7 +557,9 @@ async def get_figures(
             detail="Document has not been processed yet",
         )
 
-    figures = document.get("figures", [])
+    # Fetch full figures (with image_base64) from separate collection
+    fig_repo = FigureRepository(db)
+    figures = await fig_repo.find_by_document(document_id, include_image=True)
     return {
         "document_id": document_id,
         "total_figures": len(figures),
@@ -659,11 +684,12 @@ async def batch_process_equations(
 
     from app.models.document import Figure, Equation
 
-    # Rebuild Figure objects from stored data
-    figures_raw = document.get("figures", [])
+    # Fetch full figures (with image_base64) from separate collection
+    fig_repo = FigureRepository(db)
+    figures_raw = await fig_repo.find_by_document(document_id, include_image=True)
     all_equations = document.get("equations", [])
 
-    # Also include figures that were previously classified as equations (re-scan them)
+    # Rebuild Figure objects
     figures = [Figure(**f) if isinstance(f, dict) else f for f in figures_raw]
 
     if not figures:
@@ -680,9 +706,20 @@ async def batch_process_equations(
     omml_equations = [eq for eq in all_equations if not eq.get("equation_id", "").startswith("eq_mathpix_")]
     combined_equations = omml_equations + [eq.model_dump() for eq in new_eqs]
 
+    # Update figures in separate collection
+    remaining_fig_dicts = [fig.model_dump() for fig in remaining_figs]
+    await fig_repo.replace_all(document_id, remaining_fig_dicts)
+
+    # Store lightweight references (no image_base64) in main document
+    remaining_meta = []
+    for fig in remaining_figs:
+        d = fig.model_dump()
+        d.pop("image_base64", None)
+        remaining_meta.append(d)
+
     await repo.update_fields(document_id, {
         "equations": combined_equations,
-        "figures": [fig.model_dump() for fig in remaining_figs],
+        "figures": remaining_meta,
     })
 
     logger.info(
@@ -834,22 +871,16 @@ async def get_figure_thumbnail(
 ):
     """Return a thumbnail version of a figure (300x300 max)."""
     repo = DocumentRepository(db)
-    document = await _get_owned_document(document_id, current_user, repo)
+    await _get_owned_document(document_id, current_user, repo)
 
-    figures = document.get("figures", [])
-    figure = None
-    for fig in figures:
-        fig_id = fig.get("figure_id", "") if isinstance(fig, dict) else fig.figure_id
-        if fig_id == figure_id:
-            figure = fig
-            break
+    # Fetch the single figure from the separate collection
+    fig_repo = FigureRepository(db)
+    fig_data = await fig_repo.find_one_figure(document_id, figure_id)
 
-    if not figure:
+    if not fig_data:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Figure not found")
 
-    fig_data = figure if isinstance(figure, dict) else figure.model_dump()
     image_b64 = fig_data.get("image_base64")
-
     if not image_b64:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Figure has no image data")
 
@@ -909,6 +940,11 @@ async def clone_document(
         clone["file_path"] = dest_path
 
     await db.documents.insert_one(clone)
+
+    # Clone figures from separate collection
+    fig_repo = FigureRepository(db)
+    await fig_repo.clone_figures(document_id, new_id)
+
     logger.info("Document %s cloned to %s by %s", document_id, new_id, current_user["email"])
 
     return {

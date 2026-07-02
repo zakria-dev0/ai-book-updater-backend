@@ -159,12 +159,26 @@ class DocumentRepository:
             return None
 
     async def find_with_media(self, document_id: str) -> Optional[dict]:
-        """Fetch document with figures + equations + tables (for media analysis endpoints)."""
+        """Fetch document with figures + equations + tables (for media analysis endpoints).
+
+        Figures with full image_base64 are fetched from the separate
+        ``figures`` collection and merged into the result so that callers
+        (e.g. session figure_analysis) see the same shape as before.
+        """
         try:
             doc = await self.collection.find_one(
                 {"_id": ObjectId(document_id)}, self._MEDIA_PROJECTION,
             )
-            return self._serialize(doc) if doc else None
+            if not doc:
+                return None
+            doc = self._serialize(doc)
+
+            # Join full figures (with image_base64) from separate collection
+            from app.database.repositories.figure_repo import FigureRepository
+            fig_repo = FigureRepository(self.collection.database)
+            full_figures = await fig_repo.find_by_document(document_id, include_image=True)
+            doc["figures"] = full_figures
+            return doc
         except Exception:
             return None
 
