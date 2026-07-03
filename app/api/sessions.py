@@ -22,6 +22,7 @@ from app.models.session import (
 from app.core.logger import get_logger
 from app.core.rate_limit import limiter
 from app.core.config import settings
+from app.services.image_service import ImageService
 
 logger = get_logger(__name__)
 
@@ -6956,7 +6957,15 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
 
     async def _analyze_single_figure(fig_num: int, fig: dict, http_client: httpx.AsyncClient):
         """Analyze one figure with GPT-4o Vision + search for replacements concurrently."""
-        thumb_b64 = fig["image_b64"]
+        # Downscale/re-encode before sending to Vision and before storing in
+        # media_patches — this collection has no size cap and previously
+        # stored the figure's full-resolution bytes on every analysis run.
+        try:
+            _raw = base64.b64decode(fig["image_b64"])
+            _compressed = ImageService.compress_for_storage(_raw)
+            thumb_b64 = base64.b64encode(_compressed).decode("utf-8")
+        except Exception:
+            thumb_b64 = fig["image_b64"]
         caption = fig.get("caption", "") or ""
 
         # ── Step 1: GPT-4o Vision analysis ────────────────────────────────

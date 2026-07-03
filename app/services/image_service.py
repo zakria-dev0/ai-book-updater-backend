@@ -92,6 +92,50 @@ class ImageService:
             return False, f"Invalid image data: {str(e)}"
 
     @staticmethod
+    def compress_for_storage(
+        image_data: bytes,
+        max_dimension: int = 1600,
+        jpeg_quality: int = 85,
+        skip_below_bytes: int = 300_000,
+    ) -> bytes:
+        """
+        Downscale/re-encode raw image bytes before they get base64-stored in MongoDB.
+
+        Images whose longest side already fits within max_dimension and whose
+        size is already under skip_below_bytes are returned unchanged. Images
+        with transparency/palette data (diagrams, screenshots) are kept as
+        optimized PNG; everything else is re-encoded as JPEG, since that is
+        where most of the size reduction comes from on photo-like scans.
+        Falls back to the original bytes if compression fails or doesn't help
+        (mirrors the "keep original on failure" behavior used elsewhere in
+        this module).
+        """
+        try:
+            img = Image.open(io.BytesIO(image_data))
+            needs_resize = max(img.width, img.height) > max_dimension
+            if not needs_resize and len(image_data) < skip_below_bytes:
+                return image_data
+
+            if needs_resize:
+                img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
+
+            buffer = io.BytesIO()
+            if img.mode in ("P", "RGBA", "LA"):
+                if img.mode not in ("RGB", "RGBA", "L", "P"):
+                    img = img.convert("RGBA")
+                img.save(buffer, format="PNG", optimize=True)
+            else:
+                if img.mode not in ("RGB", "L"):
+                    img = img.convert("RGB")
+                img.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
+
+            compressed = buffer.getvalue()
+            return compressed if len(compressed) < len(image_data) else image_data
+        except Exception as e:
+            logger.error("Image compression failed, keeping original: %s", e)
+            return image_data
+
+    @staticmethod
     def convert_format(
         image_base64: str,
         target_format: str = "PNG",

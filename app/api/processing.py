@@ -6,6 +6,7 @@ from app.core.security import get_current_user_dep
 from app.database.connection import get_database
 from app.database.repositories.document_repo import DocumentRepository
 from app.database.repositories.figure_repo import FigureRepository
+from app.database.repositories.session_repo import SessionRepository
 from app.models.document import DocumentStatus
 from app.services.document_service import DOCXParser
 from app.services.equation_service import MathpixService
@@ -491,6 +492,11 @@ async def delete_document(
     # Remove figures from separate collection
     fig_repo = FigureRepository(db)
     await fig_repo.delete_by_document(document_id)
+
+    # Remove editorial sessions (and their opportunities/patches/media_patches)
+    # tied to this document so their image blobs don't stay orphaned forever
+    session_repo = SessionRepository(db)
+    await session_repo.delete_sessions_by_document(document_id)
 
     await repo.delete(document_id)
     logger.info("Document %s deleted by %s", document_id, current_user["email"])
