@@ -47,9 +47,9 @@ class MathpixService:
 
     API_URL = "https://api.mathpix.com/v3/text"
 
-    def __init__(self):
-        self.app_id = settings.MATHPIX_APP_ID
-        self.app_key = settings.MATHPIX_APP_KEY
+    def __init__(self, app_id: str = "", app_key: str = ""):
+        self.app_id = app_id or settings.MATHPIX_APP_ID
+        self.app_key = app_key or settings.MATHPIX_APP_KEY
 
     @property
     def is_configured(self) -> bool:
@@ -73,8 +73,21 @@ class MathpixService:
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as e:
-            logger.error("Mathpix HTTP error %s: %s", e.response.status_code, e.response.text)
+            code = e.response.status_code
+            if code in (401, 403):
+                raise RuntimeError(
+                    "Mathpix API key is invalid or expired. "
+                    "Please update your Mathpix credentials in Admin → API Keys."
+                ) from e
+            if code == 429:
+                raise RuntimeError(
+                    "Mathpix API quota exceeded. "
+                    "Please upgrade your Mathpix plan or update credentials in Admin → API Keys."
+                ) from e
+            logger.error("Mathpix HTTP error %s: %s", code, e.response.text)
             return None
+        except RuntimeError:
+            raise  # Re-raise our own RuntimeErrors (401/429)
         except Exception as e:
             logger.error("Mathpix request failed: %s", e)
             return None

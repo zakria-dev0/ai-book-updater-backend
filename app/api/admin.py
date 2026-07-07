@@ -696,9 +696,44 @@ class UpdateApiKeyRequest(BaseModel):
     key: str = Field(..., min_length=1, description="New API key value")
 
 
+class UpdateCloudinaryKeysRequest(BaseModel):
+    cloud_name: str = Field(..., min_length=1)
+    api_key: str = Field(..., min_length=1)
+    api_secret: str = Field(..., min_length=1)
+
+
+class UpdateMathpixKeysRequest(BaseModel):
+    app_id: str = Field(..., min_length=1)
+    app_key: str = Field(..., min_length=1)
+
+
 async def get_tavily_key_from_db(db) -> str | None:
     """Read the Tavily API key from the settings collection in MongoDB."""
     doc = await db.settings.find_one({"key": "tavily_api_key"})
+    if doc:
+        return doc.get("value")
+    return None
+
+
+async def get_cloudinary_keys_from_db(db) -> dict | None:
+    """Read Cloudinary credentials from the settings collection in MongoDB."""
+    doc = await db.settings.find_one({"key": "cloudinary_credentials"})
+    if doc and doc.get("value"):
+        return doc["value"]
+    return None
+
+
+async def get_mathpix_keys_from_db(db) -> dict | None:
+    """Read Mathpix credentials from the settings collection in MongoDB."""
+    doc = await db.settings.find_one({"key": "mathpix_credentials"})
+    if doc and doc.get("value"):
+        return doc["value"]
+    return None
+
+
+async def get_openai_key_from_db(db) -> str | None:
+    """Read the OpenAI API key from the settings collection in MongoDB."""
+    doc = await db.settings.find_one({"key": "openai_api_key"})
     if doc:
         return doc.get("value")
     return None
@@ -721,6 +756,14 @@ async def get_api_keys(
 
     # Check DB first, then fall back to .env
     tavily_key = await get_tavily_key_from_db(db) or settings.TAVILY_API_KEY
+    cloudinary_db = await get_cloudinary_keys_from_db(db)
+    cloud_name = (cloudinary_db or {}).get("cloud_name") or settings.CLOUDINARY_CLOUD_NAME
+    cloud_api_key = (cloudinary_db or {}).get("api_key") or settings.CLOUDINARY_API_KEY
+    cloud_api_secret = (cloudinary_db or {}).get("api_secret") or settings.CLOUDINARY_API_SECRET
+    mathpix_db = await get_mathpix_keys_from_db(db)
+    mathpix_app_id = (mathpix_db or {}).get("app_id") or settings.MATHPIX_APP_ID
+    mathpix_app_key = (mathpix_db or {}).get("app_key") or settings.MATHPIX_APP_KEY
+    openai_key = await get_openai_key_from_db(db) or settings.OPENAI_API_KEY
 
     def mask(val: str) -> str:
         if not val:
@@ -737,6 +780,34 @@ async def get_api_keys(
                 "masked_value": mask(tavily_key),
                 "is_set": bool(tavily_key),
                 "source": "database" if await get_tavily_key_from_db(db) else "env",
+            },
+            {
+                "id": "cloudinary",
+                "label": "Cloudinary",
+                "is_set": bool(cloud_name and cloud_api_key and cloud_api_secret),
+                "source": "database" if cloudinary_db else "env",
+                "fields": {
+                    "cloud_name": {"masked_value": mask(cloud_name), "is_set": bool(cloud_name)},
+                    "api_key": {"masked_value": mask(cloud_api_key), "is_set": bool(cloud_api_key)},
+                    "api_secret": {"masked_value": mask(cloud_api_secret), "is_set": bool(cloud_api_secret)},
+                },
+            },
+            {
+                "id": "mathpix",
+                "label": "Mathpix",
+                "is_set": bool(mathpix_app_id and mathpix_app_key),
+                "source": "database" if mathpix_db else "env",
+                "fields": {
+                    "app_id": {"masked_value": mask(mathpix_app_id), "is_set": bool(mathpix_app_id)},
+                    "app_key": {"masked_value": mask(mathpix_app_key), "is_set": bool(mathpix_app_key)},
+                },
+            },
+            {
+                "id": "openai",
+                "label": "OpenAI API Key",
+                "masked_value": mask(openai_key),
+                "is_set": bool(openai_key),
+                "source": "database" if await get_openai_key_from_db(db) else "env",
             },
         ],
     }
@@ -773,3 +844,114 @@ async def update_tavily_key(
 
     logger.info("Tavily API key updated by %s", current_user["email"])
     return {"message": "Tavily API key updated successfully"}
+
+
+@router.put(
+    "/api-keys/cloudinary",
+    summary="Update Cloudinary credentials",
+    responses={
+        200: {"description": "Credentials updated"},
+        403: {"description": "Admin only"},
+    },
+)
+async def update_cloudinary_keys(
+    body: UpdateCloudinaryKeysRequest,
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """Store or update Cloudinary credentials in MongoDB. Admin only."""
+    await _require_admin(current_user, db)
+
+    await db.settings.update_one(
+        {"key": "cloudinary_credentials"},
+        {
+            "$set": {
+                "key": "cloudinary_credentials",
+                "value": {
+                    "cloud_name": body.cloud_name,
+                    "api_key": body.api_key,
+                    "api_secret": body.api_secret,
+                },
+                "updated_at": datetime.utcnow(),
+                "updated_by": current_user["email"],
+            }
+        },
+        upsert=True,
+    )
+
+    # Reset and reload Cloudinary config so next upload picks up new credentials
+    from app.services.cloudinary_service import CloudinaryService
+    CloudinaryService.reset_config()
+    await CloudinaryService.load_from_db()
+
+    logger.info("Cloudinary credentials updated by %s", current_user["email"])
+    return {"message": "Cloudinary credentials updated successfully"}
+
+
+@router.put(
+    "/api-keys/mathpix",
+    summary="Update Mathpix credentials",
+    responses={
+        200: {"description": "Credentials updated"},
+        403: {"description": "Admin only"},
+    },
+)
+async def update_mathpix_keys(
+    body: UpdateMathpixKeysRequest,
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """Store or update Mathpix credentials in MongoDB. Admin only."""
+    await _require_admin(current_user, db)
+
+    await db.settings.update_one(
+        {"key": "mathpix_credentials"},
+        {
+            "$set": {
+                "key": "mathpix_credentials",
+                "value": {
+                    "app_id": body.app_id,
+                    "app_key": body.app_key,
+                },
+                "updated_at": datetime.utcnow(),
+                "updated_by": current_user["email"],
+            }
+        },
+        upsert=True,
+    )
+
+    logger.info("Mathpix credentials updated by %s", current_user["email"])
+    return {"message": "Mathpix credentials updated successfully"}
+
+
+@router.put(
+    "/api-keys/openai",
+    summary="Update the OpenAI API key",
+    responses={
+        200: {"description": "Key updated"},
+        403: {"description": "Admin only"},
+    },
+)
+async def update_openai_key(
+    body: UpdateApiKeyRequest,
+    current_user: dict = Depends(get_current_user_dep),
+    db=Depends(get_database),
+):
+    """Store or update the OpenAI API key in MongoDB. Admin only."""
+    await _require_admin(current_user, db)
+
+    await db.settings.update_one(
+        {"key": "openai_api_key"},
+        {
+            "$set": {
+                "key": "openai_api_key",
+                "value": body.key,
+                "updated_at": datetime.utcnow(),
+                "updated_by": current_user["email"],
+            }
+        },
+        upsert=True,
+    )
+
+    logger.info("OpenAI API key updated by %s", current_user["email"])
+    return {"message": "OpenAI API key updated successfully"}
