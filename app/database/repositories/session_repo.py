@@ -16,6 +16,7 @@ class SessionRepository:
         self.evidence_items = db.evidence_items
         self.patches = db.patches
         self.dated_statements = db.dated_statements
+        self.media_patches = db.media_patches
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #
@@ -71,9 +72,21 @@ class SessionRepository:
         await self.evidence_items.delete_many({"session_id": session_id})
         await self.patches.delete_many({"session_id": session_id})
         await self.dated_statements.delete_many({"session_id": session_id})
+        await self.media_patches.delete_many({"session_id": session_id})
         result = await self.sessions.delete_one({"_id": ObjectId(session_id)})
         logger.info("Session deleted: %s", session_id)
         return result.deleted_count > 0
+
+    async def delete_sessions_by_document(self, document_id: str) -> int:
+        """Delete every session (and their related data) belonging to a document.
+
+        Used when a document itself is deleted, so its sessions don't stay
+        behind as orphaned rows holding large media_patches image blobs.
+        """
+        sessions = await self.find_sessions_by_document(document_id)
+        for session in sessions:
+            await self.delete_session(session["id"])
+        return len(sessions)
 
     # ------------------------------------------------------------------ #
     # Update Opportunities                                                 #
