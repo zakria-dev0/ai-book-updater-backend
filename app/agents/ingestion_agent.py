@@ -270,8 +270,8 @@ MAX_CONCURRENT_CHUNKS = 3  # parallel GPT calls — limited by 30K TPM on OpenAI
 
 
 class ContentAnalysisAgent:
-    def __init__(self):
-        self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    def __init__(self, api_key: str = ""):
+        self.client = AsyncOpenAI(api_key=api_key or settings.OPENAI_API_KEY)
         self.model = settings.GPT_MODEL
         # Use the full gpt-4o model for claim extraction — mini misses subtle staleness
         self.analysis_model = settings.GPT_MODEL
@@ -292,7 +292,7 @@ class ContentAnalysisAgent:
         language patterns, and technology descriptions.
         Returns dict with estimated_publication_year and document_age_years.
         """
-        if not settings.OPENAI_API_KEY:
+        if not self.client.api_key:
             logger.warning("OpenAI API key not configured — skipping age estimation")
             return self._fallback_age_estimation(text_content)
 
@@ -391,7 +391,7 @@ class ContentAnalysisAgent:
         Analyze the first 3000 characters of a document to determine
         its writing style profile. Run once per document.
         """
-        if not settings.OPENAI_API_KEY:
+        if not self.client.api_key:
             logger.warning("OpenAI API key not configured — returning default style profile")
             return StyleProfile()
 
@@ -450,7 +450,7 @@ class ContentAnalysisAgent:
         If focus_areas is provided (not ["all"]), claims are filtered to only
         those matching the specified categories.
         """
-        if not settings.OPENAI_API_KEY:
+        if not self.client.api_key:
             logger.warning("OpenAI API key not configured — skipping content analysis")
             return []
 

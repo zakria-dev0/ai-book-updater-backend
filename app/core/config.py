@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     TAVILY_API_KEY: str = ""
     NASA_API_KEY: str = ""
 
+    # Cloudinary (figure image storage)
+    CLOUDINARY_CLOUD_NAME: str = ""
+    CLOUDINARY_API_KEY: str = ""
+    CLOUDINARY_API_SECRET: str = ""
+
     # SMTP Email Configuration
     SMTP_HOST: str = ""
     SMTP_PORT: int = 587
