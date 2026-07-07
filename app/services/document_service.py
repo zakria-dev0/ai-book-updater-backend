@@ -7,6 +7,7 @@ from docx.table import Table as DocxTable
 from docx.text.paragraph import Paragraph
 from typing import List, Optional, Tuple
 from app.models.document import Equation, Figure, Table, Position, DocumentMetadata
+from app.services.image_service import ImageService
 import base64
 from io import BytesIO
 from PIL import Image
@@ -460,6 +461,11 @@ class DOCXParser:
                 except Exception:
                     pass  # If Pillow can't open it, keep original bytes
 
+                # Downscale/re-encode before storing so large documents with
+                # many full-resolution scans don't blow past the DB storage
+                # quota (base64 adds ~33% on top of the raw bytes already).
+                image_data = ImageService.compress_for_storage(image_data)
+
                 image_base64 = base64.b64encode(image_data).decode('utf-8')
                 info = embed_info.get(rel.rId, {})
                 para_pos = info.get("para_idx")
@@ -776,6 +782,7 @@ class PDFParser:
                     xref = img[0]
                     base_image = self.doc.extract_image(xref)
                     image_bytes = base_image["image"]
+                    image_bytes = ImageService.compress_for_storage(image_bytes)
                     image_base64 = base64.b64encode(image_bytes).decode("utf-8")
                     figures.append(Figure(
                         figure_id=f"fig_p{page_num}_{img_idx}",

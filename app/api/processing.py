@@ -6,6 +6,8 @@ from app.core.security import get_current_user_dep
 from app.database.connection import get_database
 from app.database.repositories.document_repo import DocumentRepository
 from app.database.repositories.figure_repo import FigureRepository
+from app.database.repositories.session_repo import SessionRepository
+from app.services.cloudinary_service import CloudinaryService
 from app.models.document import DocumentStatus
 from app.services.document_service import DOCXParser
 from app.services.equation_service import MathpixService
@@ -60,6 +62,17 @@ async def _update_stage(
         pass  # Non-critical — don't fail processing if WS broadcast fails
 
 
+async def _get_mathpix_credentials(db) -> tuple[str, str]:
+    """Get Mathpix credentials from DB first, then fall back to .env."""
+    try:
+        doc = await db.settings.find_one({"key": "mathpix_credentials"})
+        if doc and doc.get("value"):
+            return doc["value"].get("app_id", ""), doc["value"].get("app_key", "")
+    except Exception:
+        pass
+    return settings.MATHPIX_APP_ID, settings.MATHPIX_APP_KEY
+
+
 async def _get_owned_document(
     document_id: str,
     current_user: dict,
@@ -105,13 +118,14 @@ async def _run_processing(document_id: str, db):
         await _update_stage(repo, document_id, "Extracting equations", 70, "Extracting OMML equations and converting to LaTeX")
         equations = parser._extract_equations()
 
-        if settings.MATHPIX_APP_ID and settings.MATHPIX_APP_KEY:
+        mathpix_app_id, mathpix_app_key = await _get_mathpix_credentials(db)
+        if mathpix_app_id and mathpix_app_key:
             await _update_stage(
                 repo, document_id,
                 "Extracting equations from images", 78,
                 "Using Mathpix OCR to detect equations in figures",
             )
-            mathpix = MathpixService()
+            mathpix = MathpixService(app_id=mathpix_app_id, app_key=mathpix_app_key)
             mathpix_eqs, figures = await mathpix.extract_equations_from_figures(figures)
 
             # Deduplicate: only add Mathpix equations not already found via OMML
@@ -149,19 +163,51 @@ async def _run_processing(document_id: str, db):
 
         para_to_page = {str(k): v for k, v in parser._para_to_page.items()}
 
-        # Store figures in a separate collection to avoid the MongoDB
-        # 16 MB document-size limit (large docs can have 80+ images).
+        # Upload figures to Cloudinary and store URLs in DB.
+        # Falls back to the separate MongoDB figures collection when
+        # Cloudinary is not configured.
         fig_repo = FigureRepository(db)
-        fig_dicts = [fig.model_dump() for fig in figures]
+        fig_dicts = []
+        use_cloudinary = CloudinaryService.is_configured()
+
+        if use_cloudinary and figures:
+            total_figs = len(figures)
+            await _update_stage(
+                repo, document_id,
+                "Uploading figures to cloud", 90,
+                f"Uploading {total_figs} figures to Cloudinary (0/{total_figs})",
+            )
+            for idx, fig in enumerate(figures):
+                d = fig.model_dump()
+                if d.get("image_base64"):
+                    result = CloudinaryService.upload_figure(
+                        d["image_base64"], document_id, d["figure_id"],
+                    )
+                    d["image_url"] = result["url"]
+                    d["cloudinary_public_id"] = result["public_id"]
+                    d.pop("image_base64", None)
+                fig_dicts.append(d)
+                # Update progress every 5 figures to avoid flooding WebSocket
+                if (idx + 1) % 5 == 0 or idx + 1 == total_figs:
+                    pct = 90 + int((idx + 1) / total_figs * 7)  # 90% → 97%
+                    await _update_stage(
+                        repo, document_id,
+                        "Uploading figures to cloud", pct,
+                        f"Uploading figures to Cloudinary ({idx + 1}/{total_figs})",
+                    )
+        else:
+            for fig in figures:
+                d = fig.model_dump()
+                fig_dicts.append(d)
+
         await fig_repo.replace_all(document_id, fig_dicts)
 
-        # Store lightweight figure references (no image_base64) in the
-        # main document so metadata queries still work without a join.
+        # Store lightweight figure references in the main document
+        # (no image_base64, no heavy data) so metadata queries work.
         figures_meta = []
-        for fig in figures:
-            d = fig.model_dump()
-            d.pop("image_base64", None)
-            figures_meta.append(d)
+        for d in fig_dicts:
+            meta = {k: v for k, v in d.items() if k != "image_base64"}
+            figures_meta.append(meta)
 
         await repo.update_fields(document_id, {
             "text_content": text,
@@ -299,7 +345,9 @@ async def reprocess_document(
             detail="Document is currently being processed",
         )
 
-    # Clear figures from separate collection
+    # Clear figures from Cloudinary and separate collection
+    if CloudinaryService.is_configured():
+        CloudinaryService.delete_document_figures(document_id)
     fig_repo = FigureRepository(db)
     await fig_repo.delete_by_document(document_id)
 
@@ -488,9 +536,16 @@ async def delete_document(
     if file_path:
         delete_file(file_path)
 
-    # Remove figures from separate collection
+    # Remove figures from Cloudinary and separate collection
+    if CloudinaryService.is_configured():
+        CloudinaryService.delete_document_figures(document_id)
     fig_repo = FigureRepository(db)
     await fig_repo.delete_by_document(document_id)
+
+    # Remove editorial sessions (and their opportunities/patches/media_patches)
+    # tied to this document so their image blobs don't stay orphaned forever
+    session_repo = SessionRepository(db)
+    await session_repo.delete_sessions_by_document(document_id)
 
     await repo.delete(document_id)
     logger.info("Document %s deleted by %s", document_id, current_user["email"])
@@ -676,10 +731,11 @@ async def batch_process_equations(
             detail="Document must be processed first",
         )
 
-    if not settings.MATHPIX_APP_ID or not settings.MATHPIX_APP_KEY:
+    mathpix_app_id, mathpix_app_key = await _get_mathpix_credentials(db)
+    if not mathpix_app_id or not mathpix_app_key:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Mathpix API keys not configured",
+            detail="Mathpix API keys not configured. Please add them in Admin → API Keys.",
         )
 
     from app.models.document import Figure, Equation
@@ -689,8 +745,20 @@ async def batch_process_equations(
     figures_raw = await fig_repo.find_by_document(document_id, include_image=True)
     all_equations = document.get("equations", [])
 
-    # Rebuild Figure objects
-    figures = [Figure(**f) if isinstance(f, dict) else f for f in figures_raw]
+    # Rebuild Figure objects; for Cloudinary-stored figures, download
+    # the image and set image_base64 so Mathpix can process them.
+    import httpx as _httpx, base64 as _b64
+    figures = []
+    for f in figures_raw:
+        fig = Figure(**f) if isinstance(f, dict) else f
+        if not fig.image_base64 and fig.image_url:
+            try:
+                resp = _httpx.get(fig.image_url, timeout=30)
+                resp.raise_for_status()
+                fig.image_base64 = _b64.b64encode(resp.content).decode("utf-8")
+            except Exception as e:
+                logger.warning("Could not download figure %s from Cloudinary: %s", fig.figure_id, e)
+        figures.append(fig)
 
     if not figures:
         return {
@@ -699,23 +767,27 @@ async def batch_process_equations(
             "equations_found": 0,
         }
 
-    mathpix = MathpixService()
+    mathpix = MathpixService(app_id=mathpix_app_id, app_key=mathpix_app_key)
     new_eqs, remaining_figs = await mathpix.extract_equations_from_figures(figures)
 
     # Keep non-Mathpix equations (OMML-extracted), replace Mathpix ones
     omml_equations = [eq for eq in all_equations if not eq.get("equation_id", "").startswith("eq_mathpix_")]
     combined_equations = omml_equations + [eq.model_dump() for eq in new_eqs]
 
-    # Update figures in separate collection
-    remaining_fig_dicts = [fig.model_dump() for fig in remaining_figs]
-    await fig_repo.replace_all(document_id, remaining_fig_dicts)
-
-    # Store lightweight references (no image_base64) in main document
-    remaining_meta = []
+    # Update figures in separate collection (keep Cloudinary URLs, drop base64)
+    remaining_fig_dicts = []
     for fig in remaining_figs:
         d = fig.model_dump()
-        d.pop("image_base64", None)
-        remaining_meta.append(d)
+        if d.get("image_url"):
+            d.pop("image_base64", None)
+        remaining_fig_dicts.append(d)
+    await fig_repo.replace_all(document_id, remaining_fig_dicts)
+
+    # Store lightweight references in main document
+    remaining_meta = []
+    for d in remaining_fig_dicts:
+        meta = {k: v for k, v in d.items() if k != "image_base64"}
+        remaining_meta.append(meta)
 
     await repo.update_fields(document_id, {
         "equations": combined_equations,
@@ -880,6 +952,20 @@ async def get_figure_thumbnail(
     if not fig_data:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Figure not found")
 
+    # If stored on Cloudinary, use its built-in transformation URL
+    image_url = fig_data.get("image_url")
+    if image_url:
+        thumbnail_url = CloudinaryService.get_thumbnail_url(image_url)
+        return {
+            "document_id": document_id,
+            "figure_id": figure_id,
+            "thumbnail_url": thumbnail_url,
+            "image_url": image_url,
+            "caption": fig_data.get("caption"),
+            "number": fig_data.get("number"),
+        }
+
+    # Fallback: generate thumbnail from base64 (non-Cloudinary storage)
     image_b64 = fig_data.get("image_base64")
     if not image_b64:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Figure has no image data")
