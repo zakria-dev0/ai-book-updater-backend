@@ -56,6 +56,17 @@ def _resolve_file_path(stored_path: str) -> str:
     return stored_path  # return original (will fail downstream with a clear error)
 
 
+async def _get_openai_key(db) -> str:
+    """Get OpenAI API key from DB first, then fall back to .env."""
+    try:
+        doc = await db.settings.find_one({"key": "openai_api_key"})
+        if doc and doc.get("value"):
+            return doc["value"]
+    except Exception:
+        pass
+    return settings.OPENAI_API_KEY
+
+
 # ── Request / Response Models ────────────────────────────────────────────────
 
 class CreateSessionRequest(BaseModel):
@@ -554,7 +565,7 @@ async def extract_outline(
                     })
 
             from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            client = AsyncOpenAI(api_key=(await _get_openai_key(db)))
 
             gpt_filter_prompt = (
                 "You are analyzing heading-styled paragraphs from a DOCX document.\n"
@@ -661,7 +672,7 @@ async def extract_outline(
             para_metadata = para_metadata[:300]
 
             from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            client = AsyncOpenAI(api_key=(await _get_openai_key(db)))
 
             gpt_prompt = (
                 "You are analyzing a DOCX document to identify section headings.\n"
@@ -867,7 +878,7 @@ async def _run_diagnostic_task(session_id: str, session: dict, doc: dict):
     session_repo = SessionRepository(db)
 
     try:
-        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        client = AsyncOpenAI(api_key=(await _get_openai_key(db)))
         rules = session.get("rules", {}) or {}
         outline = session.get("outline", [])
         text_content = doc.get("text_content", "")
@@ -911,6 +922,8 @@ async def _run_diagnostic_task(session_id: str, session: dict, doc: dict):
         await session_repo.delete_opportunities(session_id)
 
         # ── Scan each section with its own AI call ──
+        api_errors = []  # Track API-level failures (quota, auth)
+
         async def scan_section(section_data: dict) -> list:
             section_name = section_data["section"]
             section_text = section_data["text"]
@@ -958,7 +971,15 @@ Text:
                     raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
                 return json.loads(raw)
             except Exception as e:
+                error_str = str(e)
                 logger.warning("Diagnostic failed for section '%s': %s", section_name, e)
+                # Track quota/auth errors to surface to the user
+                if "insufficient_quota" in error_str or "429" in error_str:
+                    api_errors.append("quota")
+                elif "invalid_api_key" in error_str or "401" in error_str:
+                    api_errors.append("auth")
+                else:
+                    api_errors.append("other")
                 return []
 
         # Run sections in parallel batches of 3 to avoid rate limits
@@ -970,6 +991,27 @@ Text:
             for issues_list in results:
                 if isinstance(issues_list, list):
                     all_issues.extend(issues_list)
+
+        # If ALL sections failed due to API errors, surface the error
+        if api_errors and len(api_errors) >= len(section_texts):
+            if "quota" in api_errors:
+                error_msg = (
+                    "OpenAI API quota exceeded. Your API key has no remaining credits. "
+                    "Please check your billing at platform.openai.com or update your API key in Admin → API Keys."
+                )
+            elif "auth" in api_errors:
+                error_msg = (
+                    "OpenAI API key is invalid or expired. "
+                    "Please update your API key in Admin → API Keys."
+                )
+            else:
+                error_msg = "OpenAI API requests failed for all sections. Please try again later."
+            await session_repo.update_session(session_id, {
+                "status": SessionStatus.ERROR.value,
+                "error_message": error_msg,
+            })
+            logger.error("Diagnostic aborted for session %s: %s", session_id, error_msg)
+            return
 
         # Deduplicate by sentence text
         seen_sentences = set()
@@ -1041,12 +1083,15 @@ async def get_diagnostic(session_id: str, user=Depends(get_current_user_dep)):
         raise HTTPException(403, "Not authorized")
 
     opportunities = await session_repo.find_opportunities(session_id)
-    return {
+    result = {
         "session_id": session_id,
         "status": session.get("status"),
         "diagnostic": session.get("diagnostic"),
         "opportunities": opportunities,
     }
+    if session.get("error_message"):
+        result["error_message"] = session["error_message"]
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1546,7 +1591,7 @@ async def _plan_research_task(session_id: str, session: dict):
     session_repo = SessionRepository(db)
 
     try:
-        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        client = AsyncOpenAI(api_key=(await _get_openai_key(db)))
         rules = session.get("rules", {}) or {}
         allowed_sources = rules.get("allowed_source_types", ["government", "academic", "news", "technical", "commercial"])
 
@@ -1706,9 +1751,22 @@ Return ONLY valid JSON. No other text."""
 
     except Exception as e:
         logger.error("Research planning failed for session %s: %s", session_id, e)
+        error_str = str(e)
+        if "insufficient_quota" in error_str or ("429" in error_str and "quota" in error_str.lower()):
+            error_msg = (
+                "OpenAI API quota exceeded. Your API key has no remaining credits. "
+                "Please check your billing at platform.openai.com or update your API key in Admin → API Keys."
+            )
+        elif "invalid_api_key" in error_str or "401" in error_str:
+            error_msg = (
+                "OpenAI API key is invalid or expired. "
+                "Please update your API key in Admin → API Keys."
+            )
+        else:
+            error_msg = error_str
         await session_repo.update_session(session_id, {
             "status": SessionStatus.ERROR.value,
-            "error_message": str(e),
+            "error_message": error_msg,
         })
 
 
@@ -1950,9 +2008,24 @@ async def _run_research_task(session_id: str, session: dict, approved_plans: lis
 
     except Exception as e:
         logger.error("Research failed for session %s: %s", session_id, e)
+        error_str = str(e)
+        if "Tavily" in error_str:
+            error_msg = error_str  # Already user-friendly from RuntimeError above
+        elif "insufficient_quota" in error_str or ("429" in error_str and "quota" in error_str.lower()):
+            error_msg = (
+                "OpenAI API quota exceeded. Your API key has no remaining credits. "
+                "Please check your billing at platform.openai.com or update your API key in Admin → API Keys."
+            )
+        elif "invalid_api_key" in error_str or "401" in error_str:
+            error_msg = (
+                "OpenAI API key is invalid or expired. "
+                "Please update your API key in Admin → API Keys."
+            )
+        else:
+            error_msg = error_str
         await session_repo.update_session(session_id, {
             "status": SessionStatus.ERROR.value,
-            "error_message": str(e),
+            "error_message": error_msg,
         })
 
 
@@ -2071,7 +2144,7 @@ async def _generate_patches_task(session_id: str, session: dict):
     session_repo = SessionRepository(db)
 
     try:
-        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        client = AsyncOpenAI(api_key=(await _get_openai_key(db)))
         rules = session.get("rules", {}) or {}
         max_change_pct = rules.get("max_sentence_change_pct", 80.0)
         citation_style = rules.get("citation_style", "inline")
@@ -2083,6 +2156,8 @@ async def _generate_patches_task(session_id: str, session: dict):
         await session_repo.delete_patches(session_id)
 
         logger.info("Generating patches for %d selected opportunities (parallel)", len(selected))
+
+        patch_api_errors = []  # Track API-level failures (quota, auth)
 
         # Note: when diagnostic re-runs, opportunities get new IDs but research plans
         # still reference old IDs. The fallback pool above handles this gracefully.
@@ -2204,12 +2279,37 @@ Return ONLY valid JSON. No other text."""
                     "section_ref": opp.get("section_ref", ""),
                 }
             except Exception as e:
+                error_str = str(e)
                 logger.warning("Patch generation failed for opp %s: %s", opp_id, e)
+                if "insufficient_quota" in error_str or ("429" in error_str and "quota" in error_str.lower()):
+                    patch_api_errors.append("quota")
+                elif "invalid_api_key" in error_str or "401" in error_str:
+                    patch_api_errors.append("auth")
                 return None
 
         # Run all OpenAI calls in parallel
         results = await asyncio.gather(*[_generate_one_patch(opp) for opp in selected])
         patches = [p for p in results if p is not None]
+
+        # Check if all non-custom opportunities failed due to API errors
+        non_custom = [o for o in selected if not o.get("is_custom")]
+        if patch_api_errors and len(patch_api_errors) >= len(non_custom) and not patches:
+            if "quota" in patch_api_errors:
+                error_msg = (
+                    "OpenAI API quota exceeded. Your API key has no remaining credits. "
+                    "Please check your billing at platform.openai.com or update your API key in Admin → API Keys."
+                )
+            else:
+                error_msg = (
+                    "OpenAI API key is invalid or expired. "
+                    "Please update your API key in Admin → API Keys."
+                )
+            await session_repo.update_session(session_id, {
+                "status": SessionStatus.ERROR.value,
+                "error_message": error_msg,
+            })
+            logger.error("Patch generation aborted for session %s: %s", session_id, error_msg)
+            return
 
         await session_repo.create_patches(patches)
         await session_repo.update_session(session_id, {
@@ -2220,9 +2320,22 @@ Return ONLY valid JSON. No other text."""
 
     except Exception as e:
         logger.error("Patch generation failed for session %s: %s", session_id, e)
+        error_str = str(e)
+        if "insufficient_quota" in error_str or ("429" in error_str and "quota" in error_str.lower()):
+            error_msg = (
+                "OpenAI API quota exceeded. Your API key has no remaining credits. "
+                "Please check your billing at platform.openai.com or update your API key in Admin → API Keys."
+            )
+        elif "invalid_api_key" in error_str or "401" in error_str:
+            error_msg = (
+                "OpenAI API key is invalid or expired. "
+                "Please update your API key in Admin → API Keys."
+            )
+        else:
+            error_msg = error_str
         await session_repo.update_session(session_id, {
             "status": SessionStatus.ERROR.value,
-            "error_message": str(e),
+            "error_message": error_msg,
         })
 
 
@@ -2451,7 +2564,7 @@ Return ONLY valid JSON with:
 Return ONLY valid JSON. No other text."""
 
     try:
-        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        client = AsyncOpenAI(api_key=(await _get_openai_key(db)))
         response = await client.chat.completions.create(
             model=settings.GPT_MODEL,
             messages=[
@@ -6475,7 +6588,7 @@ async def _run_audit_task(session_id: str, session: dict, doc: dict):
     session_repo = SessionRepository(db)
 
     try:
-        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        client = AsyncOpenAI(api_key=(await _get_openai_key(db)))
         outline = session.get("outline", [])
         text_content = doc.get("text_content", "")
 
@@ -6559,9 +6672,22 @@ Text:
 
     except Exception as e:
         logger.error("Audit failed for session %s: %s", session_id, e)
+        error_str = str(e)
+        if "insufficient_quota" in error_str or ("429" in error_str and "quota" in error_str.lower()):
+            error_msg = (
+                "OpenAI API quota exceeded. Your API key has no remaining credits. "
+                "Please check your billing at platform.openai.com or update your API key in Admin → API Keys."
+            )
+        elif "invalid_api_key" in error_str or "401" in error_str:
+            error_msg = (
+                "OpenAI API key is invalid or expired. "
+                "Please update your API key in Admin → API Keys."
+            )
+        else:
+            error_msg = error_str
         await session_repo.update_session(session_id, {
             "status": SessionStatus.ERROR.value,
-            "error_message": str(e),
+            "error_message": error_msg,
         })
 
 
@@ -6677,19 +6803,7 @@ async def export_tracked_docx(session_id: str, token: Optional[str] = None, requ
 
     output_dir = os.path.join(settings.OUTPUT_DIR, session_id)
     os.makedirs(output_dir, exist_ok=True)
-    # Use unique suffix to prevent concurrent requests from overwriting each other
-    import time as _time
-    unique_suffix = str(int(_time.time() * 1000))
-    output_path = os.path.join(output_dir, f"tracked_{unique_suffix}_{doc.get('original_filename', 'document.docx')}")
-
-    # Clean up old tracked files to prevent disk bloat
-    import glob as _glob
-    for old_file in _glob.glob(os.path.join(output_dir, "tracked_*")):
-        if old_file != output_path:
-            try:
-                os.remove(old_file)
-            except OSError:
-                pass
+    output_path = os.path.join(output_dir, f"tracked_{doc.get('original_filename', 'document.docx')}")
 
     logger.info("EXPORT tracked-docx: building tracked changes from patches")
 
@@ -6930,6 +7044,7 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
         figures.append({
             "para_idx": pos.get("paragraph"),
             "image_b64": fig.get("image_base64", ""),
+            "image_url": fig.get("image_url", ""),
             "caption": fig.get("caption") or "",
             "r_embed": fig.get("r_embed") or "",
             "size_bytes": size_bytes,
@@ -6947,7 +7062,7 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
     import json as _json
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    client = AsyncOpenAI(api_key=(await _get_openai_key(db)))
 
     # Resolve Tavily API key: check MongoDB first, fall back to .env
     _fig_tavily_key = settings.TAVILY_API_KEY
@@ -6957,15 +7072,17 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
 
     async def _analyze_single_figure(fig_num: int, fig: dict, http_client: httpx.AsyncClient):
         """Analyze one figure with GPT-4o Vision + search for replacements concurrently."""
-        # Downscale/re-encode before sending to Vision and before storing in
-        # media_patches — this collection has no size cap and previously
-        # stored the figure's full-resolution bytes on every analysis run.
-        try:
-            _raw = base64.b64decode(fig["image_b64"])
-            _compressed = ImageService.compress_for_storage(_raw)
-            thumb_b64 = base64.b64encode(_compressed).decode("utf-8")
-        except Exception:
-            thumb_b64 = fig["image_b64"]
+        # Use Cloudinary URL directly when available (no base64 needed).
+        # Otherwise fall back to compressed base64.
+        _cloudinary_url = fig.get("image_url", "")
+        thumb_b64 = ""
+        if not _cloudinary_url:
+            try:
+                _raw = base64.b64decode(fig["image_b64"])
+                _compressed = ImageService.compress_for_storage(_raw)
+                thumb_b64 = base64.b64encode(_compressed).decode("utf-8")
+            except Exception:
+                thumb_b64 = fig["image_b64"]
         caption = fig.get("caption", "") or ""
 
         # ── Step 1: GPT-4o Vision analysis ────────────────────────────────
@@ -6976,20 +7093,25 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
         try:
             caption_context = f'\nThe figure caption in the textbook is: "{caption}"' if caption else ""
 
-            # Detect actual image MIME type from base64 data
-            _mime = "image/png"  # default
-            try:
-                _header = base64.b64decode(thumb_b64[:32])
-                if _header[:3] == b'\xff\xd8\xff':
-                    _mime = "image/jpeg"
-                elif _header[:4] == b'\x89PNG':
-                    _mime = "image/png"
-                elif _header[:4] == b'GIF8':
-                    _mime = "image/gif"
-                elif _header[:4] == b'RIFF':
-                    _mime = "image/webp"
-            except Exception:
-                pass
+            # Build the image_url payload for GPT-4o Vision
+            if _cloudinary_url:
+                _vision_image_url = {"url": _cloudinary_url}
+            else:
+                # Detect actual image MIME type from base64 data
+                _mime = "image/png"  # default
+                try:
+                    _header = base64.b64decode(thumb_b64[:32])
+                    if _header[:3] == b'\xff\xd8\xff':
+                        _mime = "image/jpeg"
+                    elif _header[:4] == b'\x89PNG':
+                        _mime = "image/png"
+                    elif _header[:4] == b'GIF8':
+                        _mime = "image/gif"
+                    elif _header[:4] == b'RIFF':
+                        _mime = "image/webp"
+                except Exception:
+                    pass
+                _vision_image_url = {"url": f"data:{_mime};base64,{thumb_b64}"}
 
             _vision_messages = [{
                 "role": "user",
@@ -7031,7 +7153,7 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
                     },
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:{_mime};base64,{thumb_b64}"},
+                        "image_url": _vision_image_url,
                     },
                 ],
             }]
@@ -7101,7 +7223,8 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
                 "status": "not_outdated",
                 "figure_number": fig_num,
                 "caption": caption,
-                "original_image_b64": thumb_b64,
+                "original_image_b64": thumb_b64 if not _cloudinary_url else "",
+                "original_image_url": _cloudinary_url,
                 "analysis": analysis_text,
                 "figure_category": figure_category,
                 "is_outdated": False,
@@ -7399,7 +7522,8 @@ async def figure_analysis(session_id: str, user=Depends(get_current_user_dep)):
             "status": "pending",
             "figure_number": fig_num,
             "caption": caption,
-            "original_image_b64": thumb_b64,
+            "original_image_b64": thumb_b64 if not _cloudinary_url else "",
+            "original_image_url": _cloudinary_url,
             "analysis": analysis_text,
             "figure_category": figure_category,
             "is_outdated": True,
@@ -7716,7 +7840,7 @@ async def equation_analysis(session_id: str, user=Depends(get_current_user_dep))
     # Send equations to GPT for analysis (batch them to reduce API calls)
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    client = AsyncOpenAI(api_key=(await _get_openai_key(db)))
 
     # Build a summary of all equations for GPT
     eq_summary_lines = []
@@ -8135,7 +8259,7 @@ async def table_analysis(session_id: str, user=Depends(get_current_user_dep)):
     import json as _json
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    client = AsyncOpenAI(api_key=(await _get_openai_key(db)))
 
     async def _analyze_single_table(t_num: int, tdata: dict):
         content_str = _format_table_for_gpt(tdata["content"])
@@ -8549,7 +8673,7 @@ async def run_spell_check(
     if current_chunk:
         chunks.append((start_idx, "\n".join(current_chunk)))
 
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    client = AsyncOpenAI(api_key=(await _get_openai_key(db)))
     all_issues = []
 
     system_prompt = (
