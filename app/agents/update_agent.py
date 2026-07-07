@@ -717,8 +717,8 @@ Return valid JSON only.
 
 
 class UpdateAgent:
-    def __init__(self):
-        self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    def __init__(self, api_key: str = ""):
+        self.client = AsyncOpenAI(api_key=api_key or settings.OPENAI_API_KEY)
         self.model = settings.GPT_MODEL
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
@@ -747,7 +747,7 @@ class UpdateAgent:
         """
         self._style_profile = style_profile
         self._document_age = document_age
-        if not settings.OPENAI_API_KEY:
+        if not self.client.api_key:
             logger.warning("OpenAI API key not configured — skipping proposal generation")
             return []
 
