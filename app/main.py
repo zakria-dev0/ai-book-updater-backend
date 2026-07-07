@@ -54,6 +54,9 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     await connect_to_mongo()
+    # Pre-load Cloudinary credentials from DB (if saved via Admin UI)
+    from app.services.cloudinary_service import CloudinaryService
+    await CloudinaryService.load_from_db()
     print(f"{settings.PROJECT_NAME} started successfully")
 
 
