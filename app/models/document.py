@@ -31,7 +31,9 @@ class Equation(BaseModel):
 class Figure(BaseModel):
     figure_id: str
     caption: Optional[str] = None
-    image_base64: str
+    image_base64: Optional[str] = None  # kept during in-memory processing; omitted from DB when Cloudinary is used
+    image_url: Optional[str] = None  # Cloudinary URL (primary storage)
+    cloudinary_public_id: Optional[str] = None  # for deletion
     position: Position
     number: Optional[str] = None  # e.g., "Figure 6-5"
     r_embed: Optional[str] = None  # relationship embed ID in DOCX

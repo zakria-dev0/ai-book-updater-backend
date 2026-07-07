@@ -36,6 +36,17 @@ from app.core.config import settings
 logger = get_logger(__name__)
 
 
+async def _get_openai_key_from_db(db) -> str:
+    """Get OpenAI API key from DB first, then fall back to .env."""
+    try:
+        doc = await db.settings.find_one({"key": "openai_api_key"})
+        if doc and doc.get("value"):
+            return doc["value"]
+    except Exception:
+        pass
+    return settings.OPENAI_API_KEY
+
+
 # ------------------------------------------------------------------ #
 # LangGraph State                                                      #
 # ------------------------------------------------------------------ #
@@ -679,6 +690,13 @@ async def run_analysis(
     # Default focus areas
     if not focus_areas:
         focus_areas = ["all"]
+
+    # Load OpenAI key from DB (falls back to .env)
+    openai_key = await _get_openai_key_from_db(db)
+    # Re-initialize agents with the (possibly DB-overridden) key
+    global content_agent, update_agent
+    content_agent = ContentAnalysisAgent(api_key=openai_key)
+    update_agent = UpdateAgent(api_key=openai_key)
 
     # Update document status and set initial progress immediately
     await doc_repo.update_fields(document_id, {
