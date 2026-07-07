@@ -13,10 +13,22 @@ from app.models.change import ChangeStatus, ApprovalAction, FocusArea, ChangeTyp
 from app.agents.orchestrator import run_analysis
 from app.core.logger import get_logger
 from app.core.rate_limit import limiter
+from app.core.config import settings
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["Analysis"])
+
+
+async def _get_openai_key(db) -> str:
+    """Get OpenAI API key from DB first, then fall back to .env."""
+    try:
+        doc = await db.settings.find_one({"key": "openai_api_key"})
+        if doc and doc.get("value"):
+            return doc["value"]
+    except Exception:
+        pass
+    return settings.OPENAI_API_KEY
 
 
 # ------------------------------------------------------------------ #
@@ -951,13 +963,13 @@ async def generate_ai_prompt(
     that can be reviewed (approved/rejected) like any other change.
     """
     from openai import AsyncOpenAI
-    from app.core.config import settings
     import json
 
-    if not settings.OPENAI_API_KEY:
+    openai_key = await _get_openai_key(db)
+    if not openai_key:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="OpenAI API key not configured",
+            detail="OpenAI API key not configured. Please add it in Admin → API Keys.",
         )
 
     if body.placement not in ("after_section", "at_end", "replace_section"):
@@ -1045,7 +1057,7 @@ async def generate_ai_prompt(
     )
 
     try:
-        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        client = AsyncOpenAI(api_key=openai_key)
         response = await client.chat.completions.create(
             model=settings.GPT_MODEL,
             messages=[
